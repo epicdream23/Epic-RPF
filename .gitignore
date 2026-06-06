@@ -1,0 +1,13 @@
+# Build output
+bin/
+obj/
+*.user
+
+# Decompiled CodeWalker.Core reference (derived from a third-party DLL; not source we own)
+_ref/
+
+# Bundled third-party data layer (large; redistribution governed by CodeWalker LICENSE)
+libs/
+
+# Tooling
+.vs/

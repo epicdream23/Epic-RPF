@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Epic RPF</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+    { "imports": { "three": "./lib/three/three.module.min.js" } }
+  </script>
+  <!-- Monaco (the editor that powers VS Code), self-hosted AMD build -->
+  <script src="./lib/monaco/vs/loader.js"></script>
+  <script>
+    self.MonacoEnvironment = { getWorkerUrl: () => './lib/monaco/vs/base/worker/workerMain.js' };
+    require.config({ paths: { vs: './lib/monaco/vs' } });
+    window.monacoReady = new Promise(res => require(['vs/editor/editor.main'], () => res(window.monaco)));
+  </script>
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar -->
+    <header id="toolbar">
+      <div class="brand"><span class="logo">◆</span> Epic&nbsp;RPF</div>
+      <div class="mount-bar">
+        <input id="folder" type="text" spellcheck="false"
+               value="C:\Program Files\Epic Games\GTAV" />
+        <button id="browse" class="btn ghost" title="Choose folder">Browse…</button>
+        <label class="gen-toggle" title="Enhanced / Gen9 resources">
+          <input id="gen9" type="checkbox" /> Gen9
+        </label>
+        <button id="mount" class="btn primary">Mount</button>
+      </div>
+      <div class="grow"></div>
+      <div id="mountInfo" class="muted"></div>
+    </header>
+
+    <!-- Body: tree | content | inspector -->
+    <div id="body">
+      <aside id="sidebar">
+        <div class="search">
+          <input id="filter" type="text" placeholder="Filter loaded files…" spellcheck="false" />
+        </div>
+        <div id="tree" class="tree">
+          <div class="empty-hint">Mount a GTA V folder to browse archives.</div>
+        </div>
+      </aside>
+
+      <main id="content">
+        <div id="tabs" class="tabs"></div>
+        <div id="panes" class="panes">
+          <!-- Explorer (OpenIV-style folder list) -->
+          <section class="pane" id="pane-explorer" hidden>
+            <div class="crumbs" id="crumbs"></div>
+            <div class="list">
+              <div class="list-head">
+                <span class="c-name">Name</span>
+                <span class="c-type">Type</span>
+                <span class="c-size">Size</span>
+                <span class="c-attr">Attributes</span>
+              </div>
+              <div class="list-body" id="listBody"></div>
+            </div>
+          </section>
+
+          <!-- 3D viewport -->
+          <section class="pane" id="pane-model" hidden>
+            <div class="viewport-wrap">
+              <canvas id="gl"></canvas>
+              <div class="vp-overlay">
+                <div class="vp-tools">
+                  <select id="lodSel" title="Level of detail"></select>
+                  <button class="chip" id="tgWire">Wireframe</button>
+                  <button class="chip" id="tgBox">Bounds</button>
+                  <button class="chip" id="tgGrid" data-on="1">Grid</button>
+                  <button class="chip" id="tgLight" data-on="1">Light</button>
+                  <button class="chip" id="btnFit">Fit</button>
+                </div>
+                <div class="vp-stats" id="vpStats"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Editor (text & meta-as-XML, powered by Monaco) -->
+          <section class="pane" id="pane-edit" hidden>
+            <div class="edit-bar">
+              <span id="editLang" class="edit-lang">text</span>
+              <span id="editFmt" class="edit-fmt"></span>
+              <span id="editDirty" class="edit-dirty" hidden>● unsaved</span>
+              <span class="grow"></span>
+              <button class="btn ghost sm" id="btnExport">Export…</button>
+              <button class="btn primary sm" id="btnSaveRpf">Save to archive</button>
+            </div>
+            <div id="editor" class="editor-host"></div>
+          </section>
+
+          <!-- Hex -->
+          <section class="pane" id="pane-hex" hidden>
+            <pre id="hexBody" class="hex-body"></pre>
+          </section>
+
+          <!-- Texture list -->
+          <section class="pane" id="pane-texture" hidden>
+            <div id="texGrid" class="tex-grid"></div>
+          </section>
+
+          <!-- Welcome -->
+          <section class="pane welcome" id="pane-welcome">
+            <div class="welcome-card">
+              <h1><span class="logo">◆</span> Epic RPF</h1>
+              <p>A robust GTA&nbsp;V archive browser &amp; model viewer.</p>
+              <ol>
+                <li>Confirm your GTA&nbsp;V folder in the toolbar (Gen8/Legacy by default).</li>
+                <li>Click <b>Mount</b>.</li>
+                <li>Browse the tree and double-click a <code>.ydr</code> / <code>.ydd</code> / <code>.yft</code>.</li>
+              </ol>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <aside id="inspector">
+        <div class="insp-title">Inspector</div>
+        <div id="inspBody" class="insp-body muted">Nothing selected.</div>
+      </aside>
+    </div>
+
+    <!-- Status bar -->
+    <footer id="status">
+      <span id="statusLeft">Ready</span>
+      <span class="grow"></span>
+      <span id="statusRight"></span>
+    </footer>
+  </div>
+
+  <!-- Install chooser modal -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <h3 id="modalTitle">Multiple GTA V installs found</h3>
+      <p class="muted">Choose which one to mount:</p>
+      <div id="modalList" class="modal-list"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="modalCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
