@@ -9,3 +9,5 @@ TODO:
 7. ydr textures fixen
 
 8. text file snot saving
+
+9. fix core.ypt not being xml file editable after replacing textures inside
