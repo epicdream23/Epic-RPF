@@ -7,5 +7,3 @@ TODO:
 5. 3d Viewer überarbeiten skeletons, materials, ydd name fix seitenleiste, ydd custom names in epic tool speichern (front end)
 
 6. ydr anims mit ycd (animations) verknüfen
-
-7. icons mal 1.5 in größe multiplizieren
