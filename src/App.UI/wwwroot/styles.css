@@ -30,16 +30,40 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 
 #app { display: flex; flex-direction: column; height: 100vh; }
 
-/* ---- Toolbar ---- */
+/* ---- Toolbar (custom window title bar) ---- */
 #toolbar {
   display: flex; align-items: center; gap: 14px;
-  padding: 8px 12px;
+  padding: 0 0 0 12px; min-height: 42px;
   background: linear-gradient(#161a23, #11141b);
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  -webkit-app-region: drag; app-region: drag;   /* drag the window by the bar */
 }
-.brand { font-weight: 600; letter-spacing: .3px; display: flex; align-items: center; gap: 7px; }
+/* interactive bits must not drag the window */
+#toolbar input, #toolbar select, #toolbar button, #toolbar label, .win-btns {
+  -webkit-app-region: no-drag; app-region: no-drag;
+}
+.brand { font-weight: 600; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
 .logo { color: var(--accent); }
+.app-ico { width: 18px; height: 18px; border-radius: 4px; display: block; }
+.popout-title { font-size: 12px; color: var(--text-dim); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
+
+/* window caption buttons */
+.win-btns { display: flex; align-self: stretch; margin-left: 6px; }
+.win-btn {
+  width: 46px; align-self: stretch; border: none; background: transparent;
+  color: var(--text-dim); font-size: 12px; cursor: pointer; line-height: 1;
+}
+.win-btn:hover { background: var(--bg-3); color: var(--text); }
+.win-btn.close:hover { background: #e11d48; color: #fff; }
+
+/* popout window: just the title bar + one viewer */
+body.popout #sidebar,
+body.popout #inspector,
+body.popout .mount-bar,
+body.popout #mountInfo,
+body.popout #tabs { display: none; }
 .mount-bar { display: flex; align-items: center; gap: 7px; }
 #folder {
   width: 360px; padding: 5px 9px;
@@ -71,6 +95,18 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
   width: 100%; padding: 5px 9px; border-radius: 6px;
   background: var(--bg-3); color: var(--text); border: 1px solid var(--border-2); font-size: 12px;
 }
+.search-opts { display: flex; gap: 10px; padding: 7px 2px 1px; flex-wrap: wrap; }
+.search-opts label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); cursor: default; }
+
+/* search results in the explorer */
+.result-row { display: grid; grid-template-columns: minmax(180px, 1fr) 2fr; align-items: center;
+  padding: 5px 12px; cursor: default; }
+.result-row:hover { background: var(--bg-3); }
+.result-row.selected { background: #1d2740; }
+.result-row .c-name { display: flex; align-items: center; gap: 8px; overflow: hidden; }
+.result-row .c-name .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-row .rpath { color: var(--muted); font-size: 11px; font-family: "Cascadia Mono", monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree { flex: 1 1 auto; overflow: auto; padding: 4px 0 12px; }
 .empty-hint { padding: 16px; color: var(--muted); font-size: 12px; }
 
@@ -131,6 +167,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
+.tab.dragging { opacity: .5; }
 .tab .close { color: var(--muted); padding: 0 2px; border-radius: 3px; }
 .tab .close:hover { color: var(--danger); background: var(--bg-3); }
 
@@ -141,10 +178,19 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 
 /* ---- Explorer (detail list) ---- */
 #pane-explorer:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
+.nav-row {
+  display: flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  padding: 5px 8px; background: var(--bg-2); border-bottom: 1px solid var(--border);
+}
+.nav-btn {
+  width: 26px; height: 24px; border-radius: 5px; cursor: pointer; font-size: 13px;
+  background: var(--bg-3); color: var(--text-dim); border: 1px solid var(--border-2);
+}
+.nav-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.nav-btn:disabled { opacity: .35; cursor: default; }
 .crumbs {
   display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
-  padding: 7px 12px; background: var(--bg-2); border-bottom: 1px solid var(--border);
-  flex: 0 0 auto; font-size: 12px;
+  flex: 1 1 auto; font-size: 12px; min-width: 0;
 }
 .crumb { color: var(--text-dim); padding: 2px 6px; border-radius: 4px; }
 .crumb:hover { background: var(--bg-3); color: var(--text); }
@@ -205,8 +251,26 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 .welcome-card ol { color: var(--text-dim); margin: 0; padding-left: 18px; line-height: 1.9; }
 
 /* viewport */
-.viewport-wrap { position: absolute; inset: 0; }
+#pane-model:not([hidden]) { display: flex; overflow: hidden; }
+.vp-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; position: relative; }
+.viewport-wrap { flex: 1 1 auto; position: relative; min-height: 0; }
 #gl { width: 100%; height: 100%; display: block; }
+
+/* model list (down the left for .ydd/.ypt dictionaries) */
+.vp-models {
+  flex: 0 0 184px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px;
+  padding: 8px; background: var(--bg-2); border-right: 1px solid var(--border);
+}
+.vp-models[hidden] { display: none; }
+.vp-models .vp-mhead { font-size: 10px; letter-spacing: .4px; text-transform: uppercase;
+  color: var(--muted); padding: 2px 6px 4px; }
+.vp-model {
+  padding: 5px 9px; font-size: 11px; border-radius: 5px; cursor: pointer;
+  color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border: 1px solid transparent;
+}
+.vp-model:hover { color: var(--text); background: var(--bg-3); }
+.vp-model.sel { background: var(--accent); color: #07221f; border-color: var(--accent); }
 .vp-overlay { position: absolute; inset: 0; pointer-events: none; }
 .vp-tools {
   position: absolute; top: 10px; right: 10px; display: flex; gap: 6px;
@@ -228,6 +292,38 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
   font-family: "Cascadia Mono", Consolas, monospace; pointer-events: none;
   background: rgba(13,15,20,.55); padding: 5px 8px; border-radius: 6px;
 }
+/* embedded-texture strip (e.g. .ypt) — in-flow bar under the viewport */
+.vp-textures {
+  flex: 0 0 auto; display: flex; align-items: stretch; gap: 8px;
+  padding: 8px; background: var(--bg-2); border-top: 1px solid var(--border);
+}
+.vp-textures[hidden] { display: none; }
+.vp-tex-row { display: flex; gap: 8px; overflow-x: auto; flex: 1 1 auto; }
+.vp-tex-expand {
+  flex: 0 0 auto; align-self: stretch; padding: 0 12px; font-size: 11px; cursor: pointer;
+  border-radius: 6px; background: var(--bg-3); color: var(--text-dim); border: 1px solid var(--border-2);
+}
+.vp-tex-expand:hover { color: var(--text); border-color: var(--accent); }
+.vp-tex {
+  flex: 0 0 auto; width: 92px; cursor: pointer; display: flex; flex-direction: column; gap: 3px;
+}
+.vp-tex img, .vp-tex .noimg {
+  width: 92px; height: 92px; object-fit: contain; border-radius: 5px;
+  border: 1px solid var(--border-2);
+}
+.vp-tex .noimg { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 10px; }
+.vp-tex:hover img, .vp-tex:hover .noimg { border-color: var(--accent); }
+.vp-tex .vt-name { font-size: 10px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vp-tex .vt-dim { font-size: 9px; color: var(--muted); font-family: "Cascadia Mono", monospace; }
+
+/* fullscreen texture browser (hides the model list + viewer) */
+.vp-texfull { position: absolute; inset: 0; z-index: 6; display: flex; flex-direction: column; background: var(--bg); }
+.vp-texfull[hidden] { display: none; }
+.vp-texfull-head {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px; flex: 0 0 auto;
+  background: var(--bg-2); border-bottom: 1px solid var(--border); font-weight: 600;
+}
+.vp-texfull .tex-grid { flex: 1 1 auto; overflow: auto; align-content: start; }
 
 /* editor pane */
 #pane-edit:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
@@ -253,9 +349,27 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 
 /* texture grid */
 .tex-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; padding: 14px; }
-.tex-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.tex-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+.tex-card:hover { border-color: var(--accent); }
 .tex-card .tn { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tex-card .td { color: var(--muted); font-size: 11px; margin-top: 4px; font-family: "Cascadia Mono", monospace; }
+.checker { background: repeating-conic-gradient(#1a1d24 0% 25%, #14161d 0% 50%) 50% / 20px 20px; }
+.tex-card .preview { width: 100%; height: 120px; object-fit: contain; border-radius: 6px; margin-bottom: 8px; display: block; }
+.tex-card .preview.noimg { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
+
+/* image / dds viewer + converter */
+#pane-image:not([hidden]) { display: flex; flex-direction: column; overflow: hidden; }
+.img-bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--bg-2); border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+.fmt-lbl { font-size: 11px; color: var(--text-dim); display: flex; gap: 6px; align-items: center; }
+#ddsFmt { padding: 4px 6px; font-size: 11px; border-radius: 5px; background: var(--bg-3); color: var(--text); border: 1px solid var(--border-2); }
+.img-stage { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; }
+#imgView { max-width: 100%; max-height: 100%; }
+
+/* drag-drop converter overlay */
+.dropzone { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center;
+  background: rgba(13,15,20,.82); }
+.dropzone[hidden] { display: none; }
+.dropzone div { font-size: 20px; color: var(--accent); border: 3px dashed var(--accent); border-radius: 14px; padding: 40px 60px; }
 
 /* status bar */
 #status {
@@ -266,9 +380,31 @@ code { font-family: "Cascadia Mono", Consolas, monospace; color: var(--accent); 
 
 /* context menu */
 .ctx { position: fixed; z-index: 50; background: var(--bg-3); border: 1px solid var(--border-2);
-  border-radius: 8px; padding: 4px; min-width: 150px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
-.ctx .mi { padding: 6px 10px; border-radius: 5px; cursor: default; font-size: 12px; }
+  border-radius: 8px; padding: 4px; min-width: 190px; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+.ctx .mi { display: flex; align-items: center; gap: 16px; padding: 6px 10px; border-radius: 5px;
+  cursor: default; font-size: 12px; white-space: nowrap; }
 .ctx .mi:hover { background: var(--accent-2); color: #fff; }
+.ctx .mi.disabled { color: var(--muted); pointer-events: none; }
+.ctx .mlabel { flex: 1 1 auto; }
+.ctx .accel { color: var(--muted); font-size: 11px; }
+.ctx .mi:hover .accel { color: #cfe0ff; }
+.ctx .arrow { color: var(--muted); font-size: 10px; }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+/* create dialog */
+.dlg-l { display: block; font-size: 12px; color: var(--text-dim); margin: 6px 0 4px; }
+.dlg-in { width: 100%; padding: 6px 9px; border-radius: 6px; background: var(--bg-3); color: var(--text);
+  border: 1px solid var(--border-2); font-size: 13px; }
+.dlg-cb { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-dim); margin: 12px 0 4px; }
+
+/* explorer view modes */
+.list-body.view-list .row-item { grid-template-columns: 1fr; padding: 3px 12px; }
+.list-body.view-icons { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; padding: 10px; }
+.list-body.view-icons .group-head { flex-basis: 100%; width: 100%; }
+.list-body.view-icons .row-item { width: 104px; height: 96px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center; gap: 8px; border-radius: 8px; padding: 8px; }
+.list-body.view-icons .row-item .label { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-body.view-icons .ic { width: 40px; height: 40px; }
 
 ::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-thumb { background: #283042; border-radius: 6px; border: 3px solid transparent; background-clip: padding-box; }

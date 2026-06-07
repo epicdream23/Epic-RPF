@@ -48,7 +48,10 @@ public static class FileTypes
     /// <summary>Routes a file to a viewer. Unknown/binary types fall back to hex — never a dead end.</summary>
     public static ViewerKind Route(string name) => Detect(name) switch
     {
-        RpfFileKind.Drawable or RpfFileKind.DrawableDictionary or RpfFileKind.Fragment => ViewerKind.Model,
+        // .ypt carries both drawables and textures — it opens in the model viewer
+        // (which also surfaces its embedded texture dictionary).
+        RpfFileKind.Drawable or RpfFileKind.DrawableDictionary or RpfFileKind.Fragment
+            or RpfFileKind.ParticleEffect => ViewerKind.Model,
         RpfFileKind.TextureDictionary => ViewerKind.Texture,
         RpfFileKind.Xml or RpfFileKind.Meta or RpfFileKind.Text => ViewerKind.Text,
         _ => ViewerKind.Hex,

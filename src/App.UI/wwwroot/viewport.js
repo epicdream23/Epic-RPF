@@ -8,8 +8,11 @@ let renderer, scene, camera, controls, grid, hemi, dir, ambient;
 let root;                 // THREE.Group holding the current model (Z-up -> Y-up)
 let boxHelper = null;
 let current = null;       // current model message
+const texLoader = new THREE.TextureLoader();
+const texCache = new Map();   // data-url -> THREE.Texture
 let lod = 'High';
-let wire = false, showBox = false, showGrid = true, lit = true;
+let partIndex = -1;       // -1 = show every part; otherwise only that part (drawable)
+let wire = false, showBox = false, showGrid = true, lit = true, vcolor = false;
 let canvas;
 const stats = { verts: 0, tris: 0, meshes: 0, rendered: 0, skipped: 0 };
 
@@ -27,6 +30,12 @@ export function init(glCanvas) {
   controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
+  // Scroll wheel zooms (toward the cursor); keep a sane distance range.
+  controls.enableZoom = true;
+  controls.zoomToCursor = true;
+  controls.zoomSpeed = 1.1;
+  controls.minDistance = 0.01;
+  controls.maxDistance = 8000;
 
   ambient = new THREE.AmbientLight(0xffffff, 0.35);
   hemi = new THREE.HemisphereLight(0xcfe3ff, 0x1a1d26, 0.7);
@@ -81,17 +90,39 @@ function clearRoot() {
   if (boxHelper) { scene.remove(boxHelper); boxHelper.geometry?.dispose?.(); boxHelper = null; }
 }
 
-function buildMaterial(hasColor) {
+function getTexture(url) {
+  if (!url) return null;
+  if (texCache.has(url)) return texCache.get(url);
+  const t = texLoader.load(url);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4;
+  texCache.set(url, t);
+  return t;
+}
+function clearTextures() {
+  for (const t of texCache.values()) t.dispose();
+  texCache.clear();
+}
+function buildMaterial(matInfo) {
+  const map = matInfo && matInfo.tex ? getTexture(matInfo.tex) : null;
   return new THREE.MeshStandardMaterial({
-    color: 0x9aa3af, roughness: 0.78, metalness: 0.04,
+    color: map ? 0xffffff : 0x9aa3af,
+    map: map || null,
+    roughness: 0.82, metalness: 0.04,
     side: THREE.DoubleSide, wireframe: wire,
-    vertexColors: false, flatShading: false,
   });
 }
 
 /** Load a model message ({parts:[{lods:[{level,meshes:[...]}]}]}). */
 export function loadModel(msg) {
   current = msg;
+  clearTextures();
+  // A dictionary (.ydd) / particle file (.ypt) holds independent drawables that
+  // each live at their own origin — showing them all at once just overlaps them.
+  // Default to the first drawable when there's more than one; single-drawable
+  // files (.ydr/.yft) show everything.
+  partIndex = (msg.parts && msg.parts.length > 1) ? 0 : -1;
   rebuild();
   fit();
 }
@@ -107,10 +138,11 @@ function rebuild() {
   if (!current) return;
 
   const levels = new Set();
-  for (const part of current.parts) {
+  current.parts.forEach((part, pi) => {
+    if (partIndex >= 0 && pi !== partIndex) return;
     for (const l of part.lods) levels.add(l.level);
     const chosen = pickLodForPart(part);
-    if (!chosen) continue;
+    if (!chosen) return;
     for (const m of chosen.meshes) {
       const g = new THREE.BufferGeometry();
       const pos = f32(m.pos);
@@ -124,13 +156,22 @@ function rebuild() {
       if (idx) g.setIndex(new THREE.BufferAttribute(idx, 1));
       if (!nrm) g.computeVertexNormals();
 
-      const mesh = new THREE.Mesh(g, buildMaterial(!!m.col));
+      const matInfo = (part.materials && part.materials[m.mat]) || null;
+      const material = buildMaterial(matInfo);
+      const col = f32(m.col);
+      if (vcolor && col) {
+        const c3 = new Float32Array(m.vcount * 3);
+        for (let k = 0; k < m.vcount; k++) { c3[k * 3] = col[k * 4]; c3[k * 3 + 1] = col[k * 4 + 1]; c3[k * 3 + 2] = col[k * 4 + 2]; }
+        g.setAttribute('color', new THREE.BufferAttribute(c3, 3));
+        material.vertexColors = true;
+      }
+      const mesh = new THREE.Mesh(g, material);
       root.add(mesh);
       stats.verts += m.vcount;
       stats.tris += (m.icount / 3) | 0;
       stats.meshes++;
     }
-  }
+  });
   if (current.stats) { stats.rendered = current.stats.rendered; stats.skipped = current.stats.skipped; }
   updateBox();
   updateStats();
@@ -170,6 +211,10 @@ export function fit() {
 }
 
 export function setLod(level) { lod = level; rebuild(); }
+export function setPart(i) { partIndex = i; rebuild(); fit(); }
+export function currentPart() { return partIndex; }
+export function partNames() { return current ? current.parts.map((p, i) => p.name || ('model ' + i)) : []; }
+export function setVertexColors(on) { vcolor = on; rebuild(); }
 export function setWire(on) { wire = on; root.children.forEach(m => { if (Array.isArray(m.material)) m.material.forEach(x => x.wireframe = on); else m.material.wireframe = on; }); }
 export function setBox(on) { showBox = on; updateBox(); }
 export function setGrid(on) { showGrid = on; grid.visible = on; }
@@ -183,7 +228,7 @@ export function setLit(on) {
 export function availableLods() {
   if (!current) return [];
   const s = new Set();
-  current.parts.forEach(p => p.lods.forEach(l => s.add(l.level)));
+  current.parts.forEach((p, i) => { if (partIndex < 0 || i === partIndex) p.lods.forEach(l => s.add(l.level)); });
   return ['High', 'Med', 'Low', 'VLow'].filter(x => s.has(x));
 }
 

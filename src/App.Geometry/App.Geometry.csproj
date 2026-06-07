@@ -6,4 +6,8 @@
     <AssemblyName>App.Geometry</AssemblyName>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="BCnEncoder.Net" Version="2.3.0" />
+  </ItemGroup>
+
 </Project>

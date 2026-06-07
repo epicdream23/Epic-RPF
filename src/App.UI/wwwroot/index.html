@@ -18,9 +18,9 @@
 </head>
 <body>
   <div id="app">
-    <!-- Toolbar -->
+    <!-- Toolbar (doubles as the custom window title bar) -->
     <header id="toolbar">
-      <div class="brand"><span class="logo">◆</span> Epic&nbsp;RPF</div>
+      <div class="brand"><img class="app-ico" src="./icons/app.png" alt=""> <span class="brand-name">Epic&nbsp;RPF</span></div>
       <div class="mount-bar">
         <input id="folder" type="text" spellcheck="false"
                value="C:\Program Files\Epic Games\GTAV" />
@@ -31,14 +31,25 @@
         <button id="mount" class="btn primary">Mount</button>
       </div>
       <div class="grow"></div>
+      <div id="popoutTitle" class="popout-title"></div>
       <div id="mountInfo" class="muted"></div>
+      <div class="win-btns">
+        <button class="win-btn" id="winMin" title="Minimize">&#x2500;</button>
+        <button class="win-btn" id="winMax" title="Maximize">&#x1F5D6;</button>
+        <button class="win-btn close" id="winClose" title="Close">&#x2715;</button>
+      </div>
     </header>
 
     <!-- Body: tree | content | inspector -->
     <div id="body">
       <aside id="sidebar">
         <div class="search">
-          <input id="filter" type="text" placeholder="Filter loaded files…" spellcheck="false" />
+          <input id="filter" type="text" placeholder="Search files…  (Enter)" spellcheck="false" />
+          <div class="search-opts">
+            <label><input type="checkbox" id="optExt"> Ext</label>
+            <label><input type="checkbox" id="optArchive"> This archive</label>
+            <label><input type="checkbox" id="optFolder"> This folder</label>
+          </div>
         </div>
         <div id="tree" class="tree">
           <div class="empty-hint">Mount a GTA V folder to browse archives.</div>
@@ -50,7 +61,12 @@
         <div id="panes" class="panes">
           <!-- Explorer (OpenIV-style folder list) -->
           <section class="pane" id="pane-explorer" hidden>
-            <div class="crumbs" id="crumbs"></div>
+            <div class="nav-row">
+              <button class="nav-btn" id="navBack" title="Back (Alt+Left)">&#x2190;</button>
+              <button class="nav-btn" id="navFwd" title="Forward (Alt+Right)">&#x2192;</button>
+              <button class="nav-btn" id="navUp" title="Up one level (Alt+Up)">&#x2191;</button>
+              <div class="crumbs" id="crumbs"></div>
+            </div>
             <div class="list">
               <div class="list-head">
                 <span class="c-name">Name</span>
@@ -64,19 +80,38 @@
 
           <!-- 3D viewport -->
           <section class="pane" id="pane-model" hidden>
-            <div class="viewport-wrap">
-              <canvas id="gl"></canvas>
-              <div class="vp-overlay">
-                <div class="vp-tools">
-                  <select id="lodSel" title="Level of detail"></select>
-                  <button class="chip" id="tgWire">Wireframe</button>
-                  <button class="chip" id="tgBox">Bounds</button>
-                  <button class="chip" id="tgGrid" data-on="1">Grid</button>
-                  <button class="chip" id="tgLight" data-on="1">Light</button>
-                  <button class="chip" id="btnFit">Fit</button>
+            <!-- Models in a dictionary (.ydd/.ypt) listed down the left -->
+            <aside class="vp-models" id="vpModels" hidden></aside>
+            <div class="vp-main">
+              <div class="viewport-wrap">
+                <canvas id="gl"></canvas>
+                <div class="vp-overlay">
+                  <div class="vp-tools">
+                    <select id="lodSel" title="Level of detail"></select>
+                    <button class="chip" id="tgWire">Wireframe</button>
+                    <button class="chip" id="tgVColor">Colors</button>
+                    <button class="chip" id="tgBox">Bounds</button>
+                    <button class="chip" id="tgGrid" data-on="1">Grid</button>
+                    <button class="chip" id="tgLight" data-on="1">Light</button>
+                    <button class="chip" id="tgTex" hidden>Textures</button>
+                    <button class="chip" id="btnFit">Fit</button>
+                  </div>
+                  <div class="vp-stats" id="vpStats"></div>
                 </div>
-                <div class="vp-stats" id="vpStats"></div>
               </div>
+              <div class="vp-textures" id="vpTextures" hidden>
+                <button class="vp-tex-expand" id="btnTexExpand" title="Show textures fullscreen">⛶ Expand</button>
+                <div class="vp-tex-row" id="vpTexRow"></div>
+              </div>
+            </div>
+            <!-- Fullscreen texture browser (hides the models + viewer) -->
+            <div class="vp-texfull" id="vpTexFull" hidden>
+              <div class="vp-texfull-head">
+                <span id="vpTexFullTitle">Textures</span>
+                <span class="grow"></span>
+                <button class="chip" id="btnTexCollapse">✕ Close</button>
+              </div>
+              <div class="tex-grid" id="vpTexFullGrid"></div>
             </div>
           </section>
 
@@ -101,6 +136,22 @@
           <!-- Texture list -->
           <section class="pane" id="pane-texture" hidden>
             <div id="texGrid" class="tex-grid"></div>
+          </section>
+
+          <!-- Image / DDS viewer + converter -->
+          <section class="pane" id="pane-image" hidden>
+            <div class="img-bar">
+              <span id="imgInfo" class="muted"></span>
+              <span class="grow"></span>
+              <label class="fmt-lbl">DDS format
+                <select id="ddsFmt">
+                  <option>DXT5</option><option>DXT1</option><option>DXT3</option>
+                  <option>BC7</option><option>BC4</option><option>BC5</option><option>RGBA</option>
+                </select>
+              </label>
+              <button class="btn primary sm" id="btnSaveDds">Save as DDS</button>
+            </div>
+            <div class="img-stage checker"><img id="imgView" alt=""></div>
           </section>
 
           <!-- Welcome -->
@@ -131,6 +182,9 @@
       <span id="statusRight"></span>
     </footer>
   </div>
+
+  <!-- Drag & drop overlay for the DDS converter -->
+  <div id="dropZone" class="dropzone" hidden><div>Drop an image to convert to DDS</div></div>
 
   <!-- Install chooser modal -->
   <div id="modal" class="modal" hidden>
