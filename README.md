@@ -2,7 +2,7 @@ TODO:
 
 1. Fix Sort by issue
 
-2. Fix large files loading too long (core.ypt)
+2. Fix large files loading too long (core.ypt, .ydd files (everything with huge binarys))
 
 3. add minimap parser
 
