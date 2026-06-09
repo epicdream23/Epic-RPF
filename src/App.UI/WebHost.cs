@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shell;
@@ -22,6 +25,8 @@ internal static class WebHost
     {
         await web.EnsureCoreWebView2Async();
         var core = web.CoreWebView2;
+
+        web.AllowExternalDrop = true;   // accept files dragged in from Explorer (texture import)
 
         string wwwroot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
         core.SetVirtualHostNameToFolderMapping(
@@ -60,8 +65,31 @@ internal static class WebHost
             case "min": w.WindowState = WindowState.Minimized; break;
             case "max": w.WindowState = w.WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized; break;
             case "close": w.Close(); break;
+            default:
+                if (action.StartsWith("resize:", StringComparison.Ordinal)) StartResize(w, action.Substring(7));
+                break;
         }
     }
+
+    // The window is frameless (WindowChrome's resize border doesn't work because the
+    // WebView2 child HWND covers it), so resizing is driven from the HTML edges:
+    // JS detects an edge-drag and we kick off the native resize loop here.
+    private const int WM_NCLBUTTONDOWN = 0x00A1;
+    private static readonly Dictionary<string, int> HtCodes = new()
+    {
+        ["l"] = 10, ["r"] = 11, ["t"] = 12, ["tl"] = 13, ["tr"] = 14, ["b"] = 15, ["bl"] = 16, ["br"] = 17,
+    };
+    private static void StartResize(Window w, string edge)
+    {
+        if (w.WindowState == WindowState.Maximized) return;
+        if (!HtCodes.TryGetValue(edge, out int ht)) return;
+        var h = new WindowInteropHelper(w).Handle;
+        if (h == IntPtr.Zero) return;
+        ReleaseCapture();
+        SendMessage(h, WM_NCLBUTTONDOWN, (IntPtr)ht, IntPtr.Zero);
+    }
+    [DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     private static void OpenPopout(int id, string title)
     {

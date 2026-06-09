@@ -19,10 +19,11 @@ public enum RpfFileKind
     Text,                // .txt/.lua/...
     Audio,               // .awc
     Archive,             // .rpf
+    Gfx,                 // .gfx (Scaleform/SWF)
 }
 
 /// <summary>Which viewer tab a file should open in. Hex is the always-available fallback.</summary>
-public enum ViewerKind { Model, Texture, Text, Hex }
+public enum ViewerKind { Model, Texture, Text, Gfx, Hex }
 
 /// <summary>Extension-based file-type detection and viewer routing.</summary>
 public static class FileTypes
@@ -38,6 +39,7 @@ public static class FileTypes
         ".ybn" => RpfFileKind.Bounds,
         ".ynv" => RpfFileKind.Navmesh,
         ".rpf" => RpfFileKind.Archive,
+        ".gfx" => RpfFileKind.Gfx,
         ".xml" => RpfFileKind.Xml,
         ".meta" or ".ymt" or ".ymf" or ".pso" or ".ymap" or ".ytyp" => RpfFileKind.Meta,
         ".txt" or ".log" or ".ini" or ".cfg" or ".lua" or ".nametable" or ".dat" => RpfFileKind.Text,
@@ -53,6 +55,7 @@ public static class FileTypes
         RpfFileKind.Drawable or RpfFileKind.DrawableDictionary or RpfFileKind.Fragment
             or RpfFileKind.ParticleEffect => ViewerKind.Model,
         RpfFileKind.TextureDictionary => ViewerKind.Texture,
+        RpfFileKind.Gfx => ViewerKind.Gfx,
         RpfFileKind.Xml or RpfFileKind.Meta or RpfFileKind.Text => ViewerKind.Text,
         _ => ViewerKind.Hex,
     };

@@ -6,7 +6,7 @@
     <UseWPF>true</UseWPF>
     <RootNamespace>App.UI</RootNamespace>
     <AssemblyName>EpicRpf</AssemblyName>
-    <ApplicationIcon></ApplicationIcon>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <!-- WindowsDesktop 10 is the only desktop runtime installed; target it directly. -->
   </PropertyGroup>
 

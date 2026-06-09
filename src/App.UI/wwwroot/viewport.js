@@ -214,6 +214,10 @@ export function setLod(level) { lod = level; rebuild(); }
 export function setPart(i) { partIndex = i; rebuild(); fit(); }
 export function currentPart() { return partIndex; }
 export function partNames() { return current ? current.parts.map((p, i) => p.name || ('model ' + i)) : []; }
+export function partName(i) { return current && current.parts[i] ? current.parts[i].name : null; }
+export function partHash(i) { return current && current.parts[i] ? current.parts[i].hash : null; }
+export function setPartName(i, name) { if (current && current.parts[i]) current.parts[i].name = name; }
+export function setPartData(i, part) { if (current && current.parts[i]) current.parts[i] = part; }
 export function setVertexColors(on) { vcolor = on; rebuild(); }
 export function setWire(on) { wire = on; root.children.forEach(m => { if (Array.isArray(m.material)) m.material.forEach(x => x.wireframe = on); else m.material.wireframe = on; }); }
 export function setBox(on) { showBox = on; updateBox(); }

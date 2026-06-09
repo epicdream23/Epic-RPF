@@ -39,6 +39,21 @@ function setStatus(msg, isErr = false) {
   statusLeft.style.color = isErr ? 'var(--danger)' : '';
 }
 
+// ---- loading bar -------------------------------------------------------------
+// Indeterminate top bar so the app never feels frozen. Ref-counted so overlapping
+// operations keep it visible until the last finishes. `delay` lets fast operations
+// (file opens) skip the bar entirely unless they run long (>250 ms).
+let busyCount = 0;
+function busyInc() { busyCount++; $('progress').hidden = false; }
+function busyDec() { busyCount = Math.max(0, busyCount - 1); if (busyCount === 0) $('progress').hidden = true; }
+async function withProgress(promise, delay = 0) {
+  let shown = false, timer = null;
+  const show = () => { shown = true; busyInc(); };
+  if (delay > 0) timer = setTimeout(show, delay); else show();
+  try { return await promise; }
+  finally { if (timer) clearTimeout(timer); if (shown) busyDec(); }
+}
+
 // Image icon system. Icons live in wwwroot/icons/<name>.png — folders/archives
 // use 'folder'/'archive', files use their extension (e.g. ydr.png, xml.png), and
 // anything without a matching image falls back to file.png. To customise an icon,
@@ -117,7 +132,7 @@ async function mount() {
   if (!folder) return;
   mountBtn.disabled = true;
   setStatus(`Mounting ${folder}…`);
-  const res = await call('mount', { folder, gen9: gen9Chk.checked });
+  const res = await withProgress(call('mount', { folder, gen9: gen9Chk.checked }));   // ~2-3s: show at once
   mountBtn.disabled = false;
   if (!res.ok) { setStatus('Mount failed: ' + (res.error || 'unknown'), true); mountInfo.textContent = ''; return; }
   mountInfo.innerHTML =
@@ -304,6 +319,61 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') { e.preventDefault(); navFwd(); }
   else if (e.key === 'ArrowUp') { e.preventDefault(); navUp(); }
 });
+updateNavButtons();   // start with the global arrows in their correct enabled state
+
+// ---------------------------------------------------------------- resizable + collapsible panels
+// Each side panel can be dragged wider/narrower (a splitter) and collapsed to a
+// thin rail (a toggle). Sizes + collapsed state persist across sessions.
+const PANELS = {
+  sidebar:   { el: () => $('sidebar'),   prop: 'width',     min: 180, max: 680, toggle: 'sideToggle',     open: '⟨', shut: '⟩' },
+  inspector: { el: () => $('inspector'), prop: 'width',     min: 180, max: 680, toggle: 'inspToggle',     open: '⟩', shut: '⟨' },
+  vpmodels:  { el: () => $('vpModels'),  prop: 'flexBasis', min: 120, max: 520, toggle: 'vpModelsToggle', open: '⟨', shut: '⟩' },
+};
+function setPanelSize(name, w) {
+  const p = PANELS[name], el = p.el(); if (!el) return;
+  w = Math.max(p.min, Math.min(p.max, w));
+  el.style[p.prop] = w + 'px';
+  try { localStorage.setItem('panelw_' + name, String(w)); } catch { }
+}
+function setPanelCollapsed(name, on) {
+  const p = PANELS[name], el = p.el(); if (!el) return;
+  el.classList.toggle('collapsed', on);
+  const btn = $(p.toggle); if (btn) { btn.textContent = on ? p.shut : p.open; btn.title = on ? 'Expand panel' : 'Collapse panel'; }
+  try { localStorage.setItem('panelc_' + name, on ? '1' : '0'); } catch { }
+}
+function togglePanel(name) { setPanelCollapsed(name, !PANELS[name].el().classList.contains('collapsed')); }
+function restorePanels() {
+  for (const name in PANELS) {
+    const w = parseFloat(localStorage.getItem('panelw_' + name));
+    if (!isNaN(w)) setPanelSize(name, w);
+    setPanelCollapsed(name, localStorage.getItem('panelc_' + name) === '1');
+  }
+}
+function makeResizer(splitId, name, side) {
+  const split = $(splitId); if (!split) return;
+  split.addEventListener('mousedown', e => {
+    const el = PANELS[name].el();
+    if (!el || el.classList.contains('collapsed')) return;
+    e.preventDefault();
+    const startX = e.clientX, startW = el.getBoundingClientRect().width;
+    split.classList.add('active'); document.body.classList.add('resizing');
+    const onMove = ev => setPanelSize(name, side === 'right' ? startW - (ev.clientX - startX) : startW + (ev.clientX - startX));
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      split.classList.remove('active'); document.body.classList.remove('resizing');
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+$('sideToggle').onclick = () => togglePanel('sidebar');
+$('inspToggle').onclick = () => togglePanel('inspector');
+$('vpModelsToggle').onclick = () => togglePanel('vpmodels');
+makeResizer('splitSidebar', 'sidebar', 'left');
+makeResizer('splitInspector', 'inspector', 'right');
+makeResizer('vpSplit', 'vpmodels', 'left');
+restorePanels();
 
 function renderCrumbs() {
   crumbsEl.innerHTML = '';
@@ -318,7 +388,8 @@ function renderCrumbs() {
 }
 
 let selectedRow = null;
-let sortMode = 'name';   // name | type | size
+let sortMode = 'name';   // name | type | size | attr
+let sortDir = 1;         // 1 = ascending, -1 = descending
 let viewMode = 'details'; // details | list | icons
 
 // ---- multi-selection (Windows-style: click / Ctrl+click / Shift+click) ----
@@ -349,16 +420,14 @@ function onRowClick(node, row, e) {
   showInspectorForSelection(node);
 }
 
-function sortItems(arr) {
-  return arr.slice().sort((a, b) => {
-    if (sortMode === 'size') {
-      const sa = a.container ? -1 : (a.size || 0), sb = b.container ? -1 : (b.size || 0);
-      return (sa - sb) || a.name.localeCompare(b.name, undefined, { numeric: true });
-    }
-    if (sortMode === 'type') return (a.type || '').localeCompare(b.type || '') || a.name.localeCompare(b.name, undefined, { numeric: true });
-    return a.name.localeCompare(b.name, undefined, { numeric: true });
-  });
+function cmpItems(a, b) {
+  const byName = a.name.localeCompare(b.name, undefined, { numeric: true });
+  if (sortMode === 'size') { const sa = a.container ? -1 : (a.size || 0), sb = b.container ? -1 : (b.size || 0); return (sa - sb) || byName; }
+  if (sortMode === 'type') return (a.type || '').localeCompare(b.type || '') || byName;
+  if (sortMode === 'attr') return (a.attrs || '').localeCompare(b.attrs || '') || byName;
+  return byName;
 }
+function sortItems(arr) { return arr.slice().sort((a, b) => sortDir * cmpItems(a, b)); }
 
 function renderList(items) {
   listBody.className = 'list-body view-' + viewMode;
@@ -413,8 +482,31 @@ function makeRow(it) {
   return row;
 }
 
-function setSort(m) { sortMode = m; if (activeTab && activeTab.kind === 'explorer') renderList(explorer.items); }
+function setSort(m, dir) {
+  if (dir === undefined) sortDir = (m === sortMode) ? -sortDir : 1;  // toggle on repeat
+  else sortDir = dir;
+  sortMode = m;
+  if (activeTab && activeTab.kind === 'explorer') { renderList(explorer.items); updateSortHeaders(); }
+}
 function setView(m) { viewMode = m; if (activeTab && activeTab.kind === 'explorer') renderList(explorer.items); }
+// Clickable column headers (Windows-style), with an asc/desc arrow on the active one.
+function updateSortHeaders() {
+  const map = { 'c-name': 'name', 'c-type': 'type', 'c-size': 'size', 'c-attr': 'attr' };
+  for (const cls of Object.keys(map)) {
+    const el = document.querySelector('#pane-explorer .list-head .' + cls);
+    if (!el) continue;
+    if (!el.dataset.base) el.dataset.base = el.textContent;
+    el.classList.toggle('sorted', sortMode === map[cls]);
+    el.textContent = el.dataset.base + (sortMode === map[cls] ? (sortDir > 0 ? ' ▲' : ' ▼') : '');
+  }
+}
+(function wireSortHeaders() {
+  const map = { 'c-name': 'name', 'c-type': 'type', 'c-size': 'size', 'c-attr': 'attr' };
+  for (const cls of Object.keys(map)) {
+    const el = document.querySelector('#pane-explorer .list-head .' + cls);
+    if (el) { el.style.cursor = 'pointer'; el.onclick = () => setSort(map[cls]); }
+  }
+})();
 
 function onItemDbl(item) {
   if (item.container) navigate([...explorer.crumbs, { id: item.id, name: item.name }]);
@@ -423,13 +515,14 @@ function onItemDbl(item) {
 
 async function openFile(n, as) {
   setStatus(`Opening ${n.name}…`);
-  const res = await call('open', { node: n.id, as });
+  const res = await withProgress(call('open', { node: n.id, as }), 250);   // only if slow (>250ms)
   if (res.type === 'error') { setStatus('Open failed: ' + res.message, true); return; }
   if (res.type === 'model') openModelTab(res, n.id);
   else if (res.type === 'edit') openTab(n.id, 'edit', n.name, res, n.id);
   else if (res.type === 'hex') openTab(n.id, 'hex', n.name, res, n.id);
   else if (res.type === 'texture') openTab(n.id, 'texture', n.name, res, n.id);
   else if (res.type === 'image') openTab(n.id, 'image', n.name, res, n.id);
+  else if (res.type === 'gfx') openTab(n.id, 'gfx', n.name, res, n.id);
   setStatus(`Opened ${n.name}`);
 }
 
@@ -541,17 +634,19 @@ function activate(tab) {
   else if (tab.kind === 'hex') renderHex(tab.data);
   else if (tab.kind === 'texture') renderTextures(tab.data);
   else if (tab.kind === 'image') fillImage(tab.data);
+  else if (tab.kind === 'gfx') fillGfx(tab.data);
   showInspectorForTab(tab);
 }
 
 // ---------------------------------------------------------------- model pane
-let modelTextures = [];
+let modelTextures = [], curModel = null;
 function fillModel(res) {
+  curModel = res;
   collapseTextures();
   viewport.loadModel(res);
   fillModelList();
   fillLodSelector();
-  fillModelTextures(res.textures || []);
+  fillModelTextures(res.textures || [], res.node);
   requestAnimationFrame(() => requestAnimationFrame(() => viewport.fit()));
   updateVpStats();
 }
@@ -560,53 +655,192 @@ function fillLodSelector() {
   for (const l of viewport.availableLods()) { const o = document.createElement('option'); o.value = l; o.textContent = l; sel.append(o); }
 }
 // A .ydd / .ypt holds several independent drawables — list them down the left so
-// the user clicks one (or "All") instead of using a dropdown.
+// the user clicks one (or "All"). Double-click a name to rename it (custom, saved).
 function fillModelList() {
-  const wrap = $('vpModels');
+  const wrap = $('vpModels'), list = $('vpModelList'), split = $('vpSplit');
   const names = viewport.partNames();
-  wrap.innerHTML = '';
-  if (names.length <= 1) { wrap.hidden = true; return; }
-  wrap.hidden = false;
-  const head = document.createElement('div'); head.className = 'vp-mhead'; head.textContent = `Models (${names.length})`;
-  wrap.append(head);
+  list.innerHTML = '';
+  const multi = names.length > 1;
+  wrap.hidden = !multi; split.hidden = !multi;
+  if (!multi) return;
+  $('vpModelsTitle').textContent = `Models (${names.length})`;
   const add = (label, idx) => {
     const el = document.createElement('div');
-    el.className = 'vp-model'; el.dataset.idx = String(idx); el.textContent = label; el.title = label;
+    el.className = 'vp-model'; el.dataset.idx = String(idx); el.textContent = label; el.title = label + (idx >= 0 ? '  (double-click to rename)' : '');
     if (viewport.currentPart() === idx) el.classList.add('sel');
     el.onclick = () => selectPart(idx);
-    wrap.append(el);
+    if (idx >= 0) el.ondblclick = e => { e.stopPropagation(); editPartName(idx, el); };
+    list.append(el);
   };
   add(`All (${names.length})`, -1);
   names.forEach((n, i) => add(n, i));
 }
-function selectPart(idx) {
+async function selectPart(idx) {
+  // Lazily decode the drawable's geometry the first time it's shown (fast open).
+  if (idx >= 0 && curModel && curModel.parts[idx] && curModel.parts[idx].lazy) {
+    const res = await withProgress(call('modelPart', { node: curModel.node, index: idx }), 250);
+    if (res.ok) { curModel.parts[idx] = res.part; viewport.setPartData(idx, res.part); }
+  }
   viewport.setPart(idx);
   for (const el of $('vpModels').querySelectorAll('.vp-model')) el.classList.toggle('sel', parseInt(el.dataset.idx, 10) === idx);
   fillLodSelector();
   updateVpStats();
 }
-// Embedded textures (currently from .ypt) shown in a toggleable strip — visible
-// by default when the file carries textures so both models and textures are seen.
-function fillModelTextures(texs) {
-  modelTextures = texs || [];
+// Inline-rename a model; the name is saved client-side (LUT), never into the file.
+function editPartName(idx, el) {
+  const hash = viewport.partHash(idx);
+  if (hash == null || !curModel) return;
+  const inp = document.createElement('input');
+  inp.className = 'vp-rename'; inp.value = el.textContent; el.textContent = ''; el.append(inp);
+  inp.focus(); inp.select();
+  const commit = async () => {
+    const name = inp.value.trim();
+    const res = await call('renameModel', { file: curModel.file, hash, name });
+    el.textContent = (res.ok && name) ? name : (viewport.partName(idx) || '');
+    viewport.setPartName(idx, el.textContent);
+  };
+  inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); else if (e.key === 'Escape') { inp.value = viewport.partName(idx) || ''; inp.blur(); } };
+  inp.onblur = commit;
+}
+
+// ---- lazy texture thumbnails (decode on demand as they scroll into view) ----
+const texObserver = new IntersectionObserver(es => {
+  for (const e of es) if (e.isIntersecting) { texObserver.unobserve(e.target); loadTexThumb(e.target); }
+}, { rootMargin: '150px' });
+async function loadTexThumb(ph) {
+  const res = await call('texImage', { node: ph.__node, index: ph.__index });
+  if (res && res.img) { ph.style.backgroundImage = `url("${res.img}")`; ph.textContent = ''; ph.classList.remove('noimg'); ph.__img = res.img; }
+  else { ph.classList.add('noimg'); ph.textContent = 'no preview'; }
+}
+function texThumb(t, node, cls) {
+  const ph = document.createElement('div'); ph.className = cls + ' checker'; ph.__node = node; ph.__index = t.index;
+  texObserver.observe(ph);
+  return ph;
+}
+function openTexImageUrl(name, fmt, img) {
+  openTab('img:' + name, 'image', name + '.dds', { dataUrl: img, format: fmt, name });
+}
+
+// ---- import / replace a texture inside an open .ytd / .ypt ----
+// Pick an image or .dds; a .dds imports as-is, an image is re-encoded server-side to
+// the original texture's format. The replaced texture keeps its name so the model
+// keeps referencing it. The new bytes are written straight back into the archive.
+function replaceTexturePrompt(node, index, name) {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.dds,image/png,image/jpeg,image/bmp,image/webp,image/*';
+  inp.onchange = async () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    try {
+      const buf = new Uint8Array(await f.arrayBuffer());
+      const isDds = /\.dds$/i.test(f.name) ||
+        (buf.length > 4 && buf[0] === 0x44 && buf[1] === 0x44 && buf[2] === 0x53 && buf[3] === 0x20); // "DDS "
+      let payload;
+      if (isDds) payload = { node, index, name, content: bytesToB64(buf) };
+      else {
+        const { rgba, w, h } = await imageFileToRgba(f);
+        payload = { node, index, name, rgba: bytesToB64(rgba), w, h };
+      }
+      setStatus(`Replacing ${name}…`);
+      const res = await withProgress(call('replaceTexture', payload), 250);
+      if (res.ok) { setStatus(`Replaced ${res.name} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
+      else setStatus('Replace failed: ' + (res.message || ''), true);
+    } catch (e) { setStatus('Replace failed: ' + e.message, true); }
+  };
+  inp.click();
+}
+function imageFileToRgba(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const cv = document.createElement('canvas'); cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      const cx = cv.getContext('2d'); cx.drawImage(img, 0, 0);
+      let data;
+      try { data = cx.getImageData(0, 0, cv.width, cv.height).data; }
+      catch (e) { URL.revokeObjectURL(url); reject(e); return; }
+      URL.revokeObjectURL(url);
+      resolve({ rgba: new Uint8Array(data.buffer), w: cv.width, h: cv.height });
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('cannot decode image')); };
+    img.src = url;
+  });
+}
+// After a replace, rebuild whichever texture view is showing this dictionary so the
+// new thumbnail (and shifted indices) appear without reopening.
+function applyReplacedTextures(node, textures) {
+  if (activeTab && activeTab.kind === 'texture' && activeTab.data && activeTab.data.node === node) {
+    activeTab.data.textures = textures; renderTextures(activeTab.data);
+  }
+  if (curModel && curModel.node === node) {
+    curModel.textures = textures;
+    fillModelTextures(textures, node);
+    if (!$('vpTexFull').hidden) expandTextures();
+  }
+}
+function texMenu(node, t, ev, ph, fmt) {
+  ev.preventDefault(); ev.stopPropagation();
+  showMenu([
+    { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name) },
+    { sep: true },
+    { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
+  ], ev.clientX, ev.clientY);
+}
+
+// The open dictionary a dropped file would import into: the active .ytd (texture
+// tab) or .ypt (model tab). Returns null when there's no archive to drop into.
+function dropTargetNode() {
+  if (activeTab && activeTab.kind === 'texture' && activeTab.data) return activeTab.data.node;
+  if (activeTab && activeTab.kind === 'model' && curModel && /\.ypt$/.test(curModel.file || '')) return curModel.node;
+  return null;
+}
+function dropTargetName() {
+  if (activeTab && activeTab.kind === 'texture') return activeTab.title || 'archive';
+  if (activeTab && activeTab.kind === 'model' && curModel) return curModel.name || 'archive';
+  return 'archive';
+}
+// Import a dropped image/DDS into the open dictionary. The texture name is the
+// dropped file's base name — matching name replaces, otherwise it's added.
+async function importDroppedTexture(node, file) {
+  const baseName = file.name.replace(/\.[^.]+$/, '').toLowerCase();
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const isDds = /\.dds$/i.test(file.name) ||
+      (buf.length > 4 && buf[0] === 0x44 && buf[1] === 0x44 && buf[2] === 0x53 && buf[3] === 0x20); // "DDS "
+    let payload;
+    if (isDds) payload = { node, name: baseName, index: -1, content: bytesToB64(buf) };
+    else {
+      const { rgba, w, h } = await imageFileToRgba(file);
+      payload = { node, name: baseName, index: -1, rgba: bytesToB64(rgba), w, h };
+    }
+    setStatus(`Importing ${baseName}…`);
+    const res = await withProgress(call('replaceTexture', payload), 250);
+    if (res.ok) { setStatus(`Imported ${res.name} into ${dropTargetName()} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
+    else setStatus('Import failed: ' + (res.message || ''), true);
+  } catch (e) { setStatus('Import failed: ' + e.message, true); }
+}
+
+// Embedded textures (e.g. .ypt) in a toggleable strip — metadata shows instantly,
+// thumbnails stream in lazily so opening is fast even with 100+ textures.
+function fillModelTextures(texs, node) {
+  modelTextures = (texs || []).map(t => ({ ...t, node }));
   const wrap = $('vpTextures'), row = $('vpTexRow'), chip = $('tgTex');
   row.innerHTML = '';
   const has = modelTextures.length > 0;
-  chip.hidden = !has;
-  chip.classList.toggle('on', has);
-  wrap.hidden = !has;
+  chip.hidden = !has; chip.classList.toggle('on', has); wrap.hidden = !has;
   if (!has) return;
   for (const t of modelTextures) row.append(makeTexThumb(t));
-}
-function openTexImage(t, fmt) {
-  openTab('img:' + t.name, 'image', t.name + '.dds', { dataUrl: t.img, format: fmt, name: t.name });
 }
 function makeTexThumb(t) {
   const fmt = (t.format || '').replace('D3DFMT_', '');
   const c = document.createElement('div'); c.className = 'vp-tex';
-  c.innerHTML = (t.img ? `<img class="checker" src="${t.img}" alt="">` : `<div class="noimg checker">no preview</div>`)
-    + `<span class="vt-name">${t.name}</span><span class="vt-dim">${t.width}×${t.height} · ${fmt}</span>`;
-  if (t.img) c.onclick = () => openTexImage(t, fmt);
+  const ph = texThumb(t, t.node, 'vt-img');
+  const name = document.createElement('span'); name.className = 'vt-name'; name.textContent = t.name;
+  const dim = document.createElement('span'); dim.className = 'vt-dim'; dim.textContent = `${t.width}×${t.height} · ${fmt}`;
+  c.append(ph, name, dim);
+  c.onclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };
+  c.oncontextmenu = ev => texMenu(t.node, t, ev, ph, fmt);
   return c;
 }
 // "Expand" -> textures fill the pane (model list + 3D viewer hidden).
@@ -616,9 +850,12 @@ function expandTextures() {
   for (const t of modelTextures) {
     const fmt = (t.format || '').replace('D3DFMT_', '');
     const c = document.createElement('div'); c.className = 'tex-card';
-    c.innerHTML = (t.img ? `<img class="preview checker" src="${t.img}" alt="">` : `<div class="preview noimg checker">no preview</div>`)
-      + `<div class="tn">${t.name}</div><div class="td">${t.width}×${t.height} · ${fmt}</div>`;
-    if (t.img) c.onclick = () => openTexImage(t, fmt);
+    const ph = texThumb(t, t.node, 'preview');
+    const tn = document.createElement('div'); tn.className = 'tn'; tn.textContent = t.name;
+    const td = document.createElement('div'); td.className = 'td'; td.textContent = `${t.width}×${t.height} · ${fmt}`;
+    c.append(ph, tn, td);
+    c.onclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };
+    c.oncontextmenu = ev => texMenu(t.node, t, ev, ph, fmt);
     grid.append(c);
   }
   $('vpTexFull').hidden = false;
@@ -654,7 +891,9 @@ async function saveActive(target) {
   if (!t || t.kind !== 'edit') return;
   const content = editor.value(t);
   setStatus(target === 'rpf' ? 'Saving to archive…' : 'Exporting…');
-  const res = await call('save', { node: t.key, content, format: t.data.format, metaName: t.data.metaName, target });
+  // Pass the file's stable path too: a background remount (live file watch) recycles
+  // node ids, so the bridge re-resolves the save target by path when the node is stale.
+  const res = await call('save', { node: t.key, path: t.data.path, content, format: t.data.format, metaName: t.data.metaName, target });
   if (res.canceled) { setStatus('Save canceled'); return; }
   if (res.ok) {
     if (target === 'rpf') { editor.markSaved(t); updateDirty(t); setStatus(`Saved ${t.title} into archive (${fmtSize(res.size)})`); }
@@ -683,24 +922,430 @@ function renderTextures(res) {
   const g = $('texGrid'); g.innerHTML = '';
   if (!res.textures.length) { g.innerHTML = '<div class="muted" style="padding:14px">No textures.</div>'; return; }
   for (const t of res.textures) {
+    const fmt = (t.format || '').replace('D3DFMT_', '');
     const c = document.createElement('div'); c.className = 'tex-card';
-    const fmt = t.format.replace('D3DFMT_', '');
-    const prev = t.img
-      ? `<img class="preview checker" src="${t.img}" alt="">`
-      : `<div class="preview noimg checker">no preview</div>`;
-    c.innerHTML = prev + `<div class="tn">${t.name}</div><div class="td">${t.width}×${t.height} · ${fmt} · ${t.levels} mip${t.levels === 1 ? '' : 's'}</div>`;
-    if (t.img) c.onclick = () => openTab('img:' + t.name, 'image', t.name + '.dds', { dataUrl: t.img, format: fmt, name: t.name });
+    const ph = texThumb(t, res.node, 'preview');
+    const tn = document.createElement('div'); tn.className = 'tn'; tn.textContent = t.name;
+    const td = document.createElement('div'); td.className = 'td'; td.textContent = `${t.width}×${t.height} · ${fmt} · ${t.levels} mip${t.levels === 1 ? '' : 's'}`;
+    c.append(ph, tn, td);
+    c.onclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };
+    c.oncontextmenu = ev => texMenu(res.node, t, ev, ph, fmt);
     g.appendChild(c);
   }
 }
 
+// ---------------------------------------------------------------- gfx (Scaleform/SWF) structure viewer
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+// JPEXS-style layout: a tree of every defined symbol on the left, a live preview
+// (vector shapes / sprite timelines / resolved bitmaps) on the right. GTA's main
+// timeline is almost always empty (content is attached by ActionScript at runtime),
+// so browsing the symbol tree — not "playing the main timeline" — is how you see
+// what's in the file.
+const gfx = {
+  canvas: null, ctx: null, res: null, scene: null,
+  symbol: 'summary', curKind: 'summary', curId: -1,
+  frame: 0, playing: false, raf: 0, lastT: 0,
+  zoom: 1, panX: 0, panY: 0, images: new Map(),
+};
+const GFX_GROUPS = ['Sprite', 'Shape', 'Image', 'Font', 'Text', 'Button', 'Sound'];
+const GFX_KIND = { Sprite: 'sprite', Shape: 'shape', Image: 'image', Font: 'info', Text: 'info', Button: 'info', Sound: 'info' };
+
+function fillGfx(res) {
+  gfxStop();
+  gfx.res = res; gfx.scene = null; gfx.images = new Map();
+  gfx.symbol = 'summary'; gfx.curKind = 'summary'; gfx.curId = -1; gfx.frame = 0;
+  $('gfxFileName').textContent = res.name || '';
+  $('gfxFileMeta').textContent = res.ok
+    ? `${esc(res.signature)} · ${Math.round(res.width)}×${Math.round(res.height)} · ${res.frameCount}f`
+    : 'parse error';
+  $('gfxFilter').value = '';
+  gfxBuildTree(res);
+  gfxEnsureScene().then(() => gfxSelect('summary'));
+}
+
+// Fetch the renderable scene (shapes/sprites/timeline + resolved bitmaps) once.
+async function gfxEnsureScene() {
+  if (gfx.scene || !gfx.res) return gfx.scene;
+  const sc = await call('gfxScene', { node: gfx.res.node });
+  if (sc && sc.ok) {
+    gfx.scene = sc; gfx.images = new Map();
+    for (const im of sc.images || []) if (im.dataUrl) {
+      const img = new Image();
+      img.onload = () => { if (['image', 'shape', 'sprite', 'main'].includes(gfx.curKind)) gfxDraw(); };
+      img.src = im.dataUrl; gfx.images.set(im.id, img);
+    }
+  }
+  return gfx.scene;
+}
+
+// Build the left tree from the structural tag list (every defined character),
+// labelled by exported symbol name where the file provides one.
+function gfxBuildTree(res) {
+  const tree = $('gfxTree'); tree.innerHTML = '';
+  const nameById = new Map();
+  for (const s of res.symbols || []) if (!nameById.has(s.id)) nameById.set(s.id, s.name);
+
+  tree.append(gfxRow({ key: 'summary', label: 'Summary', kind: 'doc', depth: 0 }));
+  tree.append(gfxRow({ key: 'main', label: 'Main timeline', kind: 'main', meta: `${res.frameCount}f`, depth: 0 }));
+
+  const groups = {}; for (const g of GFX_GROUPS) groups[g] = [];
+  const seen = new Set();
+  for (const t of res.tags || []) {
+    if (t.id == null || !(t.category in groups)) continue;
+    const k = t.category + ':' + t.id; if (seen.has(k)) continue; seen.add(k);
+    groups[t.category].push({ id: t.id, name: nameById.get(t.id) || '', detail: t.detail || '' });
+  }
+  for (const cat of GFX_GROUPS) {
+    const arr = groups[cat]; if (!arr.length) continue;
+    arr.sort((a, b) => a.id - b.id);
+    tree.append(gfxGroupEl(cat, arr));
+  }
+}
+// A plain (non-expandable) tree row. depth drives indentation; the blank twisty
+// spacer keeps icons aligned with expandable rows.
+function gfxRow({ key, label, kind, meta, depth }) {
+  const el = document.createElement('div');
+  el.className = 'gfx-node'; el.dataset.key = key; el.style.setProperty('--d', depth || 0);
+  el.innerHTML = `<span class="gfx-tw-sp"></span><span class="gfx-ic gfx-ic-${kind}"></span><span class="gfx-nlabel">${esc(label)}</span>`
+    + (meta ? `<span class="gfx-nmeta">${esc(meta)}</span>` : '');
+  el.onclick = () => gfxSelect(key);
+  return el;
+}
+// An expandable sprite row: clicking the label previews the sprite, clicking the
+// twisty reveals the objects it contains (its display list), each itself selectable
+// — and nested sprites expand recursively.
+function gfxSpriteRow(id, label, meta, depth) {
+  const wrap = document.createElement('div'); wrap.className = 'gfx-snode';
+  const row = document.createElement('div'); row.className = 'gfx-node'; row.dataset.key = 'sprite:' + id; row.style.setProperty('--d', depth);
+  row.innerHTML = `<span class="gfx-tw gfx-ctw">▸</span><span class="gfx-ic gfx-ic-sprite"></span><span class="gfx-nlabel">${esc(label)}</span>`
+    + (meta ? `<span class="gfx-nmeta">${esc(meta)}</span>` : '');
+  const kids = document.createElement('div'); kids.className = 'gfx-children'; kids.hidden = true;
+  let built = false;
+  const tw = row.querySelector('.gfx-ctw');
+  tw.onclick = e => {
+    e.stopPropagation();
+    const open = kids.hidden;
+    if (open && !built) { gfxBuildChildren(kids, id, depth + 1); built = true; }
+    kids.hidden = !open; tw.textContent = open ? '▾' : '▸';
+  };
+  row.onclick = () => gfxSelect('sprite:' + id);
+  wrap.append(row, kids);
+  return wrap;
+}
+// Build a sprite's child rows from its display list (the union of placed objects
+// across its frames, by depth). Shapes/images are leaves; sprites are expandable.
+function gfxBuildChildren(container, spriteId, depth) {
+  const sp = gfx.scene && gfx.scene.sprites[spriteId];
+  const items = [];
+  if (sp) { const seen = new Set(); for (const fr of sp.frames) for (const pl of fr) { if (pl.char < 0 || seen.has(pl.depth)) continue; seen.add(pl.depth); items.push(pl); } }
+  if (!items.length) { const e = document.createElement('div'); e.className = 'gfx-empty'; e.style.setProperty('--d', depth); e.textContent = sp ? '(empty)' : '(no contents)'; container.append(e); return; }
+  items.sort((a, b) => a.depth - b.depth);
+  for (const pl of items) {
+    const isSprite = !!gfx.scene.sprites[pl.char], isShape = !!gfx.scene.shapes[pl.char];
+    const kind = isSprite ? 'sprite' : isShape ? 'shape' : 'image';
+    const sym = (gfx.res.symbols || []).find(s => s.id === pl.char);
+    const label = pl.name || (sym && sym.name) || (`${kind[0].toUpperCase()}${kind.slice(1)} ${pl.char}`);
+    if (isSprite) container.append(gfxSpriteRow(pl.char, label, `#${pl.char}`, depth));
+    else container.append(gfxRow({ key: kind + ':' + pl.char, label, kind, meta: `#${pl.char}`, depth }));
+  }
+}
+function gfxGroupEl(cat, arr) {
+  const wrap = document.createElement('div'); wrap.className = 'gfx-group';
+  const head = document.createElement('div'); head.className = 'gfx-ghead open';
+  head.innerHTML = `<span class="gfx-tw">▾</span><span class="gfx-gname">${cat}s</span><span class="gfx-gcount">${arr.length}</span>`;
+  const body = document.createElement('div'); body.className = 'gfx-gbody';
+  const kind = GFX_KIND[cat];
+  for (const it of arr) {
+    if (cat === 'Sprite') body.append(gfxSpriteRow(it.id, it.name || `Sprite ${it.id}`, it.name ? `#${it.id}` : '', 1));
+    else body.append(gfxRow({ key: (kind === 'info' ? 'info:' + cat + ':' : kind + ':') + it.id, label: it.name || `${cat} ${it.id}`, kind, meta: it.name ? `#${it.id}` : (it.detail || ''), depth: 1 }));
+  }
+  head.onclick = () => {
+    const open = head.classList.toggle('open');
+    body.hidden = !open; head.querySelector('.gfx-tw').textContent = open ? '▾' : '▸';
+  };
+  wrap.append(head, body);
+  return wrap;
+}
+
+// ---- selection + preview ----
+async function gfxSelect(key) {
+  gfx.symbol = key; gfx.frame = 0; gfxStop();
+  for (const el of $('gfxTree').querySelectorAll('.gfx-node')) el.classList.toggle('sel', el.dataset.key === key);
+  await gfxEnsureScene();
+
+  if (key === 'summary') { gfx.curKind = 'summary'; gfxShowSummary(); return; }
+  if (key.startsWith('info:')) { gfx.curKind = 'info'; gfxShowItemInfo(key); return; }
+
+  // visual: main / sprite / shape / image
+  $('gfxInfo').hidden = true; $('gfxStage').hidden = false; $('gfxRenderMsg') && ($('gfxRenderMsg').textContent = '');
+  if (!gfx.scene) { gfx.curKind = 'main'; $('gfxSel').textContent = gfxSelLabel(key); $('gfxPlay').hidden = true; $('gfxFrame').hidden = true; $('gfxRenderMsg').textContent = 'Could not build render scene'; return; }
+  gfx.curKind = key === 'main' ? 'main' : key.split(':')[0];
+  gfx.curId = key.includes(':') ? parseInt(key.split(':')[1]) : -1;
+  $('gfxSel').textContent = gfxSelLabel(key);
+  const anim = key === 'main' || key.startsWith('sprite:');
+  $('gfxPlay').hidden = !anim; $('gfxFrame').hidden = !anim;
+  if (anim) { const r = gfxAnimRange(); $('gfxFrame').max = Math.max(r - 1, 0); $('gfxFrame').value = 0; gfxUpdateFrameLbl(); }
+  else $('gfxFrameLbl').textContent = '';
+  if (gfx.curKind === 'image' && !gfx.images.has(gfx.curId)) {
+    const e = (gfx.scene.images || []).find(i => i.id === gfx.curId);
+    $('gfxRenderMsg').textContent = e && e.file ? `External image not found: ${e.file}` : 'Image not resolved';
+  }
+  // double rAF: the stage was just un-hidden, so wait for layout before fitting
+  // (a single frame can still measure a zero-size canvas).
+  requestAnimationFrame(() => requestAnimationFrame(gfxFit));
+}
+function gfxSelLabel(key) {
+  if (key === 'main') return 'Main timeline';
+  const [k, idStr] = key.split(':'); const id = parseInt(idStr);
+  const s = (gfx.res.symbols || []).find(x => x.id === id);
+  return `${k.charAt(0).toUpperCase()}${k.slice(1)} #${id}` + (s ? ` · ${s.name}` : '');
+}
+function gfxShowSummary() {
+  $('gfxStage').hidden = true; $('gfxInfo').hidden = false;
+  $('gfxPlay').hidden = true; $('gfxFrame').hidden = true; $('gfxFrameLbl').textContent = '';
+  $('gfxSel').textContent = 'Summary';
+  const res = gfx.res, el = $('gfxInfo');
+  if (!res.ok) { el.innerHTML = `<div class="gfx-pad muted">Could not parse GFX: ${esc(res.error || 'unknown error')}</div>`; return; }
+  const r1 = n => Math.round(n * 10) / 10, counts = res.counts || {};
+  const order = ['Shape', 'Sprite', 'Font', 'Image', 'Text', 'Button', 'Sound', 'Control', 'Meta', 'Other'];
+  let h = `<div class="gfx-isect"><div class="gfx-meta2">${esc(res.signature)} · ${esc(res.compression)} · v${res.version} · ${r1(res.width)}×${r1(res.height)} · ${r1(res.frameRate)} fps · ${res.frameCount} frames · ${res.tagCount} tags</div>`;
+  h += `<div class="gfx-chips">` + order.filter(k => counts[k]).map(k => `<span class="gfx-chip"><b>${counts[k]}</b> ${k}${counts[k] === 1 ? '' : 's'}</span>`).join('') + `</div></div>`;
+  if (res.images && res.images.length)
+    h += `<div class="gfx-isect"><h4>Referenced images (${res.images.length})</h4>` +
+      res.images.map(im => `<div class="gfx-irow"><span class="gfx-id">#${im.id}</span><span class="gfx-iname">${esc(im.file)}</span><span class="gfx-idim">${im.width}×${im.height}</span></div>`).join('') + `</div>`;
+  h += `<div class="gfx-isect"><h4>Tags (${res.tags.length})</h4><div class="gfx-tags">` +
+    res.tags.map(t => `<div class="gfx-trow gfx-cat-${esc(t.category)}"><span class="gfx-tcode">${t.code}</span><span class="gfx-tname">${esc(t.name)}</span><span class="gfx-id">${t.id != null ? '#' + t.id : ''}</span><span class="gfx-tdetail">${esc(t.detail || '')}</span></div>`).join('') + `</div></div>`;
+  el.innerHTML = h;
+}
+function gfxShowItemInfo(key) {
+  $('gfxStage').hidden = true; $('gfxInfo').hidden = false;
+  $('gfxPlay').hidden = true; $('gfxFrame').hidden = true; $('gfxFrameLbl').textContent = '';
+  const [, cat, idStr] = key.split(':'); const id = parseInt(idStr), res = gfx.res;
+  const tags = (res.tags || []).filter(t => t.id === id && t.category === cat);
+  const sym = (res.symbols || []).find(s => s.id === id);
+  $('gfxSel').textContent = `${cat} #${id}` + (sym ? ` · ${sym.name}` : '');
+  let h = `<div class="gfx-isect"><h4>${esc(cat)} #${id}</h4>`;
+  if (sym) h += `<div class="gfx-prow"><span class="gk">Exported name</span><span class="gv">${esc(sym.name)}</span></div>`;
+  for (const t of tags) h += `<div class="gfx-prow"><span class="gk">${esc(t.name)}</span><span class="gv">${esc(t.detail || '—')}</span></div>`;
+  h += `<div class="gfx-note">Fonts, text and buttons aren't vector-rendered here. Shapes, sprites and images preview in the canvas.</div></div>`;
+  $('gfxInfo').innerHTML = h;
+}
+function gfxAnimRange() {
+  const sc = gfx.scene, sel = gfx.symbol; let own = 1;
+  if (sel === 'main') own = sc.main.frameCount;
+  else if (sel.startsWith('sprite:')) own = (sc.sprites[sel.slice(7)] || {}).frameCount || 1;
+  else return 1;
+  if (own > 1) return own;
+  let mx = 1; for (const k in sc.sprites) mx = Math.max(mx, sc.sprites[k].frameCount || 1);   // animate nested sprites
+  return mx;
+}
+function gfxUpdateFrameLbl() { $('gfxFrameLbl').textContent = `${gfx.frame + 1} / ${gfxAnimRange()}`; }
+
+function gfxApply(m, x, y) { return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]; }
+function gfxMul(a, b) { return [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1], a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]]; }
+function gfxPath(cmds) {
+  const p = new Path2D();
+  for (let i = 0; i < cmds.length;) { const op = cmds[i++]; if (op === 0) p.moveTo(cmds[i++], cmds[i++]); else if (op === 1) p.lineTo(cmds[i++], cmds[i++]); else p.quadraticCurveTo(cmds[i++], cmds[i++], cmds[i++], cmds[i++]); }
+  return p;
+}
+// Apply an accumulated CXFORM colour transform to a css rgba() string (RGB only;
+// alpha rides on globalAlpha). null cx = identity. This is what makes runtime-neutral
+// shapes that are *statically* tinted via a placement's colour transform show their
+// real colour instead of the base (often white/grey) fill.
+function gfxApplyCx(css, cx) {
+  if (!cx || !css) return css;
+  const m = /rgba?\(([^)]+)\)/i.exec(css); if (!m) return css;
+  const p = m[1].split(',').map(parseFloat);
+  const cl = v => v < 0 ? 0 : v > 255 ? 255 : v;
+  return `rgba(${Math.round(cl(p[0] * cx.mul[0] + cx.add[0]))},${Math.round(cl(p[1] * cx.mul[1] + cx.add[1]))},${Math.round(cl(p[2] * cx.mul[2] + cx.add[2]))},${p.length > 3 ? p[3] : 1})`;
+}
+// Compose a placement's CXFORM under the current one: result = parent(place(colour)).
+function gfxCompose(cx, pl) {
+  const pm = pl.cMul, pa = pl.cAdd;
+  if (!pm && !pa) return cx || null;
+  const m0 = cx ? cx.mul : [1, 1, 1], a0 = cx ? cx.add : [0, 0, 0];
+  const pmul = pm || [1, 1, 1, 1], padd = pa || [0, 0, 0, 0];
+  return {
+    mul: [m0[0] * pmul[0], m0[1] * pmul[1], m0[2] * pmul[2]],
+    add: [padd[0] * m0[0] + a0[0], padd[1] * m0[1] + a0[1], padd[2] * m0[2] + a0[2]],
+  };
+}
+function gfxStyle(ctx, f, cx) {
+  if (f.type === 'solid') return gfxApplyCx(f.color || '#888', cx);
+  if (f.type === 'linear') { const m = f.matrix, a = gfxApply(m, -819.2, 0), b = gfxApply(m, 819.2, 0); const g = ctx.createLinearGradient(a[0], a[1], b[0], b[1]); for (const s of f.stops) g.addColorStop(Math.max(0, Math.min(1, s.pos)), gfxApplyCx(s.color, cx)); return g; }
+  if (f.type === 'radial') { const m = f.matrix, c = gfxApply(m, 0, 0), e = gfxApply(m, 819.2, 0); const r = Math.hypot(e[0] - c[0], e[1] - c[1]) || 1; const g = ctx.createRadialGradient(c[0], c[1], 0, c[0], c[1], r); for (const s of f.stops) g.addColorStop(Math.max(0, Math.min(1, s.pos)), gfxApplyCx(s.color, cx)); return g; }
+  if (f.type === 'bitmap') { const img = gfx.images.get(f.image); if (img && img.complete && img.naturalWidth) { const pat = ctx.createPattern(img, f.repeat ? 'repeat' : 'no-repeat'); try { pat.setTransform(new DOMMatrix(f.matrix)); } catch { } return pat; } return 'rgba(120,140,160,.45)'; }
+  return '#888';
+}
+function gfxDrawShape(ctx, sh, cx) {
+  for (const f of sh.fills) { ctx.fillStyle = gfxStyle(ctx, f, cx); ctx.fill(gfxPath(f.path)); }
+  for (const s of sh.strokes) { ctx.strokeStyle = gfxApplyCx(s.color || '#000', cx); ctx.lineWidth = Math.max(s.width || 0, 0.15); ctx.stroke(gfxPath(s.path)); }
+}
+function gfxDrawChar(ctx, id, tick, guard, cx) {
+  if (guard > 64) return; const sc = gfx.scene, ids = String(id);
+  if (sc.shapes[ids]) { gfxDrawShape(ctx, sc.shapes[ids], cx); return; }
+  const sp = sc.sprites[ids];
+  if (sp) { const fc = sp.frameCount || 1; const fr = sp.frames[((tick % fc) + fc) % fc] || sp.frames[0] || []; gfxDrawList(ctx, fr, tick, guard + 1, cx); }
+}
+function gfxDrawList(ctx, list, tick, guard, cx) {
+  for (const pl of list) {
+    if (pl.char < 0) continue;
+    ctx.save();
+    const m = pl.matrix; ctx.transform(m[0], m[1], m[2], m[3], m[4], m[5]);
+    const a = ctx.globalAlpha; ctx.globalAlpha = a * (pl.alpha == null ? 1 : pl.alpha);
+    gfxDrawChar(ctx, pl.char, tick, guard, gfxCompose(cx, pl));
+    ctx.globalAlpha = a; ctx.restore();
+  }
+}
+function gfxBoundsOf(id, m, acc, guard) {
+  if (guard > 64) return; const sc = gfx.scene, ids = String(id);
+  if (sc.shapes[ids]) {
+    const b = sc.shapes[ids].bounds;
+    for (const [x, y] of [[b[0], b[1]], [b[0] + b[2], b[1]], [b[0], b[1] + b[3]], [b[0] + b[2], b[1] + b[3]]]) {
+      const t = gfxApply(m, x, y); acc.x0 = Math.min(acc.x0, t[0]); acc.y0 = Math.min(acc.y0, t[1]); acc.x1 = Math.max(acc.x1, t[0]); acc.y1 = Math.max(acc.y1, t[1]);
+    }
+    return;
+  }
+  const sp = sc.sprites[ids];
+  if (sp) for (const pl of (sp.frames[0] || [])) if (pl.char >= 0) gfxBoundsOf(pl.char, gfxMul(m, pl.matrix), acc, guard + 1);
+}
+function gfxSymbolBounds() {
+  const acc = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }; const sel = gfx.symbol, I = [1, 0, 0, 1, 0, 0];
+  if (sel.startsWith('image:')) {
+    const e = (gfx.scene.images || []).find(i => i.id === gfx.curId), img = gfx.images.get(gfx.curId);
+    const w = (e && e.w) || (img && img.naturalWidth) || 100, h = (e && e.h) || (img && img.naturalHeight) || 100;
+    return { x0: 0, y0: 0, x1: w, y1: h };
+  }
+  if (sel === 'main') for (const pl of (gfx.scene.main.frames[0] || [])) if (pl.char >= 0) gfxBoundsOf(pl.char, pl.matrix, acc, 0);
+  else if (sel.startsWith('sprite:')) gfxBoundsOf(parseInt(sel.slice(7)), I, acc, 0);
+  else if (sel.startsWith('shape:')) gfxBoundsOf(parseInt(sel.slice(6)), I, acc, 0);
+  if (!isFinite(acc.x0)) return { x0: 0, y0: 0, x1: gfx.scene.width || 100, y1: gfx.scene.height || 100 };
+  return acc;
+}
+function gfxFit() {
+  if (!gfx.scene) return;
+  const cv = gfx.canvas, cw = cv.clientWidth || 1, ch = cv.clientHeight || 1, b = gfxSymbolBounds();
+  const bw = Math.max(b.x1 - b.x0, 1), bh = Math.max(b.y1 - b.y0, 1);
+  gfx.zoom = Math.min(cw / bw, ch / bh) * 0.92;
+  gfx.panX = cw / 2 - gfx.zoom * (b.x0 + bw / 2);
+  gfx.panY = ch / 2 - gfx.zoom * (b.y0 + bh / 2);
+  gfxDraw();
+}
+function gfxDraw() {
+  if (!gfx.scene || !gfx.canvas) return;
+  const cv = gfx.canvas, ctx = gfx.ctx, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = cv.clientWidth, ch = cv.clientHeight;
+  if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.save();
+  ctx.translate(gfx.panX, gfx.panY); ctx.scale(gfx.zoom, gfx.zoom);
+  const tick = gfx.frame | 0, sel = gfx.symbol, sc = gfx.scene;
+  try {
+    if (sel === 'main') gfxDrawList(ctx, sc.main.frames[tick % Math.max(sc.main.frameCount, 1)] || [], tick, 0);
+    else if (sel.startsWith('sprite:')) gfxDrawChar(ctx, parseInt(sel.slice(7)), tick, 0);
+    else if (sel.startsWith('shape:')) gfxDrawChar(ctx, parseInt(sel.slice(6)), 0, 0);
+    else if (sel.startsWith('image:')) {
+      const img = gfx.images.get(gfx.curId);
+      if (img && img.complete && img.naturalWidth) {
+        const e = (sc.images || []).find(i => i.id === gfx.curId);
+        ctx.drawImage(img, 0, 0, (e && e.w) || img.naturalWidth, (e && e.h) || img.naturalHeight);
+      }
+    }
+  } catch { }
+  ctx.restore();
+}
+function gfxStop() { gfx.playing = false; if (gfx.raf) cancelAnimationFrame(gfx.raf); gfx.raf = 0; $('gfxPlay').textContent = '▶'; $('gfxPlay').classList.remove('on'); }
+function gfxPlayToggle() {
+  gfx.playing = !gfx.playing;
+  $('gfxPlay').textContent = gfx.playing ? '❚❚' : '▶'; $('gfxPlay').classList.toggle('on', gfx.playing);
+  if (gfx.playing) { gfx.lastT = performance.now(); gfx.raf = requestAnimationFrame(gfxAnimate); } else gfxStop();
+}
+function gfxAnimate(now) {
+  if (!gfx.playing) return;
+  const fps = Math.max(gfx.scene.frameRate || 30, 1);
+  if (now - gfx.lastT >= 1000 / fps) {
+    gfx.lastT = now; const range = Math.max(gfxAnimRange(), 1);
+    gfx.frame = (gfx.frame + 1) % range; $('gfxFrame').value = gfx.frame; gfxUpdateFrameLbl(); gfxDraw();
+  }
+  gfx.raf = requestAnimationFrame(gfxAnimate);
+}
+(function gfxInit() {
+  gfx.canvas = $('gfxCanvas'); if (!gfx.canvas) return;
+  gfx.ctx = gfx.canvas.getContext('2d');
+  new ResizeObserver(() => { if (!$('gfxStage').hidden) gfxDraw(); }).observe(gfx.canvas);
+  $('gfxFit').onclick = gfxFit;
+  $('gfxPlay').onclick = gfxPlayToggle;
+  $('gfxFrame').oninput = e => { gfxStop(); gfx.frame = parseInt(e.target.value) || 0; gfxUpdateFrameLbl(); gfxDraw(); };
+  $('gfxFilter').oninput = e => {
+    const q = e.target.value.trim().toLowerCase();
+    for (const g of $('gfxTree').querySelectorAll('.gfx-group')) {
+      const body = g.querySelector('.gfx-gbody'); let any = false;
+      // each direct child is a leaf (.gfx-node) or an expandable sprite (.gfx-snode);
+      // match on the row label only (collapsed children aren't in the DOM yet).
+      for (const child of body.children) {
+        const row = child.classList.contains('gfx-snode') ? child.querySelector(':scope > .gfx-node') : child;
+        const txt = (row || child).textContent.toLowerCase();
+        const show = !q || txt.includes(q); child.hidden = !show; if (show) any = true;
+      }
+      g.hidden = !!q && !any;
+    }
+  };
+  gfx.canvas.addEventListener('wheel', e => {
+    e.preventDefault(); const r = gfx.canvas.getBoundingClientRect(); const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const f = e.deltaY < 0 ? 1.15 : 1 / 1.15; const nz = Math.max(0.02, Math.min(80, gfx.zoom * f));
+    gfx.panX = mx - (mx - gfx.panX) * (nz / gfx.zoom); gfx.panY = my - (my - gfx.panY) * (nz / gfx.zoom); gfx.zoom = nz; gfxDraw();
+  }, { passive: false });
+  let drag = false, sx = 0, sy = 0;
+  gfx.canvas.addEventListener('mousedown', e => { drag = true; sx = e.clientX - gfx.panX; sy = e.clientY - gfx.panY; gfx.canvas.style.cursor = 'grabbing'; });
+  window.addEventListener('mousemove', e => { if (drag) { gfx.panX = e.clientX - sx; gfx.panY = e.clientY - sy; gfxDraw(); } });
+  window.addEventListener('mouseup', () => { if (drag) { drag = false; gfx.canvas.style.cursor = 'grab'; } });
+})();
+
 // ---------------------------------------------------------------- image / DDS converter
 function fillImage(d) {
   const img = $('imgView');
+  imgZoomReset();
   img.onload = () => { $('imgInfo').textContent = `${d.format || ''} · ${img.naturalWidth}×${img.naturalHeight}`; };
   img.src = d.dataUrl;
   $('imgInfo').textContent = d.format || '';
 }
+
+// Scroll-wheel zoom (toward the cursor) + drag-to-pan for the texture/DDS viewer.
+// Double-click resets to fit. Zoom 1 = fit-to-pane (the default flex centring).
+let imgZoom = 1, imgPanX = 0, imgPanY = 0;
+function imgApply() {
+  const img = $('imgView');
+  img.style.transform = `translate(${imgPanX}px, ${imgPanY}px) scale(${imgZoom})`;
+  img.style.cursor = imgZoom > 1 ? 'grab' : '';
+}
+function imgZoomReset() { imgZoom = 1; imgPanX = 0; imgPanY = 0; imgApply(); }
+(function imageZoom() {
+  const stage = document.querySelector('#pane-image .img-stage');
+  if (!stage) return;
+  stage.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = stage.getBoundingClientRect();
+    const mx = e.clientX - (r.left + r.width / 2), my = e.clientY - (r.top + r.height / 2);
+    const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const nz = Math.min(40, Math.max(1, imgZoom * f));
+    if (nz === imgZoom) return;
+    imgPanX = mx - (mx - imgPanX) * (nz / imgZoom);
+    imgPanY = my - (my - imgPanY) * (nz / imgZoom);
+    imgZoom = nz;
+    if (imgZoom === 1) { imgPanX = 0; imgPanY = 0; }
+    imgApply();
+  }, { passive: false });
+  let dragging = false, sx = 0, sy = 0;
+  stage.addEventListener('mousedown', e => {
+    if (imgZoom <= 1 || e.button !== 0) return;
+    dragging = true; sx = e.clientX - imgPanX; sy = e.clientY - imgPanY;
+    $('imgView').style.cursor = 'grabbing'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => { if (dragging) { imgPanX = e.clientX - sx; imgPanY = e.clientY - sy; imgApply(); } });
+  window.addEventListener('mouseup', () => { if (dragging) { dragging = false; imgApply(); } });
+  stage.addEventListener('dblclick', imgZoomReset);
+})();
 function bytesToB64(bytes) {
   let bin = ''; const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
@@ -727,26 +1372,53 @@ $('btnSaveDds').onclick = () => {
   saveDds(base + '.dds');
 };
 
-// drag & drop any image -> convert to DDS
+// drag & drop import. Per dropped file:
+//   1. a CodeWalker XML export (name.<ext>.xml) -> convert back to the original
+//      binary resource and import it into the current folder.
+//   2. an image/.dds while a .ytd/.ypt texture view is active -> import as a texture
+//      into that dictionary (replace-by-name, else add).
+//   3. anything else -> import the file as-is into the current folder (replace same name).
+const XML_REIMPORT_RE = /\.(ydr|ydd|yft|ytd|ypt|ymap|ytyp|ymt|ymf|meta|pso|rbf|rel|ynd|ynv|ycd|ybn|yld|yed|ywr|yvr|awc|fxc|ypdb|yfd|mrf|cut|dat)\.xml$/i;
+const TEXTURE_RE = /\.(png|jpe?g|bmp|webp|gif|tga|dds)$/i;
+function currentFolder() { return explorer.crumbs.length ? explorer.crumbs[explorer.crumbs.length - 1] : null; }
+
 let dragDepth = 0;
 window.addEventListener('dragover', e => e.preventDefault());
-window.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; $('dropZone').hidden = false; });
+window.addEventListener('dragenter', e => {
+  e.preventDefault(); dragDepth++;
+  const dz = $('dropZone'), msg = dz.querySelector('div'), folder = currentFolder();
+  msg.textContent = dropTargetNode() != null
+    ? `Drop images → ${dropTargetName()} · other files → ${folder ? folder.name : 'folder'}`
+    : (folder ? `Drop files to import into ${folder.name}` : 'Mount a folder to import files');
+  dz.hidden = false;
+});
 window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('dropZone').hidden = true; } });
 window.addEventListener('drop', async e => {
   e.preventDefault(); dragDepth = 0; $('dropZone').hidden = true;
-  const f = e.dataTransfer.files[0]; if (!f) return;
-  const ext = (f.name.split('.').pop() || '').toLowerCase();
-  if (ext === 'dds') {
-    const buf = new Uint8Array(await f.arrayBuffer());
-    const res = await call('decodeDds', { content: bytesToB64(buf), name: f.name });
-    if (res.dataUrl) openTab('drop:' + f.name, 'image', f.name, { dataUrl: res.dataUrl, format: 'DDS', name: f.name });
-    else setStatus('Could not decode ' + f.name, true);
-  } else {
-    const rd = new FileReader();
-    rd.onload = () => openTab('drop:' + f.name, 'image', f.name, { dataUrl: rd.result, format: ext.toUpperCase(), name: f.name });
-    rd.readAsDataURL(f);
-  }
+  const files = e.dataTransfer.files; if (!files || !files.length) return;
+  for (const file of files) await handleDroppedFile(file);
 });
+
+async function handleDroppedFile(file) {
+  const lower = file.name.toLowerCase();
+  if (XML_REIMPORT_RE.test(lower)) { await importDroppedFile(file, true); return; }      // XML export -> original binary
+  const tnode = dropTargetNode();
+  if (tnode != null && TEXTURE_RE.test(lower)) { await importDroppedTexture(tnode, file); return; }  // texture into ytd/ypt
+  await importDroppedFile(file, false);                                                  // raw file into current folder
+}
+async function importDroppedFile(file, asXml) {
+  const folder = currentFolder();
+  if (!folder) { setStatus('Mount a folder before importing files', true); return; }
+  try {
+    const payload = asXml
+      ? { node: folder.id, name: file.name, as: 'xml', content: await file.text() }
+      : { node: folder.id, name: file.name, content: bytesToB64(new Uint8Array(await file.arrayBuffer())) };
+    setStatus(`Importing ${file.name}…`);
+    const res = await withProgress(call('importFile', payload), 250);
+    if (res.ok) { setStatus(`Imported ${res.name} into ${folder.name} (${fmtSize(res.size)})`); await refreshCurrent(); }
+    else setStatus('Import failed: ' + (res.message || ''), true);
+  } catch (e) { setStatus('Import failed: ' + e.message, true); }
+}
 
 // ---------------------------------------------------------------- inspector
 function row(k, v) { return `<div><span class="k">${k}:</span> <span class="v">${v}</span></div>`; }
@@ -773,6 +1445,12 @@ function showInspectorForTab(tab) {
     inspBody.innerHTML = h;
   } else if (tab.kind === 'explorer') {
     inspBody.innerHTML = `<div class="muted">${explorer.items.length} item${explorer.items.length === 1 ? '' : 's'}</div>`;
+  } else if (tab.kind === 'gfx') {
+    const g = tab.data;
+    if (!g.ok) { inspBody.innerHTML = `<div class="muted">GFX parse error</div>`; return; }
+    inspBody.innerHTML = `<div class="sect"><h4>GFX</h4>${row('File', g.name)}${row('Format', g.signature + ' (' + g.compression + ')')}
+      ${row('Size', Math.round(g.width) + '×' + Math.round(g.height))}${row('Frames', g.frameCount)}${row('Tags', g.tagCount)}
+      ${row('Images', (g.images || []).length)}${row('Symbols', (g.symbols || []).length)}</div>`;
   }
 }
 
@@ -995,6 +1673,37 @@ $('winMin').onclick = () => post('winMin');
 $('winMax').onclick = () => post('winMax');
 $('winClose').onclick = () => post('winClose');
 
+// ---- frameless window resize -------------------------------------------------
+// The OS title bar is gone, so the user couldn't resize the window (WindowChrome's
+// resize border is covered by the WebView2 HWND). Detect a drag within 6px of any
+// window edge and hand off to the native resize loop on the C# side. The toolbar is
+// caption (app-region: drag) so its mousedowns don't reach JS — top-edge resize via
+// the title bar is naturally skipped; sides, bottom and corners all work.
+(function windowResize() {
+  if (window.__POPOUT) { /* popouts resize fine too — same handler */ }
+  const M = 6;
+  const CUR = { l: 'ew-resize', r: 'ew-resize', t: 'ns-resize', b: 'ns-resize',
+                tl: 'nwse-resize', br: 'nwse-resize', tr: 'nesw-resize', bl: 'nesw-resize' };
+  const edgeAt = e => {
+    const w = innerWidth, h = innerHeight, x = e.clientX, y = e.clientY;
+    const l = x <= M, r = x >= w - M, t = y <= M, b = y >= h - M;
+    if (t && l) return 'tl'; if (t && r) return 'tr'; if (b && l) return 'bl'; if (b && r) return 'br';
+    if (l) return 'l'; if (r) return 'r'; if (t) return 't'; if (b) return 'b';
+    return '';
+  };
+  let cur = '';
+  window.addEventListener('mousemove', e => {
+    if (e.buttons) return;                       // don't fight an active drag/pan/splitter
+    const d = edgeAt(e);
+    if (d !== cur) { cur = d; document.body.style.cursor = d ? CUR[d] : ''; }
+  });
+  window.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    const d = edgeAt(e);
+    if (d) { e.preventDefault(); e.stopPropagation(); post('winResize', { edge: d }); }
+  }, true);                                       // capture: beats splitter/pan handlers
+})();
+
 // ---------------------------------------------------------------- popout window mode
 // A torn-off tab: hide the chrome and show just its viewer (state transferred from
 // the originating window via the bridge).
@@ -1032,6 +1741,17 @@ async function autoload() {
     if (a.open === 'icons' || a.open === 'list') { setView(a.open); return; }
     if (a.open === 'search') { optExt.checked = true; filterInput.value = 'ydd'; await runSearch(); return; }
     if (a.open === 'root') return; // stay on the freshly-mounted root (dev/screenshot)
+    if (a.open === 'sorttest') { setSort('size'); return; }
+    if (a.open === 'gfx') { const res = await call('firstGfx'); if (res.type === 'gfx') openTab('auto', 'gfx', res.name, res); return; }
+    if (a.open === 'renametest') {
+      const res = await call('firstYpt'); if (res.type === 'model') openModelTab(res);
+      await new Promise(r => setTimeout(r, 700));
+      const hash = viewport.partHash(1);
+      const rr = await call('renameModel', { file: curModel.file, hash, name: 'ZZ_CUSTOM_NAME' });
+      viewport.setPartName(1, 'ZZ_CUSTOM_NAME'); fillModelList();
+      setStatus(`renamed part1 hash=${hash} ok=${rr.ok} (file=${curModel.file})`);
+      return;
+    }
     if (a.open === 'mtest') {
       const up = mountRoots.find(k => k.name.toLowerCase() === 'update');
       const c1 = await getChildren(up.id); const rpf = c1.find(k => k.name.toLowerCase() === 'update.rpf');

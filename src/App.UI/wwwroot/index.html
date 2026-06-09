@@ -21,6 +21,11 @@
     <!-- Toolbar (doubles as the custom window title bar) -->
     <header id="toolbar">
       <div class="brand"><img class="app-ico" src="./icons/app.png" alt=""> <span class="brand-name">Epic&nbsp;RPF</span></div>
+      <div class="nav-global" id="navGlobal">
+        <button class="nav-btn" id="navBack" title="Back (Alt+Left)">&#x2190;</button>
+        <button class="nav-btn" id="navFwd" title="Forward (Alt+Right)">&#x2192;</button>
+        <button class="nav-btn" id="navUp" title="Up one level (Alt+Up)">&#x2191;</button>
+      </div>
       <div class="mount-bar">
         <input id="folder" type="text" spellcheck="false"
                value="C:\Program Files\Epic Games\GTAV" />
@@ -40,9 +45,16 @@
       </div>
     </header>
 
+    <!-- Indeterminate loading bar (mount + slow file opens) -->
+    <div id="progress" class="progress" hidden><div class="bar"></div></div>
+
     <!-- Body: tree | content | inspector -->
     <div id="body">
       <aside id="sidebar">
+        <div class="panel-head">
+          <span class="panel-title">Explorer</span>
+          <button class="panel-toggle" id="sideToggle" title="Collapse panel">&#x27E8;</button>
+        </div>
         <div class="search">
           <input id="filter" type="text" placeholder="Search files…  (Enter)" spellcheck="false" />
           <div class="search-opts">
@@ -56,15 +68,14 @@
         </div>
       </aside>
 
+      <div class="splitter" id="splitSidebar"></div>
+
       <main id="content">
         <div id="tabs" class="tabs"></div>
         <div id="panes" class="panes">
           <!-- Explorer (OpenIV-style folder list) -->
           <section class="pane" id="pane-explorer" hidden>
             <div class="nav-row">
-              <button class="nav-btn" id="navBack" title="Back (Alt+Left)">&#x2190;</button>
-              <button class="nav-btn" id="navFwd" title="Forward (Alt+Right)">&#x2192;</button>
-              <button class="nav-btn" id="navUp" title="Up one level (Alt+Up)">&#x2191;</button>
               <div class="crumbs" id="crumbs"></div>
             </div>
             <div class="list">
@@ -81,7 +92,14 @@
           <!-- 3D viewport -->
           <section class="pane" id="pane-model" hidden>
             <!-- Models in a dictionary (.ydd/.ypt) listed down the left -->
-            <aside class="vp-models" id="vpModels" hidden></aside>
+            <aside class="vp-models" id="vpModels" hidden>
+              <div class="vp-mhead-bar">
+                <span class="vp-mhead" id="vpModelsTitle">Models</span>
+                <button class="panel-toggle" id="vpModelsToggle" title="Collapse list">&#x27E8;</button>
+              </div>
+              <div class="vp-mlist" id="vpModelList"></div>
+            </aside>
+            <div class="vp-split" id="vpSplit" hidden></div>
             <div class="vp-main">
               <div class="viewport-wrap">
                 <canvas id="gl"></canvas>
@@ -154,6 +172,37 @@
             <div class="img-stage checker"><img id="imgView" alt=""></div>
           </section>
 
+          <!-- GFX (Scaleform/SWF) read-only viewer: symbol tree + live preview -->
+          <section class="pane" id="pane-gfx" hidden>
+            <div class="gfx-layout">
+              <aside class="gfx-tree-pane">
+                <div class="gfx-file">
+                  <span id="gfxFileName" class="gfx-fname"></span>
+                  <span id="gfxFileMeta" class="gfx-fmeta"></span>
+                </div>
+                <input id="gfxFilter" class="gfx-filter" type="text" placeholder="Filter symbols…" spellcheck="false">
+                <div id="gfxTree" class="gfx-tree"></div>
+              </aside>
+              <div class="gfx-view">
+                <div class="gfx-toolbar">
+                  <span id="gfxSel" class="gfx-sel">—</span>
+                  <span class="grow"></span>
+                  <button class="chip" id="gfxPlay" title="Play / pause" hidden>▶</button>
+                  <input type="range" id="gfxFrame" min="0" max="0" value="0" title="Frame" hidden />
+                  <span id="gfxFrameLbl" class="muted"></span>
+                  <button class="chip" id="gfxFit" title="Fit to view">Fit</button>
+                </div>
+                <div class="gfx-content">
+                  <div class="gfx-stage checker" id="gfxStage">
+                    <canvas id="gfxCanvas"></canvas>
+                    <div id="gfxRenderMsg" class="gfx-rmsg muted"></div>
+                  </div>
+                  <div id="gfxInfo" class="gfx-info" hidden></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <!-- Welcome -->
           <section class="pane welcome" id="pane-welcome">
             <div class="welcome-card">
@@ -169,8 +218,13 @@
         </div>
       </main>
 
+      <div class="splitter" id="splitInspector"></div>
+
       <aside id="inspector">
-        <div class="insp-title">Inspector</div>
+        <div class="insp-title">
+          <span class="it-label">Inspector</span>
+          <button class="panel-toggle" id="inspToggle" title="Collapse panel">&#x27E9;</button>
+        </div>
         <div id="inspBody" class="insp-body muted">Nothing selected.</div>
       </aside>
     </div>

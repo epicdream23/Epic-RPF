@@ -61,10 +61,33 @@ public sealed class RpfWorkspace
     public IReadOnlyList<RpfFile> AllRpfs => Manager.AllRpfs;
 
     /// <summary>Raw bytes for a file entry (binary or resource), via its owning archive.</summary>
+    /// <remarks>
+    /// For a <b>resource</b> (.ydr/.ydd/.yft/.ytd/.ypt) this returns the DECOMPRESSED
+    /// payload with the RSC7 header stripped — only valid when paired with the entry's
+    /// flags (as <c>GetFile</c> does). It is NOT a standalone file; use
+    /// <see cref="ExtractForSave"/> when writing to disk or back into an archive.
+    /// </remarks>
     public static byte[] Extract(RpfFileEntry entry)
     {
         if (entry == null) throw new ArgumentNullException(nameof(entry));
         return entry.File.ExtractFile(entry);
+    }
+
+    /// <summary>
+    /// Bytes for a file entry as a valid standalone file, suitable for saving to disk or
+    /// re-importing into an archive. Binary entries pass through; resource entries are
+    /// re-wrapped with their RSC7 header (re-compressed), so the result is a real
+    /// .ydr/.ytd/.ypt/etc. that other tools — and our own re-open/import — accept.
+    /// Without this, an extracted resource is headerless garbage and an undo of a deleted
+    /// resource is restored as a (corrupt) binary entry.
+    /// </summary>
+    public static byte[] ExtractForSave(RpfFileEntry entry)
+    {
+        if (entry == null) throw new ArgumentNullException(nameof(entry));
+        byte[] data = entry.File.ExtractFile(entry);
+        if (entry is RpfResourceFileEntry res && data != null)
+            return ResourceBuilder.AddResourceHeader(res, ResourceBuilder.Compress(data));
+        return data ?? Array.Empty<byte>();
     }
 
     /// <summary>Look up an entry by full archive path, or null if not found.</summary>

@@ -47,6 +47,48 @@ public static class TextureCodec
             (px[i], px[i + 2]) = (px[i + 2], px[i]);
     }
 
+    /// <summary>
+    /// Build a RAGE <see cref="Texture"/> from imported .dds bytes, safely. Tools commonly
+    /// export DDS with a DX10 header declaring an <b>sRGB</b> DXGI format (e.g. BC7_UNORM_SRGB);
+    /// RAGE has no sRGB texture formats, so CodeWalker's DDSIO maps those to format 0. A
+    /// format-0 texture serializes fine but the game can't create the GPU resource — it
+    /// crashes the instant the texture loads, and the surrounding resource is left unusable.
+    /// We normalize sRGB DX10 formats to their UNORM equivalents and refuse anything that
+    /// still won't map, so a bad import can never silently corrupt a .ytd / .ypt.
+    /// </summary>
+    public static Texture TextureFromDds(byte[] dds)
+    {
+        byte[] data = NormalizeSrgbDx10(dds);
+        var tex = DDSIO.GetTexture(data) ?? throw new Exception("could not parse the DDS");
+        if (tex.Format == 0)
+            throw new Exception("unsupported DDS pixel format — re-export as BC7, DXT5 or DXT1 (non-sRGB)");
+        return tex;
+    }
+
+    // If the DDS carries a DX10 header with an sRGB DXGI format, rewrite it to the matching
+    // non-sRGB (UNORM) format on a copy so DDSIO can map it to a real RAGE format.
+    private static byte[] NormalizeSrgbDx10(byte[] dds)
+    {
+        const uint DX10 = 0x30315844;   // 'DX10' fourCC at ddspf.dwFourCC (offset 84)
+        if (dds.Length < 148) return dds;                       // no room for a DX10 header
+        if (BitConverter.ToUInt32(dds, 84) != DX10) return dds; // not a DX10-extended DDS
+        uint fmt = BitConverter.ToUInt32(dds, 128);             // dxgiFormat
+        uint norm = fmt switch
+        {
+            29 => 28u,   // R8G8B8A8_UNORM_SRGB -> R8G8B8A8_UNORM
+            91 => 87u,   // B8G8R8A8_UNORM_SRGB -> B8G8R8A8_UNORM
+            72 => 71u,   // BC1_UNORM_SRGB -> BC1_UNORM
+            75 => 74u,   // BC2_UNORM_SRGB -> BC2_UNORM
+            78 => 77u,   // BC3_UNORM_SRGB -> BC3_UNORM
+            99 => 98u,   // BC7_UNORM_SRGB -> BC7_UNORM
+            _ => fmt,
+        };
+        if (norm == fmt) return dds;
+        var copy = (byte[])dds.Clone();
+        BitConverter.GetBytes(norm).CopyTo(copy, 128);
+        return copy;
+    }
+
     /// <summary>Raw .dds bytes → RGBA8. Null on failure.</summary>
     public static byte[]? DecodeDds(byte[] dds, out int w, out int h)
     {

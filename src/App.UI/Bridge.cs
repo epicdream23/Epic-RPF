@@ -11,6 +11,7 @@ using System.Xml;
 using App.Core;
 using App.Geometry;
 using CodeWalker.GameFiles;
+using CodeWalker.Utils;
 
 namespace App.UI;
 
@@ -50,6 +51,9 @@ public sealed class Bridge
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // The GFX scene DTOs (shapes/sprites/fills/placements) expose their data as
+        // public fields; without this they serialize as empty {} and nothing renders.
+        IncludeFields = true,
     };
 
     public Bridge(Action<string> post, Func<string?> pickFolder, Func<string, string?> pickSavePath,
@@ -87,6 +91,11 @@ public sealed class Bridge
         public string? Payload { get; set; }    // serialized viewer state for a torn-off tab
         public bool Force { get; set; }          // delete: confirmed to purge trash if full
         public long Batch { get; set; }          // delete: groups a multi-select delete for undo
+        public int Index { get; set; }           // modelPart / texImage index
+        public string? File { get; set; }        // custom-name LUT key (file name)
+        public string? Hash { get; set; }        // custom-name LUT key (drawable hash hex)
+        public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
+        public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
     }
 
     private static readonly HashSet<string> ImageExts = new(StringComparer.Ordinal)
@@ -140,6 +149,31 @@ public sealed class Bridge
     private static readonly List<UndoEntry> _undoStack = new();
     private static long _batchSeq = 1;
 
+    // Loaded-model cache so parts/textures load lazily (fast open of huge ydd/ypt).
+    private sealed class ModelCache
+    {
+        public List<DrawableLoader.NamedDrawable> Drawables = new();
+        public TextureDictionary? LocalDict;
+        public RpfFileEntry? Entry;
+        public string EntryPath = "";  // archive path of Entry, to re-resolve after a remount
+        public string File = "";
+        public string DiskPath = "";   // set for loose (on-disk) ytd/ypt, for writing texture edits back
+    }
+    private static readonly Dictionary<int, ModelCache> _modelCache = new();
+    private static readonly List<int> _modelCacheOrder = new();
+    private static int _synthSeq = -1;
+
+    // Cached .gfx bytes (+ source entry for image resolution) so the render scene can
+    // be built lazily when the user switches to the visual view.
+    private static readonly Dictionary<int, (byte[] bytes, RpfFileEntry? entry, string diskPath)> _gfxCache = new();
+    private static readonly List<int> _gfxCacheOrder = new();
+
+    // Custom drawable names (client-side only, never written into the file).
+    // names.json: { "<filenameLower>": { "<hashHex>": "Custom Name" } }
+    private static string NamesLutPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EpicRpf", "names.json");
+    private static Dictionary<string, Dictionary<string, string>>? _namesLut;
+
     public void HandleMessage(string json)
     {
         Req req;
@@ -169,6 +203,8 @@ public sealed class Bridge
             case "firstModel": CmdFirstModel(r); break;
             case "firstMeta": CmdFirstMeta(r); break;
             case "firstYtd": CmdFirstYtd(r); break;
+            case "firstGfx": CmdFirstGfx(r); break;
+            case "gfxScene": CmdGfxScene(r); break;
             case "firstProp": CmdFirstProp(r); break;
             case "firstYpt": CmdFirstYpt(r); break;
             case "save": CmdSave(r); break;
@@ -179,11 +215,17 @@ public sealed class Bridge
             case "createFolder": CmdCreateFolder(r); break;
             case "createRpf": CmdCreateRpf(r); break;
             case "createYtd": CmdCreateYtd(r); break;
+            case "importFile": CmdImportFile(r); break;
             case "delete": CmdDelete(r); break;
             case "undo": CmdUndo(r); break;
+            case "modelPart": CmdModelPart(r); break;
+            case "texImage": CmdTexImage(r); break;
+            case "replaceTexture": CmdReplaceTexture(r); break;
+            case "renameModel": CmdRenameModel(r); break;
             case "winMin": _windowAction?.Invoke("min"); break;
             case "winMax": _windowAction?.Invoke("max"); break;
             case "winClose": _windowAction?.Invoke("close"); break;
+            case "winResize": _windowAction?.Invoke("resize:" + (r.Edge ?? "")); break;
             case "popout": CmdPopout(r); break;
             case "popoutData": CmdPopoutData(r); break;
             default: Send(new { type = "error", reqId = r.Id, message = $"unknown cmd '{r.Cmd}'" }); break;
@@ -367,15 +409,24 @@ public sealed class Bridge
             // (ydr/ydd/yft/ytd/ypt) the default is their viewer, but the CodeWalker XML
             // round-trip is still available on demand.
             if (r.As == "xml") { OpenAsXml(r, fe); return; }
-            switch (FileTypes.Route(fe.Name))
+            // A malformed/modded resource must never dead-end: if its typed viewer fails
+            // to parse, fall back to the hex view instead of just erroring out (the
+            // openers send their message only on success, so a throw means nothing was
+            // sent yet — the fallback is safe). Mirrors OpenDiskFile's behaviour.
+            try
             {
-                case ViewerKind.Model: OpenModel(r, fe); break;
-                case ViewerKind.Texture: OpenTexture(r, fe); break;
-                default:
-                    if (ImageExts.Contains(ExtOf(fe.NameLower))) OpenImage(r, fe);
-                    else OpenEditableOrHex(r, fe);
-                    break;
+                switch (FileTypes.Route(fe.Name))
+                {
+                    case ViewerKind.Model: OpenModel(r, fe); break;
+                    case ViewerKind.Texture: OpenTexture(r, fe); break;
+                    case ViewerKind.Gfx: OpenGfxCore(r, fe.Name, RpfWorkspace.Extract(fe), fe); break;
+                    default:
+                        if (ImageExts.Contains(ExtOf(fe.NameLower))) OpenImage(r, fe);
+                        else OpenEditableOrHex(r, fe);
+                        break;
+                }
             }
+            catch { try { OpenHexCore(r, fe.Name, RpfWorkspace.Extract(fe)); } catch (Exception ex) { Send(new { type = "error", reqId = r.Id, message = ex.Message }); } }
             return;
         }
 
@@ -403,11 +454,14 @@ public sealed class Bridge
                     SendModelData(r, name, di.Path, dws, ld, null);
                     break;
                 case ViewerKind.Texture:
-                    SendTextures(r, name, RpfFile.GetResourceFile<YtdFile>(bytes)?.TextureDict);
+                    SendTextures(r, name, RpfFile.GetResourceFile<YtdFile>(bytes)?.TextureDict, null, di.Path);
+                    break;
+                case ViewerKind.Gfx:
+                    OpenGfxCore(r, name, bytes, null, di.Path);
                     break;
                 default:
                     if (ImageExts.Contains(ext)) OpenImageCore(r, name, bytes);
-                    else OpenEditableOrHexCore(r, name, bytes, null);
+                    else OpenEditableOrHexCore(r, name, bytes, null, di.Path);
                     break;
             }
         }
@@ -473,6 +527,26 @@ public sealed class Bridge
                 }
         }
         Send(new { type = "error", reqId = r.Id, message = "no .ytd found" });
+    }
+
+    private void CmdFirstGfx(Req r)
+    {
+        if (_ws == null) { Send(new { type = "error", reqId = r.Id, message = "not mounted" }); return; }
+        RpfFileEntry? first = null, minimap = null;
+        foreach (var rpf in _ws.AllRpfs)
+        {
+            if (rpf.AllEntries == null) continue;
+            foreach (var e in rpf.AllEntries)
+                if (e is RpfFileEntry fe && fe.NameLower.EndsWith(".gfx", StringComparison.Ordinal))
+                {
+                    first ??= fe;
+                    if (fe.NameLower.Contains("minimap")) { minimap = fe; break; }
+                }
+            if (minimap != null) break;
+        }
+        var pick = minimap ?? first;
+        if (pick != null) { OpenGfxCore(r, pick.Name, RpfWorkspace.Extract(pick), pick); return; }
+        Send(new { type = "error", reqId = r.Id, message = "no .gfx found" });
     }
 
     // Find a model with a same-named sibling .ytd and NO embedded textures, so it
@@ -561,7 +635,7 @@ public sealed class Bridge
 
         string srcName;
         Func<byte[]> getBytes;
-        if (obj is RpfFileEntry fe) { srcName = fe.Name; getBytes = () => RpfWorkspace.Extract(fe); }
+        if (obj is RpfFileEntry fe) { srcName = fe.Name; getBytes = () => RpfWorkspace.ExtractForSave(fe); }
         else if (obj is DiskItem di && !di.IsDir) { srcName = Path.GetFileName(di.Path); getBytes = () => File.ReadAllBytes(di.Path); }
         else { Send(new { type = "error", reqId = r.Id, message = "invalid node" }); return; }
 
@@ -598,59 +672,336 @@ public sealed class Bridge
             return;
         }
 
+        // Cache the loaded drawables/dict so other parts and textures load on demand.
+        // For a loose file (no archive entry) keep the disk path so texture edits can save.
+        int cacheKey = r.Node > 0 ? r.Node : _synthSeq--;
+        CacheModel(cacheKey, new ModelCache { Drawables = drawables, LocalDict = localDict, Entry = modelEntry, EntryPath = modelEntry?.Path ?? "", File = name, DiskPath = modelEntry == null ? path : "" });
+
+        // Only decode the first drawable now (the viewer shows one at a time); the
+        // rest are placeholders loaded when selected. Textures stream in lazily too.
+        string fileLower = name.ToLowerInvariant();
         var parts = new List<object>();
-        int geom = 0, rendered = 0, skipped = 0;
-        var skipSamples = new List<string>();
-        foreach (var nd in drawables)
+        object stats = new { geometryCount = 0, rendered = 0, skipped = 0, skipSamples = Array.Empty<string>() };
+        for (int i = 0; i < drawables.Count; i++)
         {
-            var model = GeometryDecoder.Decode(nd.Drawable, nd.Name);
-            geom += model.GeometryCount;
-            rendered += model.RenderedCount;
-            skipped += model.SkippedReasons.Count;
-            if (skipSamples.Count < 5) skipSamples.AddRange(model.SkippedReasons.Take(5 - skipSamples.Count));
-            parts.Add(BuildModelDto(model, nd.Drawable, modelEntry, localDict));
+            if (i == 0) { parts.Add(BuildPart(drawables[i], modelEntry, localDict, fileLower, out stats)); }
+            else parts.Add(LazyPart(drawables[i], fileLower));
         }
 
         Send(new
         {
             type = "model",
             reqId = r.Id,
+            node = cacheKey,
+            file = fileLower,
             name,
             path,
             parts,
-            textures = TextureList(localDict),
-            stats = new { geometryCount = geom, rendered, skipped, skipSamples },
+            textures = TextureMeta(localDict),
+            stats,
         });
     }
 
-    // Build the viewer-friendly list of textures in a dictionary (used for the
-    // .ypt texture strip). Returns an empty list when there's no dictionary.
-    private List<object> TextureList(TextureDictionary? dict)
+    private object LazyPart(DrawableLoader.NamedDrawable nd, string fileLower)
+    {
+        string hashHex = nd.Hash.ToString("X8");
+        return new { name = DisplayName(fileLower, hashHex, nd.Name), hash = hashHex, lazy = true, materials = Array.Empty<object>(), lods = Array.Empty<object>() };
+    }
+
+    // Decode one drawable into a full part DTO (geometry + its diffuse textures).
+    private object BuildPart(DrawableLoader.NamedDrawable nd, RpfFileEntry? modelEntry, TextureDictionary? localDict, string fileLower, out object stats)
+    {
+        var model = GeometryDecoder.Decode(nd.Drawable, nd.Name);
+        stats = new { geometryCount = model.GeometryCount, rendered = model.RenderedCount, skipped = model.SkippedReasons.Count, skipSamples = model.SkippedReasons.Take(5).ToArray() };
+        var dto = (Dictionary<string, object?>)BuildModelDto(model, nd.Drawable, modelEntry, localDict);
+        string hashHex = nd.Hash.ToString("X8");
+        dto["hash"] = hashHex;
+        dto["lazy"] = false;
+        dto["name"] = DisplayName(fileLower, hashHex, nd.Name);
+        return dto;
+    }
+
+    private void CmdModelPart(Req r)
+    {
+        if (!_modelCache.TryGetValue(r.Node, out var mc) || r.Index < 0 || r.Index >= mc.Drawables.Count)
+        { Send(new { type = "modelPart", reqId = r.Id, ok = false }); return; }
+        var part = BuildPart(mc.Drawables[r.Index], mc.Entry, mc.LocalDict, mc.File.ToLowerInvariant(), out var stats);
+        Send(new { type = "modelPart", reqId = r.Id, ok = true, index = r.Index, part, stats });
+    }
+
+    private void CmdTexImage(Req r)
+    {
+        var texs = (_modelCache.TryGetValue(r.Node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
+        if (texs == null || r.Index < 0 || r.Index >= texs.Length || texs[r.Index] == null)
+        { Send(new { type = "texImage", reqId = r.Id, index = r.Index, img = (string?)null }); return; }
+        Send(new { type = "texImage", reqId = r.Id, index = r.Index, img = DecodeTexUrl(texs[r.Index]) });
+    }
+
+    // Replace (or add) a texture inside an open .ytd / .ypt and write the resource
+    // back into its archive (or to disk). The new texture keeps the replaced one's
+    // name + usage so the model keeps referencing it; only the pixels/format change.
+    // Import source is either a .dds (Content, base64) or raw RGBA (Rgba/W/H) that we
+    // encode to the original texture's format.
+    private void CmdReplaceTexture(Req r)
+    {
+        if (!_modelCache.TryGetValue(r.Node, out var mc))
+        { Send(new { type = "replaced", reqId = r.Id, ok = false, message = "texture source not open" }); return; }
+
+        // Re-resolve the entry against the CURRENT mount: a background remount (the file
+        // watcher fires on any .rpf change) replaces the archive graph and leaves mc.Entry
+        // pointing at a stale archive with stale offsets — reading/writing through it would
+        // corrupt the file. GetEntry rebuilds it from the live graph by its stable path.
+        var fe = mc.Entry;
+        if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
+            && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh)
+        {
+            fe = fresh;
+            mc.Entry = fresh;
+        }
+        string fileLower = (fe?.NameLower ?? Path.GetFileName(mc.DiskPath)).ToLowerInvariant();
+        bool isYpt = fileLower.EndsWith(".ypt", StringComparison.Ordinal);
+        bool isYtd = fileLower.EndsWith(".ytd", StringComparison.Ordinal);
+        if (!isYpt && !isYtd)
+        { Send(new { type = "replaced", reqId = r.Id, ok = false, message = "only .ytd / .ypt textures can be replaced" }); return; }
+        if (fe == null && string.IsNullOrEmpty(mc.DiskPath))
+        { Send(new { type = "replaced", reqId = r.Id, ok = false, message = "no writable source for this texture" }); return; }
+
+        try
+        {
+            // Re-load a fresh, authoritative copy (GetFile doesn't cache) to modify + save.
+            YtdFile? ytd = null; YptFile? ypt = null;
+            TextureDictionary? dict;
+            if (fe != null)
+            {
+                if (isYtd) { ytd = _ws!.Manager.GetFile<YtdFile>(fe); dict = ytd?.TextureDict; }
+                else { ypt = _ws!.Manager.GetFile<YptFile>(fe); dict = ypt?.PtfxList?.TextureDictionary; }
+            }
+            else
+            {
+                byte[] raw = File.ReadAllBytes(mc.DiskPath);
+                if (isYtd) { ytd = RpfFile.GetResourceFile<YtdFile>(raw); dict = ytd?.TextureDict; }
+                else { ypt = RpfFile.GetResourceFile<YptFile>(raw); dict = ypt?.PtfxList?.TextureDictionary; }
+            }
+            if (dict == null)
+            { Send(new { type = "replaced", reqId = r.Id, ok = false, message = "no texture dictionary in file" }); return; }
+
+            var list = (dict.Textures?.data_items ?? Array.Empty<Texture>()).Where(t => t != null).ToList();
+
+            // Find the texture being replaced (by name first, index as fallback).
+            string targetName = r.Name ?? "";
+            Texture? oldTex = list.FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
+            if (oldTex == null && r.Index >= 0 && r.Index < list.Count) oldTex = list[r.Index];
+
+            // Build the replacement texture from the imported DDS (or encode RGBA first).
+            byte[] ddsBytes;
+            if (!string.IsNullOrEmpty(r.Content))
+                ddsBytes = Convert.FromBase64String(r.Content);
+            else
+            {
+                byte[] rgba = Convert.FromBase64String(r.Rgba ?? "");
+                if (r.W <= 0 || r.H <= 0 || rgba.Length < (long)r.W * r.H * 4) throw new Exception("bad image data");
+                string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
+                ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt, true);
+            }
+            // TextureFromDds normalizes sRGB DX10 formats and rejects anything that maps to
+            // format 0, so a bad import fails cleanly instead of writing a file that crashes
+            // the game and can no longer be opened.
+            var newTex = TextureCodec.TextureFromDds(ddsBytes);
+
+            string keepName = !string.IsNullOrEmpty(oldTex?.Name) ? oldTex!.Name
+                            : (!string.IsNullOrEmpty(targetName) ? targetName : "texture");
+            newTex.Name = keepName;
+            newTex.NameHash = JenkHash.GenHash(keepName.ToLowerInvariant());
+            if (oldTex != null) { newTex.Usage = oldTex.Usage; newTex.UsageFlags = oldTex.UsageFlags; }
+
+            if (oldTex != null) list[list.IndexOf(oldTex)] = newTex;
+            else list.Add(newTex);                          // "import new" -> add a texture
+            dict.BuildFromTextureList(list);
+
+            byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
+            if (fe != null) { MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
+
+            // Point the display cache at the new dict so thumbnails reflect the edit.
+            mc.LocalDict = dict;
+            Send(new { type = "replaced", reqId = r.Id, ok = true, node = r.Node, name = keepName, size = data.Length, textures = TextureMeta(dict) });
+        }
+        catch (Exception ex)
+        {
+            Send(new { type = "replaced", reqId = r.Id, ok = false, message = ex.Message });
+        }
+    }
+
+    // Map a RAGE texture format to an encoder format string (for image imports —
+    // keep the original compression so the game reads it as expected).
+    private static string EncodeFormatFor(TextureFormat? f) => f switch
+    {
+        TextureFormat.D3DFMT_DXT1 => "DXT1",
+        TextureFormat.D3DFMT_DXT3 => "DXT3",
+        TextureFormat.D3DFMT_DXT5 => "DXT5",
+        TextureFormat.D3DFMT_ATI1 => "BC4",
+        TextureFormat.D3DFMT_ATI2 => "BC5",
+        TextureFormat.D3DFMT_BC7 => "BC7",
+        TextureFormat.D3DFMT_A8R8G8B8 or TextureFormat.D3DFMT_A8B8G8R8 or TextureFormat.D3DFMT_X8R8G8B8 => "RGBA",
+        _ => "DXT5",
+    };
+
+    private void CacheModel(int key, ModelCache mc)
+    {
+        _modelCache[key] = mc;
+        _modelCacheOrder.Remove(key); _modelCacheOrder.Add(key);
+        while (_modelCacheOrder.Count > 6) { var old = _modelCacheOrder[0]; _modelCacheOrder.RemoveAt(0); _modelCache.Remove(old); }
+    }
+
+    // ---- custom drawable names (persisted LUT) ---------------------------
+
+    private static Dictionary<string, Dictionary<string, string>> NamesLut()
+    {
+        if (_namesLut != null) return _namesLut;
+        try
+        {
+            if (File.Exists(NamesLutPath))
+                _namesLut = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string>>>(File.ReadAllText(NamesLutPath));
+        }
+        catch { }
+        return _namesLut ??= new();
+    }
+
+    // Custom name keyed by (file name, drawable hash) — survives moving the file
+    // since it's keyed by name, not full path. Falls back to the resolved hash name.
+    private static string DisplayName(string fileLower, string hashHex, string fallback)
+    {
+        var lut = NamesLut();
+        if (lut.TryGetValue(fileLower, out var m) && m.TryGetValue(hashHex, out var custom) && !string.IsNullOrEmpty(custom))
+            return custom;
+        return fallback;
+    }
+
+    private void CmdRenameModel(Req r)
+    {
+        string file = (r.File ?? "").ToLowerInvariant();
+        string hash = r.Hash ?? "";
+        string name = (r.Name ?? "").Trim();
+        if (file.Length == 0 || hash.Length == 0) { Send(new { type = "renamed", reqId = r.Id, ok = false }); return; }
+        try
+        {
+            var lut = NamesLut();
+            if (!lut.TryGetValue(file, out var m)) { m = new(); lut[file] = m; }
+            if (name.Length == 0) m.Remove(hash); else m[hash] = name;       // empty -> revert to default
+            if (m.Count == 0) lut.Remove(file);
+            Directory.CreateDirectory(Path.GetDirectoryName(NamesLutPath)!);
+            File.WriteAllText(NamesLutPath, JsonSerializer.Serialize(lut, new JsonSerializerOptions { WriteIndented = true }));
+            Send(new { type = "renamed", reqId = r.Id, ok = true, name });
+        }
+        catch (Exception ex) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Texture metadata only (no decoded image) — thumbnails stream in on demand via
+    // texImage so opening a dictionary with many textures is instant.
+    private static List<object> TextureMeta(TextureDictionary? dict)
     {
         var list = new List<object>();
         var texs = dict?.Textures?.data_items;
         if (texs != null)
-            foreach (var t in texs)
+            for (int i = 0; i < texs.Length; i++)
             {
-                if (t == null) continue;
-                list.Add(new
-                {
-                    name = t.Name,
-                    width = (int)t.Width,
-                    height = (int)t.Height,
-                    format = t.Format.ToString(),
-                    levels = (int)t.Levels,
-                    img = DecodeTexUrl(t),
-                });
+                var t = texs[i]; if (t == null) continue;
+                list.Add(new { index = i, name = t.Name, width = (int)t.Width, height = (int)t.Height, format = t.Format.ToString(), levels = (int)t.Levels });
             }
         return list;
     }
 
     private void OpenTexture(Req r, RpfFileEntry fe)
-        => SendTextures(r, fe.Name, _ws!.Manager.GetFile<YtdFile>(fe)?.TextureDict);
+        => SendTextures(r, fe.Name, _ws!.Manager.GetFile<YtdFile>(fe)?.TextureDict, fe);
 
-    private void SendTextures(Req r, string name, TextureDictionary? dict)
-        => Send(new { type = "texture", reqId = r.Id, name, textures = TextureList(dict) });
+    private void SendTextures(Req r, string name, TextureDictionary? dict, RpfFileEntry? entry = null, string diskPath = "")
+    {
+        int cacheKey = r.Node > 0 ? r.Node : _synthSeq--;
+        CacheModel(cacheKey, new ModelCache { LocalDict = dict, File = name, Entry = entry, EntryPath = entry?.Path ?? "", DiskPath = diskPath });
+        Send(new { type = "texture", reqId = r.Id, node = cacheKey, name, textures = TextureMeta(dict) });
+    }
+
+    // Read-only Scaleform GFx (.gfx) structure view: parse the SWF/GFx tag list and
+    // surface its shapes/sprites/fonts/images/text + referenced external textures.
+    // The raw bytes are cached so the visual render scene can be built on demand.
+    private void OpenGfxCore(Req r, string name, byte[] bytes, RpfFileEntry? entry = null, string diskPath = "")
+    {
+        var g = GfxParser.Parse(bytes);
+        int key = r.Node > 0 ? r.Node : _synthSeq--;
+        _gfxCache[key] = (bytes, entry, diskPath);
+        _gfxCacheOrder.Remove(key); _gfxCacheOrder.Add(key);
+        while (_gfxCacheOrder.Count > 4) { var old = _gfxCacheOrder[0]; _gfxCacheOrder.RemoveAt(0); _gfxCache.Remove(old); }
+        Send(new
+        {
+            type = "gfx", reqId = r.Id, node = key, name,
+            ok = g.Ok, error = g.Error,
+            signature = g.Signature, compression = g.Compression, version = g.Version,
+            fileLength = g.FileLength, width = g.Width, height = g.Height,
+            frameRate = g.FrameRate, frameCount = g.FrameCount, tagCount = g.TagCount,
+            counts = g.Counts,
+            images = g.Images.ConvertAll(i => new { i.Id, i.File, i.Width, i.Height }),
+            symbols = g.Symbols.ConvertAll(s => new { s.Id, s.Name }),
+            tags = g.Tags.ConvertAll(t => new { t.Code, t.Name, t.Category, id = t.Id, t.Detail }),
+        });
+    }
+
+    // Build the visual render scene (shapes/sprites/timeline) for an open .gfx and
+    // resolve its referenced images to PNG data URLs so the canvas can draw them.
+    private void CmdGfxScene(Req r)
+    {
+        if (!_gfxCache.TryGetValue(r.Node, out var g))
+        { Send(new { type = "gfxScene", reqId = r.Id, ok = false, error = "gfx not open" }); return; }
+
+        var scene = GfxSceneParser.Parse(g.bytes);
+        var images = new List<object>();
+        foreach (var im in scene.Images)
+        {
+            string? url = null; int w = im.W, h = im.H;
+            try
+            {
+                if (im.Kind == "external" && !string.IsNullOrEmpty(im.File))
+                    url = ResolveGfxImageUrl(im.File!, g.entry, out w, out h);
+            }
+            catch { }
+            images.Add(new { id = im.Id, dataUrl = url, w, h, file = im.File, resolved = url != null });
+        }
+
+        Send(new
+        {
+            type = "gfxScene", reqId = r.Id, ok = scene.Ok, error = scene.Error,
+            width = scene.Width, height = scene.Height, frameRate = scene.FrameRate, frameCount = scene.FrameCount,
+            shapes = scene.Shapes, sprites = scene.Sprites, main = scene.Main,
+            symbols = scene.Symbols.ConvertAll(s => new { s.Id, s.Name }),
+            images,
+        });
+    }
+
+    // Resolve a GFx external image filename (e.g. "blips_texturesheet.dds") to a PNG
+    // data URL: a sibling loose .dds, else a same-named texture in nearby .ytd files.
+    private string? ResolveGfxImageUrl(string file, RpfFileEntry? entry, out int w, out int h)
+    {
+        w = 0; h = 0;
+        if (_ws == null) return null;
+        string lower = file.ToLowerInvariant();
+        string baseName = file; int dot = baseName.LastIndexOf('.'); if (dot > 0) baseName = baseName[..dot];
+
+        var dds = entry?.Parent?.Files?.FirstOrDefault(f => f.NameLower == lower);
+        if (dds != null)
+        {
+            var rgba = TextureCodec.DecodeDds(RpfWorkspace.Extract(dds), out w, out h);
+            if (rgba != null) return ImageUtil.DataUrlPng(ImageUtil.PngFromRgba(rgba, w, h));
+        }
+
+        _resolver ??= new TextureResolver(_ws.Manager);
+        if (entry != null) try { _resolver.IndexForModel(entry, new[] { baseName }); } catch { }
+        var tex = _resolver.Resolve(baseName);
+        if (tex != null)
+        {
+            var rgba = TextureCodec.DecodeTexture(tex, out w, out h);
+            if (rgba != null) return ImageUtil.DataUrlPng(ImageUtil.PngFromRgba(rgba, w, h));
+        }
+        return null;
+    }
 
     private void OpenImage(Req r, RpfFileEntry fe) => OpenImageCore(r, fe.Name, RpfWorkspace.Extract(fe));
 
@@ -683,10 +1034,12 @@ public sealed class Bridge
     }
 
     private void OpenEditableOrHex(Req r, RpfFileEntry fe)
-        => OpenEditableOrHexCore(r, fe.Name, RpfWorkspace.Extract(fe), fe);
+        => OpenEditableOrHexCore(r, fe.Name, RpfWorkspace.Extract(fe), fe, fe.Path);
 
     // fe is null for loose disk files (no binary-meta XML conversion available there).
-    private void OpenEditableOrHexCore(Req r, string name, byte[] bytes, RpfFileEntry? fe)
+    // savePath is the stable identity (archive entry path or on-disk path) the front-end
+    // echoes back on save so the write survives a background remount invalidating node ids.
+    private void OpenEditableOrHexCore(Req r, string name, byte[] bytes, RpfFileEntry? fe, string savePath = "")
     {
         string ext = ExtOf(name.ToLowerInvariant());
 
@@ -698,7 +1051,7 @@ public sealed class Bridge
         {
             Send(new
             {
-                type = "edit", reqId = r.Id, name, editable = true,
+                type = "edit", reqId = r.Id, name, editable = true, path = savePath,
                 format = "text", language = LangForExt(ext), content = DecodeText(bytes),
             });
             return;
@@ -719,7 +1072,7 @@ public sealed class Bridge
             if (string.IsNullOrEmpty(xml)) return false;
             Send(new
             {
-                type = "edit", reqId = r.Id, name = fe.Name, editable = true,
+                type = "edit", reqId = r.Id, name = fe.Name, editable = true, path = fe.Path,
                 format = "meta", metaName = xmlName, language = "xml", content = xml,
             });
             return true;
@@ -748,7 +1101,7 @@ public sealed class Bridge
 
             Send(new
             {
-                type = "edit", reqId = r.Id, name = fe.Name, editable = true,
+                type = "edit", reqId = r.Id, name = fe.Name, editable = true, path = fe.Path,
                 format = "meta", metaName = xmlName, language = "xml", content = xml,
             });
         }
@@ -760,10 +1113,19 @@ public sealed class Bridge
 
     private void CmdSave(Req r)
     {
-        if (!_nodes.TryGetValue(r.Node, out var obj))
-        { Send(new { type = "saved", reqId = r.Id, ok = false, message = "invalid node" }); return; }
-        var fe = obj as RpfFileEntry;
-        var di = obj as DiskItem;
+        // Resolve the save target. Node ids are invalidated whenever the file watcher
+        // remounts (any background .rpf change in the install clears the registry), which
+        // is why edits to anything but a just-opened file silently failed with "invalid
+        // node". The editor now also echoes the file's stable path, so fall back to
+        // re-resolving by path against the live mount (archive entry) or the disk.
+        RpfFileEntry? fe = null;
+        DiskItem? di = null;
+        if (_nodes.TryGetValue(r.Node, out var obj)) { fe = obj as RpfFileEntry; di = obj as DiskItem; }
+        if (fe == null && (di == null || di.IsDir) && !string.IsNullOrEmpty(r.Path))
+        {
+            if (_ws?.Manager.GetEntry(r.Path!) is RpfFileEntry ent) fe = ent;
+            else if (File.Exists(r.Path!)) di = new DiskItem { Path = r.Path!, IsDir = false };
+        }
         if (fe == null && (di == null || di.IsDir))
         { Send(new { type = "saved", reqId = r.Id, ok = false, message = "invalid node" }); return; }
 
@@ -1046,6 +1408,45 @@ public sealed class Bridge
         catch (Exception ex) { Send(new { type = "created", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
+    // Import an arbitrary dropped file into a folder/archive. As-is by default (raw
+    // bytes in Content as base64, replacing any same-name file). When As=="xml" the
+    // file is a CodeWalker XML export (name.<ext>.xml) and is converted back to its
+    // binary resource, saved as name.<ext> — the reverse of "Edit as XML"/extract.
+    private void CmdImportFile(Req r)
+    {
+        if (!ResolveTarget(r.Node, out var disk, out var dir, out var err))
+        { Send(new { type = "imported", reqId = r.Id, ok = false, message = err }); return; }
+        string name = (r.Name ?? "").Trim();
+        if (name.Length == 0) { Send(new { type = "imported", reqId = r.Id, ok = false, message = "name required" }); return; }
+        try
+        {
+            byte[] data; string outName;
+            if (r.As == "xml")
+            {
+                // trimlength recovers the original name: ".ydr.xml"->4 (name.ydr),
+                // ".pso.xml"->8 (a ymt exported as name.ymt.pso.xml -> name.ymt).
+                var fmt = XmlMeta.GetXMLFormat(name.ToLowerInvariant(), out int trim);
+                outName = name.Length > trim ? name.Substring(0, name.Length - trim) : name;
+                var doc = new XmlDocument();
+                doc.LoadXml(r.Content ?? "");
+                data = XmlMeta.GetData(doc, fmt, "");
+                if (data == null || data.Length == 0)
+                    throw new Exception("XML conversion produced no data (embedded-texture resources also need their .dds folder)");
+            }
+            else
+            {
+                outName = name;
+                data = Convert.FromBase64String(r.Content ?? "");
+                if (data.Length == 0) throw new Exception("empty file");
+            }
+
+            if (disk != null) { var p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, data); }
+            else { MarkSelfWrite(SafePhysical(dir!.File)); RpfFile.CreateFile(dir!, outName, data, true); }
+            Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = data.Length });
+        }
+        catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
     private void AddRpfToManager(RpfFile rpf)
     {
         try { _ws?.Manager.AllRpfs.Add(rpf); } catch { }
@@ -1127,7 +1528,9 @@ public sealed class Bridge
     private void MoveRpfFileToTrash(RpfFileEntry fe, long batch)
     {
         string dest = UniqueTrashPath(fe.Name);
-        try { File.WriteAllBytes(dest, RpfWorkspace.Extract(fe)); } catch { }
+        // Save a valid standalone copy (RSC7 header re-added for resources) so undo can
+        // re-import it as the correct entry kind instead of a corrupt binary file.
+        try { File.WriteAllBytes(dest, RpfWorkspace.ExtractForSave(fe)); } catch { }
         MarkSelfWrite(SafePhysical(fe.File));
         var parent = fe.Parent;
         RpfFile.DeleteEntry(fe);
@@ -1261,7 +1664,12 @@ public sealed class Bridge
         try
         {
             if (dir != null) ExtractDir(dir, outDir, ref count, ref bytes);
-            else { var d = Path.Combine(outDir, Path.GetFileName(diskDir!.Path)); CopyDir(diskDir.Path, d); count = -1; }
+            else
+            {
+                var d = Path.Combine(outDir, Path.GetFileName(diskDir!.Path));
+                CopyDir(diskDir.Path, d);
+                try { count = Directory.GetFiles(d, "*", SearchOption.AllDirectories).Length; } catch { count = 0; }
+            }
         }
         catch (Exception ex) { Send(new { type = "extractedAll", reqId = r.Id, ok = false, message = ex.Message }); return; }
         Send(new { type = "extractedAll", reqId = r.Id, ok = true, path = outDir, count, bytes });
@@ -1272,7 +1680,7 @@ public sealed class Bridge
         Directory.CreateDirectory(outBase);
         if (dir.Files != null)
             foreach (var fe in dir.Files)
-                try { var d = RpfWorkspace.Extract(fe); File.WriteAllBytes(Path.Combine(outBase, SafeName(fe.Name)), d); count++; bytes += d.Length; }
+                try { var d = RpfWorkspace.ExtractForSave(fe); File.WriteAllBytes(Path.Combine(outBase, SafeName(fe.Name)), d); count++; bytes += d.Length; }
                 catch { }
         if (dir.Directories != null)
             foreach (var sub in dir.Directories)
@@ -1498,7 +1906,7 @@ public sealed class Bridge
         return id;
     }
 
-    private object BuildModelDto(ModelData m, DrawableBase d, RpfFileEntry? modelEntry, TextureDictionary? localDict = null)
+    private Dictionary<string, object?> BuildModelDto(ModelData m, DrawableBase d, RpfFileEntry? modelEntry, TextureDictionary? localDict = null)
     {
         var shaders = d.ShaderGroup?.Shaders?.data_items;
 
@@ -1529,13 +1937,13 @@ public sealed class Bridge
             }
             mats.Add(new { shader = md.ShaderName, diffuse = md.DiffuseTextureName, tex });
         }
-        return new
+        return new Dictionary<string, object?>
         {
-            name = m.Name,
-            bmin = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z },
-            bmax = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
-            materials = mats,
-            lods = m.Lods.Select(l => new { level = l.Level, meshes = l.Meshes.Select(MeshDto).ToArray() }).ToArray(),
+            ["name"] = m.Name,
+            ["bmin"] = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z },
+            ["bmax"] = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
+            ["materials"] = mats,
+            ["lods"] = m.Lods.Select(l => new { level = l.Level, meshes = l.Meshes.Select(MeshDto).ToArray() }).ToArray(),
         };
     }
 

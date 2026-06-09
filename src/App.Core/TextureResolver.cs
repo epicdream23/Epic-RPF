@@ -41,36 +41,105 @@ public sealed class TextureResolver
 
     /// <summary>
     /// Index ytds near <paramref name="modelEntry"/> until all <paramref name="neededNames"/>
-    /// resolve or the budget is spent. Order: same-named sibling, same folder, then up to a
-    /// few parent folders (the model's own archive).
+    /// resolve or the budget is spent. The lookup is layered, strongest signal first:
+    ///   1. txds named after the model (incl. <c>_hi</c>/<c>+hi</c>/<c>_lod</c> variants);
+    ///   2. txds named after each *needed texture* — RAGE groups a texture into a same-named
+    ///      txd, which is the decisive signal in big shared archives (e.g. weapons.rpf, where
+    ///      a model's txd is alphabetically far down a list of hundreds);
+    ///   3. a broad scan of this folder and a few parents, ordered by name relevance so the
+    ///      right txd is hit early, continuing until resolved or the (generous) budget is spent.
+    /// The old code capped the scan at 48 alphabetically-first ytds, so weapon body textures
+    /// (e.g. <c>w_sr_*</c>) in weapons.rpf were never reached and models rendered untextured.
     /// </summary>
-    public void IndexForModel(RpfFileEntry modelEntry, ICollection<string> neededNames, int maxYtds = 48)
+    public void IndexForModel(RpfFileEntry modelEntry, ICollection<string> neededNames, int maxYtds = 256)
     {
         if (neededNames.Count == 0) return;
         bool AllResolved() => neededNames.All(_byName.ContainsKey);
         if (AllResolved()) return;
 
-        int loaded = 0;
         var dir = modelEntry.Parent;
         string baseLower = StripExt(modelEntry.NameLower);
 
-        // 1. <model>.ytd sibling — the strongest heuristic for props.
-        var sibling = dir?.Files?.FirstOrDefault(f => f.NameLower == baseLower + ".ytd");
-        if (sibling != null) { IndexYtd(sibling); loaded++; if (AllResolved()) return; }
+        // 1. txds named after the model (and the base name with detail suffixes stripped,
+        //    so a "_hi"/"_lod" model finds the base <model>.ytd that holds its textures).
+        foreach (var cand in TxdCandidates(baseLower))
+            if (TryIndexNamed(dir, cand) && AllResolved()) return;
 
-        // 2. every .ytd in the folder, then walk up a few parents.
-        var d = dir;
-        for (int up = 0; d != null && up <= 3 && loaded < maxYtds; up++)
+        // 2. txds named after each needed texture (the dominant RAGE convention).
+        foreach (var nm in neededNames.ToList())
         {
-            if (d.Files != null)
-                foreach (var f in d.Files)
-                    if (f.NameLower.EndsWith(".ytd", StringComparison.Ordinal))
-                    {
-                        IndexYtd(f);
-                        if (++loaded >= maxYtds || AllResolved()) return;
-                    }
+            string n = nm.ToLowerInvariant();
+            bool any = TryIndexNamed(dir, n);
+            any |= TryIndexNamed(dir, n + "+hi");
+            if (any && AllResolved()) return;
+        }
+
+        // 3. broad scan of this folder then a few parents, ordered by relevance.
+        int loaded = 0;
+        var d = dir;
+        for (int up = 0; d != null && up <= 3 && loaded < maxYtds && !AllResolved(); up++)
+        {
+            var ytds = d.Files?.Where(f => f.NameLower.EndsWith(".ytd", StringComparison.Ordinal)).ToList();
+            if (ytds != null)
+            {
+                ytds.Sort((a, b) => Relevance(b.NameLower, baseLower, neededNames)
+                                  - Relevance(a.NameLower, baseLower, neededNames));
+                foreach (var f in ytds)
+                {
+                    IndexYtd(f);
+                    if (++loaded >= maxYtds || AllResolved()) break;
+                }
+            }
             d = d.Parent;
         }
+    }
+
+    // Index a ytd named exactly "<baseName>.ytd" in this directory, if present.
+    private bool TryIndexNamed(RpfDirectoryEntry? dir, string baseName)
+    {
+        var f = dir?.Files?.FirstOrDefault(x => x.NameLower == baseName + ".ytd");
+        if (f == null) return false;
+        IndexYtd(f);
+        return true;
+    }
+
+    // Candidate txd base-names for a model: itself, its "+hi" high-detail twin, and the
+    // same with a trailing detail suffix (_hi / +hi / _lod[n] / _l[n]) stripped.
+    private static IEnumerable<string> TxdCandidates(string baseLower)
+    {
+        yield return baseLower;
+        yield return baseLower + "+hi";
+        string stripped = StripDetailSuffix(baseLower);
+        if (stripped != baseLower) { yield return stripped; yield return stripped + "+hi"; }
+    }
+
+    private static string StripDetailSuffix(string s)
+    {
+        foreach (var suf in new[] { "+hi", "_hi", "_lod", "_lod1", "_lod2", "_lod3", "_l1", "_l2", "_l3" })
+            if (s.EndsWith(suf, StringComparison.Ordinal) && s.Length > suf.Length)
+                return s.Substring(0, s.Length - suf.Length);
+        return s;
+    }
+
+    // How likely a ytd holds what the model needs: the longest shared prefix between the
+    // ytd's name and either the model base name or any needed texture name.
+    private static int Relevance(string ytdNameLower, string baseLower, ICollection<string> needed)
+    {
+        string ytdBase = StripExt(ytdNameLower);
+        int best = SharedPrefix(ytdBase, baseLower);
+        foreach (var n in needed)
+        {
+            int p = SharedPrefix(ytdBase, n.ToLowerInvariant());
+            if (p > best) best = p;
+        }
+        return best;
+    }
+
+    private static int SharedPrefix(string a, string b)
+    {
+        int n = Math.Min(a.Length, b.Length), i = 0;
+        while (i < n && a[i] == b[i]) i++;
+        return i;
     }
 
     private static string StripExt(string name)
