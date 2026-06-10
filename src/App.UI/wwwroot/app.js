@@ -479,8 +479,33 @@ function makeRow(it) {
     if (!isSelected(it)) { setSelection([it]); selAnchor = row.__idx; selectedRow = row; showInspectorForSelection(it); }
     showMenu(menuFor(it), e.clientX, e.clientY);
   };
+  row.addEventListener('pointerdown', e => beginRowDrag(it, e));
+  row.addEventListener('dragstart', e => e.preventDefault());  // suppress HTML5 drag; we do native OS drag
   return row;
 }
+
+// ---- native file drag-out (to Explorer / desktop / any app) ----
+// HTML5 drag can't produce real OS files, so we detect the gesture here and the C#
+// host runs an OLE DoDragDrop with an actual FileDrop. We fire on the first move past
+// a small threshold (button still down) so the native drag picks up the gesture.
+let dragRow = null;
+function beginRowDrag(it, e) {
+  if (e.button !== 0) return;
+  dragRow = { it, x: e.clientX, y: e.clientY };
+}
+window.addEventListener('pointermove', e => {
+  if (!dragRow) return;
+  if (!(e.buttons & 1)) { dragRow = null; return; }     // button released — not a drag
+  if (Math.abs(e.clientX - dragRow.x) + Math.abs(e.clientY - dragRow.y) < 6) return;
+  const it = dragRow.it; dragRow = null;
+  const set = (isSelected(it) && selection.length > 1) ? selection : [it];
+  const ids = set.filter(n => n && n.id !== 0 &&
+    (n.kind === 'file' || n.kind === 'archive' || n.kind === 'dir' || n.kind === 'folder')).map(n => n.id);
+  if (!ids.length) return;
+  setStatus(ids.length === 1 ? `Dragging ${it.name}…` : `Dragging ${ids.length} items…`);
+  post('dragOut', { nodes: ids });
+});
+window.addEventListener('pointerup', () => { dragRow = null; });
 
 function setSort(m, dir) {
   if (dir === undefined) sortDir = (m === sortMode) ? -sortDir : 1;  // toggle on repeat
@@ -1492,7 +1517,9 @@ function menuFor(node) {
   items.push({ label: 'New RPF', accel: 'Ctrl+N', action: () => newRpf(target) });
   items.push({ label: 'New YTD', action: () => newYtd(target) });
   items.push({ sep: true });
-  if (node && (node.kind === 'file' || node.kind === 'archive')) items.push({ label: 'Extract…', action: () => extract(node) });
+  const multiSel = selection.length > 1 && node && isSelected(node);
+  if (multiSel) items.push({ label: `Extract ${selection.length} items…`, action: () => extractMany(selection) });
+  else if (node && (node.kind === 'file' || node.kind === 'archive')) items.push({ label: 'Extract…', action: () => extract(node) });
   items.push({ label: 'Extract all…', action: () => extractAll(target) });
   if (node && node.id !== 0) {
     items.push({ sep: true });
@@ -1519,6 +1546,15 @@ async function extract(n) {
   const res = await call('extract', { node: n.id });
   if (res.canceled) { setStatus('Extract canceled'); return; }
   if (res.ok) setStatus(`Extracted ${n.name} → ${res.path} (${fmtSize(res.size)})`);
+  else setStatus('Extract failed: ' + (res.message || ''), true);
+}
+async function extractMany(nodes) {
+  const ids = nodes.filter(n => n && n.id !== 0 && (n.kind === 'file' || n.kind === 'archive' || n.kind === 'dir' || n.kind === 'folder')).map(n => n.id);
+  if (!ids.length) { setStatus('Nothing extractable selected.', true); return; }
+  setStatus(`Extracting ${ids.length} items…`);
+  const res = await call('extractMany', { nodes: ids });
+  if (res.canceled) { setStatus('Extract canceled'); return; }
+  if (res.ok) setStatus(`Extracted ${res.count.toLocaleString()} files → ${res.path}` + (res.failed ? ` (${res.failed} failed)` : ''));
   else setStatus('Extract failed: ' + (res.message || ''), true);
 }
 async function extractAll(target) {

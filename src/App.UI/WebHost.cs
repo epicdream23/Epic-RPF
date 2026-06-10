@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
@@ -37,11 +39,24 @@ internal static class WebHost
             pickFolder: () => PickFolder(window),
             pickSavePath: name => PickSavePath(window, name),
             windowAction: action => window.Dispatcher.Invoke(() => DoWindowAction(window, action)),
-            openPopout: (id, title) => window.Dispatcher.Invoke(() => OpenPopout(id, title)));
+            openPopout: (id, title) => window.Dispatcher.Invoke(() => OpenPopout(id, title)),
+            startDrag: paths => StartFileDrag(web, paths));
 
         core.WebMessageReceived += (_, args) =>
         {
-            try { bridge.HandleMessage(args.WebMessageAsJson); }
+            try
+            {
+                string json = args.WebMessageAsJson;
+                // The native file drag-out must run on THIS (UI) thread, synchronously,
+                // while the mouse button is still down — so handle it inline rather than
+                // through the bridge's gated background queue.
+                if (json.Contains("\"dragOut\"") && TryGetDragNodes(json, out int[] ids))
+                {
+                    bridge.HandleDrag(ids);
+                    return;
+                }
+                bridge.HandleMessage(json);
+            }
             catch { /* a malformed message must never take the app down */ }
         };
 
@@ -95,6 +110,42 @@ internal static class WebHost
     {
         var win = new PopoutWindow(id, title);
         win.Show();
+    }
+
+    // Parse {cmd:"dragOut", nodes:[...]} -> node ids.
+    private static bool TryGetDragNodes(string json, out int[] ids)
+    {
+        ids = Array.Empty<int>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("cmd", out var c) || c.GetString() != "dragOut") return false;
+            if (!root.TryGetProperty("nodes", out var ns) || ns.ValueKind != JsonValueKind.Array) return false;
+            var list = new List<int>();
+            foreach (var n in ns.EnumerateArray()) if (n.TryGetInt32(out int v)) list.Add(v);
+            ids = list.ToArray();
+            return ids.Length > 0;
+        }
+        catch { return false; }
+    }
+
+    // Run the OLE drag loop with a real FileDrop data object so the files can be
+    // dropped onto Explorer / the desktop / any app. DoDragDrop is modal: it tracks
+    // the mouse (the button is still down from the HTML gesture) until the drop, then
+    // returns. Must be on the UI thread.
+    private static void StartFileDrag(System.Windows.DependencyObject source, string[] paths)
+    {
+        try
+        {
+            if (paths == null || paths.Length == 0) return;
+            var files = new StringCollection();
+            files.AddRange(paths);
+            var data = new DataObject();
+            data.SetFileDropList(files);
+            DragDrop.DoDragDrop(source, data, DragDropEffects.Copy);
+        }
+        catch { /* drag is best-effort; a failed gesture just does nothing */ }
     }
 
     private static string? PickFolder(Window w) => w.Dispatcher.Invoke(() =>

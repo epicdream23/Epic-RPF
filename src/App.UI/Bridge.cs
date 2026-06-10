@@ -28,6 +28,7 @@ public sealed class Bridge
     private readonly Func<string, string?> _pickSavePath;
     private readonly Action<string>? _windowAction;     // "min" | "max" | "close"
     private readonly Action<int, string>? _openPopout;  // (popoutId, title) -> new window
+    private readonly Action<string[]>? _startDrag;      // begin a native OS file drag with these paths
 
     // The mounted game is shared across all windows (main + torn-off popouts), so
     // these are static: a popout window's Bridge reuses the already-mounted set.
@@ -57,13 +58,74 @@ public sealed class Bridge
     };
 
     public Bridge(Action<string> post, Func<string?> pickFolder, Func<string, string?> pickSavePath,
-                  Action<string>? windowAction = null, Action<int, string>? openPopout = null)
+                  Action<string>? windowAction = null, Action<int, string>? openPopout = null,
+                  Action<string[]>? startDrag = null)
     {
         _post = post;
         _pickFolder = pickFolder;
         _pickSavePath = pickSavePath;
         _windowAction = windowAction;
         _openPopout = openPopout;
+        _startDrag = startDrag;
+    }
+
+    // Native OS drag-out. Called on the UI thread the instant the front-end detects a
+    // drag gesture (so the mouse button is still down). Each selected entry is
+    // materialised to a real file path — archive entries are extracted to a temp drag
+    // folder (as valid standalone files), loose disk files / base .rpf / disk folders
+    // are dragged in place — then handed to the host which runs the OLE drag loop.
+    // Pure file reads (no manager mutation), so it runs without the command gate.
+    public void HandleDrag(int[] ids)
+    {
+        if (_startDrag == null) return;
+        var paths = PrepareDragPaths(ids);
+        if (paths.Length > 0) _startDrag(paths);
+    }
+
+    public string[] PrepareDragPaths(int[] ids)
+    {
+        if (ids == null || ids.Length == 0) return Array.Empty<string>();
+        string dir = Path.Combine(Path.GetTempPath(), "EpicRpf_drag");
+        try
+        {
+            if (Directory.Exists(dir))
+            {
+                foreach (var f in Directory.GetFiles(dir)) { try { File.Delete(f); } catch { } }
+                foreach (var d in Directory.GetDirectories(dir)) { try { Directory.Delete(d, true); } catch { } }
+            }
+            Directory.CreateDirectory(dir);
+        }
+        catch { }
+
+        var paths = new List<string>();
+        foreach (var id in ids)
+        {
+            if (!_nodes.TryGetValue(id, out var obj)) continue;
+            try
+            {
+                switch (obj)
+                {
+                    case RpfFileEntry fe:
+                        var p = Path.Combine(dir, SafeName(fe.Name));
+                        File.WriteAllBytes(p, RpfWorkspace.ExtractForSave(fe));
+                        paths.Add(p);
+                        break;
+                    case DiskItem di:                                   // loose file or folder — drag in place
+                        if (File.Exists(di.Path) || Directory.Exists(di.Path)) paths.Add(di.Path);
+                        break;
+                    case RpfFile rf when SafePhysical(rf) is string phys && File.Exists(phys):
+                        paths.Add(phys);                                // base .rpf — drag the archive file itself
+                        break;
+                    case RpfDirectoryEntry rd:                          // folder inside an archive — extract to temp
+                        var sub = Path.Combine(dir, SafeName(rd.Name));
+                        int c = 0; long b = 0; ExtractDir(rd, sub, ref c, ref b);
+                        paths.Add(sub);
+                        break;
+                }
+            }
+            catch { }
+        }
+        return paths.ToArray();
     }
 
     private sealed class Req
@@ -96,6 +158,7 @@ public sealed class Bridge
         public string? Hash { get; set; }        // custom-name LUT key (drawable hash hex)
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
+        public int[]? Nodes { get; set; }         // multi-select (extract many)
     }
 
     private static readonly HashSet<string> ImageExts = new(StringComparer.Ordinal)
@@ -211,6 +274,7 @@ public sealed class Bridge
             case "encodeDds": CmdEncodeDds(r); break;
             case "decodeDds": CmdDecodeDds(r); break;
             case "extract": CmdExtract(r); break;
+            case "extractMany": CmdExtractMany(r); break;
             case "extractAll": CmdExtractAll(r); break;
             case "createFolder": CmdCreateFolder(r); break;
             case "createRpf": CmdCreateRpf(r); break;
@@ -644,6 +708,34 @@ public sealed class Bridge
         byte[] bytes = getBytes();
         File.WriteAllBytes(path, bytes);
         Send(new { type = "extracted", reqId = r.Id, ok = true, path, size = bytes.Length });
+    }
+
+    // Extract several selected files at once into a single chosen folder. Each entry
+    // is written as a valid standalone file (RSC7 header re-added for resources).
+    private void CmdExtractMany(Req r)
+    {
+        var ids = r.Nodes ?? Array.Empty<int>();
+        if (ids.Length == 0) { Send(new { type = "extractedMany", reqId = r.Id, ok = false, message = "nothing selected" }); return; }
+        string? outDir = _pickFolder();
+        if (outDir == null) { Send(new { type = "extractedMany", reqId = r.Id, ok = false, canceled = true }); return; }
+
+        int count = 0, failed = 0; long bytes = 0;
+        foreach (var id in ids)
+        {
+            if (!_nodes.TryGetValue(id, out var obj)) { failed++; continue; }
+            try
+            {
+                string name; byte[] data;
+                if (obj is RpfFileEntry fe) { name = fe.Name; data = RpfWorkspace.ExtractForSave(fe); }
+                else if (obj is DiskItem di && !di.IsDir) { name = Path.GetFileName(di.Path); data = File.ReadAllBytes(di.Path); }
+                else if (obj is RpfDirectoryEntry rd) { var sub = Path.Combine(outDir, SafeName(rd.Name)); int c = 0; long b = 0; ExtractDir(rd, sub, ref c, ref b); count += c; bytes += b; continue; }
+                else { failed++; continue; }
+                File.WriteAllBytes(Path.Combine(outDir, SafeName(name)), data);
+                count++; bytes += data.Length;
+            }
+            catch { failed++; }
+        }
+        Send(new { type = "extractedMany", reqId = r.Id, ok = count > 0, path = outDir, count, failed, bytes });
     }
 
     // ---- openers ----------------------------------------------------------
