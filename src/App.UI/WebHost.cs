@@ -23,9 +23,17 @@ namespace App.UI;
 /// </summary>
 internal static class WebHost
 {
+    private static CoreWebView2Environment? _env;
+
     public static async Task<Bridge> AttachAsync(Window window, WebView2 web, string? injectJs)
     {
-        await web.EnsureCoreWebView2Async();
+        // Keep the WebView2 user-data folder in LocalAppData. By default it is created
+        // NEXT TO THE EXE ("EpicRpf.exe.WebView2"), which fails the moment the app is
+        // installed to a read-only location (Program Files) — the browser process can't
+        // start and the window stays blank. One shared environment per process.
+        _env ??= await CoreWebView2Environment.CreateAsync(null,
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EpicRpf", "WebView2"));
+        await web.EnsureCoreWebView2Async(_env);
         var core = web.CoreWebView2;
 
         web.AllowExternalDrop = true;   // accept files dragged in from Explorer (texture import)

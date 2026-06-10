@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Epic RPF</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+    { "imports": { "three": "./lib/three/three.module.min.js" } }
+  </script>
+  <!-- Monaco (the editor that powers VS Code), self-hosted AMD build -->
+  <script src="./lib/monaco/vs/loader.js"></script>
+  <script>
+    self.MonacoEnvironment = { getWorkerUrl: () => './lib/monaco/vs/base/worker/workerMain.js' };
+    require.config({ paths: { vs: './lib/monaco/vs' } });
+    window.monacoReady = new Promise(res => require(['vs/editor/editor.main'], () => res(window.monaco)));
+  </script>
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar (doubles as the custom window title bar) -->
+    <header id="toolbar">
+      <div class="brand"><img class="app-ico" src="./icons/app.png" alt=""> <span class="brand-name">Epic&nbsp;RPF</span></div>
+      <div class="nav-global" id="navGlobal">
+        <button class="nav-btn" id="navBack" title="Back (Alt+Left)">&#x2190;</button>
+        <button class="nav-btn" id="navFwd" title="Forward (Alt+Right)">&#x2192;</button>
+        <button class="nav-btn" id="navUp" title="Up one level (Alt+Up)">&#x2191;</button>
+      </div>
+      <div class="mount-bar">
+        <input id="folder" type="text" spellcheck="false"
+               value="C:\Program Files\Epic Games\GTAV" />
+        <button id="browse" class="btn ghost" title="Choose folder">Browse…</button>
+        <label class="gen-toggle" title="Enhanced / Gen9 resources">
+          <input id="gen9" type="checkbox" /> Gen9
+        </label>
+        <button id="mount" class="btn primary">Mount</button>
+      </div>
+      <div class="grow"></div>
+      <div id="popoutTitle" class="popout-title"></div>
+      <div id="mountInfo" class="muted"></div>
+      <div class="win-btns">
+        <button class="win-btn" id="winMin" title="Minimize">&#x2500;</button>
+        <button class="win-btn" id="winMax" title="Maximize">&#x1F5D6;</button>
+        <button class="win-btn close" id="winClose" title="Close">&#x2715;</button>
+      </div>
+    </header>
+
+    <!-- Indeterminate loading bar (mount + slow file opens) -->
+    <div id="progress" class="progress" hidden><div class="bar"></div></div>
+
+    <!-- Body: tree | content | inspector -->
+    <div id="body">
+      <aside id="sidebar">
+        <div class="panel-head">
+          <span class="panel-title">Explorer</span>
+          <button class="panel-toggle" id="sideToggle" title="Collapse panel">&#x27E8;</button>
+        </div>
+        <div class="search">
+          <input id="filter" type="text" placeholder="Search files…  (Enter)" spellcheck="false" />
+          <div class="search-opts">
+            <label><input type="checkbox" id="optExt"> Ext</label>
+            <label><input type="checkbox" id="optArchive"> This archive</label>
+            <label><input type="checkbox" id="optFolder"> This folder</label>
+          </div>
+        </div>
+        <div id="tree" class="tree">
+          <div class="empty-hint">Mount a GTA V folder to browse archives.</div>
+        </div>
+      </aside>
+
+      <div class="splitter" id="splitSidebar"></div>
+
+      <main id="content">
+        <div id="tabs" class="tabs"></div>
+        <div id="panes" class="panes">
+          <!-- Explorer (OpenIV-style folder list) -->
+          <section class="pane" id="pane-explorer" hidden>
+            <div class="nav-row">
+              <div class="crumbs" id="crumbs"></div>
+            </div>
+            <div class="list">
+              <div class="list-head">
+                <span class="c-name">Name</span>
+                <span class="c-type">Type</span>
+                <span class="c-size">Size</span>
+                <span class="c-attr">Attributes</span>
+              </div>
+              <div class="list-body" id="listBody"></div>
+            </div>
+          </section>
+
+          <!-- 3D viewport -->
+          <section class="pane" id="pane-model" hidden>
+            <!-- Models in a dictionary (.ydd/.ypt) listed down the left -->
+            <aside class="vp-models" id="vpModels" hidden>
+              <div class="vp-mhead-bar">
+                <span class="vp-mhead" id="vpModelsTitle">Models</span>
+                <button class="panel-toggle" id="vpModelsToggle" title="Collapse list">&#x27E8;</button>
+              </div>
+              <div class="vp-mlist" id="vpModelList"></div>
+            </aside>
+            <div class="vp-split" id="vpSplit" hidden></div>
+            <div class="vp-main">
+              <div class="viewport-wrap">
+                <canvas id="gl"></canvas>
+                <div class="vp-overlay">
+                  <div class="vp-tools">
+                    <select id="lodSel" title="Level of detail"></select>
+                    <button class="chip" id="tgWire">Wireframe</button>
+                    <button class="chip" id="tgVColor">Colors</button>
+                    <button class="chip" id="tgBox">Bounds</button>
+                    <button class="chip" id="tgGrid" data-on="1">Grid</button>
+                    <button class="chip" id="tgLight" data-on="1">Light</button>
+                    <button class="chip" id="tgTex" hidden>Textures</button>
+                    <button class="chip" id="btnFit">Fit</button>
+                  </div>
+                  <div class="vp-stats" id="vpStats"></div>
+                </div>
+              </div>
+              <div class="vp-textures" id="vpTextures" hidden>
+                <button class="vp-tex-expand" id="btnTexExpand" title="Show textures fullscreen">⛶ Expand</button>
+                <div class="vp-tex-row" id="vpTexRow"></div>
+              </div>
+            </div>
+            <!-- Fullscreen texture browser (hides the models + viewer) -->
+            <div class="vp-texfull" id="vpTexFull" hidden>
+              <div class="vp-texfull-head">
+                <span id="vpTexFullTitle">Textures</span>
+                <span class="grow"></span>
+                <button class="chip" id="btnTexCollapse">✕ Close</button>
+              </div>
+              <div class="tex-grid" id="vpTexFullGrid"></div>
+            </div>
+          </section>
+
+          <!-- Editor (text & meta-as-XML, powered by Monaco) -->
+          <section class="pane" id="pane-edit" hidden>
+            <div class="edit-bar">
+              <span id="editLang" class="edit-lang">text</span>
+              <span id="editFmt" class="edit-fmt"></span>
+              <span id="editDirty" class="edit-dirty" hidden>● unsaved</span>
+              <span class="grow"></span>
+              <button class="btn ghost sm" id="btnExport">Export…</button>
+              <button class="btn primary sm" id="btnSaveRpf">Save to archive</button>
+            </div>
+            <div id="editor" class="editor-host"></div>
+          </section>
+
+          <!-- Hex -->
+          <section class="pane" id="pane-hex" hidden>
+            <pre id="hexBody" class="hex-body"></pre>
+          </section>
+
+          <!-- Texture list -->
+          <section class="pane" id="pane-texture" hidden>
+            <div id="texGrid" class="tex-grid"></div>
+          </section>
+
+          <!-- Image / DDS viewer + converter -->
+          <section class="pane" id="pane-image" hidden>
+            <div class="img-bar">
+              <span id="imgInfo" class="muted"></span>
+              <span class="grow"></span>
+              <label class="fmt-lbl">DDS format
+                <select id="ddsFmt">
+                  <option>DXT5</option><option>DXT1</option><option>DXT3</option>
+                  <option>BC7</option><option>BC4</option><option>BC5</option><option>RGBA</option>
+                </select>
+              </label>
+              <button class="btn primary sm" id="btnSaveDds">Save as DDS</button>
+            </div>
+            <div class="img-stage checker"><img id="imgView" alt=""></div>
+          </section>
+
+          <!-- GFX (Scaleform/SWF) read-only viewer: symbol tree + live preview -->
+          <section class="pane" id="pane-gfx" hidden>
+            <div class="gfx-layout">
+              <aside class="gfx-tree-pane">
+                <div class="gfx-file">
+                  <span id="gfxFileName" class="gfx-fname"></span>
+                  <span id="gfxFileMeta" class="gfx-fmeta"></span>
+                </div>
+                <input id="gfxFilter" class="gfx-filter" type="text" placeholder="Filter symbols…" spellcheck="false">
+                <div id="gfxTree" class="gfx-tree"></div>
+              </aside>
+              <div class="gfx-view">
+                <div class="gfx-toolbar">
+                  <span id="gfxSel" class="gfx-sel">—</span>
+                  <span class="grow"></span>
+                  <button class="chip" id="gfxPlay" title="Play / pause" hidden>▶</button>
+                  <input type="range" id="gfxFrame" min="0" max="0" value="0" title="Frame" hidden />
+                  <span id="gfxFrameLbl" class="muted"></span>
+                  <button class="chip" id="gfxFit" title="Fit to view">Fit</button>
+                </div>
+                <div class="gfx-content">
+                  <div class="gfx-stage checker" id="gfxStage">
+                    <canvas id="gfxCanvas"></canvas>
+                    <div id="gfxRenderMsg" class="gfx-rmsg muted"></div>
+                  </div>
+                  <div id="gfxInfo" class="gfx-info" hidden></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Welcome -->
+          <section class="pane welcome" id="pane-welcome">
+            <div class="welcome-card">
+              <h1><span class="logo">◆</span> Epic RPF</h1>
+              <p>A robust GTA&nbsp;V archive browser &amp; model viewer.</p>
+              <ol>
+                <li>Confirm your GTA&nbsp;V folder in the toolbar (Gen8/Legacy by default).</li>
+                <li>Click <b>Mount</b>.</li>
+                <li>Browse the tree and double-click a <code>.ydr</code> / <code>.ydd</code> / <code>.yft</code>.</li>
+              </ol>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <div class="splitter" id="splitInspector"></div>
+
+      <aside id="inspector">
+        <div class="insp-title">
+          <span class="it-label">Inspector</span>
+          <button class="panel-toggle" id="inspToggle" title="Collapse panel">&#x27E9;</button>
+        </div>
+        <div id="inspBody" class="insp-body muted">Nothing selected.</div>
+      </aside>
+    </div>
+
+    <!-- Status bar -->
+    <footer id="status">
+      <span id="statusLeft">Ready</span>
+      <span class="grow"></span>
+      <span id="statusRight"></span>
+    </footer>
+  </div>
+
+  <!-- Drag & drop overlay for the DDS converter -->
+  <div id="dropZone" class="dropzone" hidden><div>Drop an image to convert to DDS</div></div>
+
+  <!-- Install chooser modal -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <h3 id="modalTitle">Multiple GTA V installs found</h3>
+      <p class="muted">Choose which one to mount:</p>
+      <div id="modalList" class="modal-list"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="modalCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
