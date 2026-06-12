@@ -72,6 +72,7 @@ const FOLDER_ICONS = {
   user: 'folder-user', appdata: 'folder-user',
   config: 'folder-config', settings: 'folder-config',
   temp: 'folder-temp', tmp: 'folder-temp', cache: 'folder-temp',
+  epic: 'folder-epic',
 };
 function iconName(node) {
   if (node.kind === 'folder' || node.kind === 'dir')
@@ -79,6 +80,8 @@ function iconName(node) {
   if (node.kind === 'archive') return 'archive';
   return (node.name.split('.').pop() || 'file').toLowerCase();
 }
+// Folders named "epic" (the user's own mod folder) get a glowing, animated label.
+function isEpicNode(node) { return (node.kind === 'folder' || node.kind === 'dir') && node.name.toLowerCase() === 'epic'; }
 function iconImg(name, cls = 'ic') {
   return `<img class="${cls}" src="./icons/${name}.png" onerror="this.onerror=null;this.src='./icons/file.png'" alt="">`;
 }
@@ -179,7 +182,7 @@ function makeTreeNode(n, depth) {
   const icEl = iconEl(iconName(n));
 
   const lab = document.createElement('span');
-  lab.className = 'label'; lab.textContent = n.name;
+  lab.className = isEpicNode(n) ? 'label epic-glow' : 'label'; lab.textContent = n.name;
 
   row.append(tw, icEl, lab);
   const kids = document.createElement('div');
@@ -464,13 +467,14 @@ function makeRow(it) {
     const sizeText = it.container
       ? (it.count != null ? `${it.count} item${it.count === 1 ? '' : 's'}` : '')
       : (it.size >= 0 ? fmtSize(it.size) : '');
+    const lc = isEpicNode(it) ? 'label epic-glow' : 'label';
     row.innerHTML =
-      `<span class="c-name">${iconImg(iconName(it))}<span class="label">${it.name}</span></span>` +
+      `<span class="c-name">${iconImg(iconName(it))}<span class="${lc}">${it.name}</span></span>` +
       `<span class="c-type">${it.type || ''}</span>` +
       `<span class="c-size">${sizeText}</span>` +
       `<span class="c-attr">${it.attrs || ''}</span>`;
   } else {
-    row.innerHTML = `${iconImg(iconName(it))}<span class="label">${it.name}</span>`;
+    row.innerHTML = `${iconImg(iconName(it))}<span class="${isEpicNode(it) ? 'label epic-glow' : 'label'}">${it.name}</span>`;
   }
   row.onclick = e => onRowClick(it, row, e);
   row.ondblclick = () => onItemDbl(it);
@@ -506,6 +510,60 @@ window.addEventListener('pointermove', e => {
   post('dragOut', { nodes: ids });
 });
 window.addEventListener('pointerup', () => { dragRow = null; });
+
+// ---- rubber-band (marquee) selection ----------------------------------------
+// Drag a box over empty space in the explorer list; every row the box touches is
+// selected (Ctrl = add to the current selection). Coordinates are kept in the
+// list's content space (offsetTop/scroll) so the box and hit-test survive scrolling.
+(function marquee() {
+  let on = false, ax = 0, ay = 0, lastX = 0, lastY = 0, box = null, additive = false, baseSel = [], scrollTimer = 0;
+  const uniqById = arr => { const m = new Map(); for (const n of arr) m.set(n.id, n); return [...m.values()]; };
+
+  function update() {
+    const r = listBody.getBoundingClientRect();
+    const cx = lastX - r.left + listBody.scrollLeft, cy = lastY - r.top + listBody.scrollTop;
+    const x1 = Math.min(ax, cx), y1 = Math.min(ay, cy), x2 = Math.max(ax, cx), y2 = Math.max(ay, cy);
+    box.style.cssText = `left:${x1}px;top:${y1}px;width:${x2 - x1}px;height:${y2 - y1}px`;
+    const hits = [];
+    for (const o of explorer.ordered) {
+      const t = o.row.offsetTop, b = t + o.row.offsetHeight, l = o.row.offsetLeft, rr = l + o.row.offsetWidth;
+      if (rr > x1 && l < x2 && b > y1 && t < y2) hits.push(o.node);
+    }
+    setSelection(additive ? uniqById([...baseSel, ...hits]) : hits);
+  }
+  function autoScroll() {
+    const r = listBody.getBoundingClientRect();
+    if (lastY > r.bottom - 22 && listBody.scrollTop < listBody.scrollHeight - listBody.clientHeight) { listBody.scrollTop += 16; update(); }
+    else if (lastY < r.top + 22 && listBody.scrollTop > 0) { listBody.scrollTop -= 16; update(); }
+  }
+  listBody.addEventListener('pointerdown', e => {
+    // Only start on empty space (a row handles its own click/drag), left button, not while searching.
+    if (e.button !== 0 || searchActive || e.target.closest('.row-item')) return;
+    on = true; additive = e.ctrlKey || e.metaKey;
+    baseSel = additive ? selection.slice() : [];
+    const r = listBody.getBoundingClientRect();
+    ax = e.clientX - r.left + listBody.scrollLeft; ay = e.clientY - r.top + listBody.scrollTop;
+    lastX = e.clientX; lastY = e.clientY;
+    box = document.createElement('div'); box.className = 'marquee';
+    box.style.cssText = `left:${ax}px;top:${ay}px;width:0;height:0`;
+    listBody.appendChild(box);
+    if (!additive) { clearSelection(); applySelectionStyles(); }
+    try { listBody.setPointerCapture(e.pointerId); } catch {}
+    scrollTimer = setInterval(autoScroll, 50);
+    e.preventDefault();
+  });
+  listBody.addEventListener('pointermove', e => { if (!on) return; lastX = e.clientX; lastY = e.clientY; update(); });
+  function end(e) {
+    if (!on) return; on = false;
+    clearInterval(scrollTimer); scrollTimer = 0;
+    if (box) { box.remove(); box = null; }
+    try { listBody.releasePointerCapture(e.pointerId); } catch {}
+    selAnchor = -1;
+    if (selection.length) showInspectorForSelection(selection[selection.length - 1]);
+  }
+  listBody.addEventListener('pointerup', end);
+  listBody.addEventListener('pointercancel', end);
+})();
 
 function setSort(m, dir) {
   if (dir === undefined) sortDir = (m === sortMode) ? -sortDir : 1;  // toggle on repeat
@@ -808,9 +866,18 @@ function texMenu(node, t, ev, ph, fmt) {
   ev.preventDefault(); ev.stopPropagation();
   showMenu([
     { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name) },
+    { label: 'Delete texture', action: () => deleteTexture(node, t.index, t.name) },
     { sep: true },
     { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
   ], ev.clientX, ev.clientY);
+}
+async function deleteTexture(node, index, name) {
+  const yes = await confirmDialog({ title: 'Delete texture', body: `Remove “${name}” from this dictionary? This rewrites the file.`, okLabel: 'Delete' });
+  if (!yes) return;
+  setStatus(`Deleting ${name}…`);
+  const res = await call('deleteTexture', { node, index, name });
+  if (res.ok) { setStatus(`Deleted ${name} (${res.count} left)`); applyReplacedTextures(res.node, res.textures); }
+  else setStatus('Delete failed: ' + (res.message || ''), true);
 }
 
 // The open dictionary a dropped file would import into: the active .ytd (texture
@@ -926,7 +993,41 @@ async function saveActive(target) {
   } else setStatus('Save failed: ' + (res.message || ''), true);
 }
 $('btnSaveRpf').onclick = () => saveActive('rpf');
-$('btnExport').onclick = () => saveActive('export');
+// When the file is shown AS XML (a binary meta/resource), ask which form to extract.
+$('btnExport').onclick = async () => {
+  const t = activeTab;
+  if (t && t.kind === 'edit' && t.data && t.data.format === 'meta') {
+    const choice = await choiceDialog({
+      title: `Extract “${t.title}”`,
+      body: "You're viewing this file as XML. Extract which format?",
+      buttons: [{ label: 'As XML', value: 'xml', cls: 'primary' }, { label: 'Original file', value: 'bin', cls: 'ghost' }],
+    });
+    if (choice === 'xml') return saveActive('export');
+    if (choice === 'bin') {
+      setStatus(`Extracting ${t.title}…`);
+      const res = await call('extract', { node: t.key });
+      if (res.canceled) { setStatus('Extract canceled'); return; }
+      setStatus(res.ok ? `Extracted ${t.title} → ${res.path}` : 'Extract failed: ' + (res.message || ''), !res.ok);
+    }
+    return;
+  }
+  saveActive('export');
+};
+
+// Small N-button choice dialog. Resolves to the picked value (or null on Escape).
+function choiceDialog({ title, body, buttons }) {
+  return new Promise(resolve => {
+    const ov = document.createElement('div'); ov.className = 'modal';
+    ov.innerHTML = `<div class="modal-card"><h3>${esc(title)}</h3>
+      <p class="muted" style="white-space:normal">${esc(body || '')}</p>
+      <div class="modal-actions"></div></div>`;
+    document.body.append(ov);
+    const acts = ov.querySelector('.modal-actions');
+    const done = v => { ov.remove(); resolve(v); };
+    for (const b of buttons) { const el = document.createElement('button'); el.className = 'btn ' + (b.cls || 'ghost'); el.textContent = b.label; el.onclick = () => done(b.value); acts.append(el); }
+    ov.onkeydown = e => { if (e.key === 'Escape') done(null); };
+  });
+}
 
 // ---------------------------------------------------------------- hex / texture
 function b64bytes(s) { const bin = atob(s || ''); const o = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) o[i] = bin.charCodeAt(i); return o; }
@@ -1426,6 +1527,7 @@ window.addEventListener('drop', async e => {
 
 async function handleDroppedFile(file) {
   const lower = file.name.toLowerCase();
+  if (lower.endsWith('.epic')) { await epicInstallFromBytes(new Uint8Array(await file.arrayBuffer())); return; }  // drop an extension to install
   if (XML_REIMPORT_RE.test(lower)) { await importDroppedFile(file, true); return; }      // XML export -> original binary
   const tnode = dropTargetNode();
   if (tnode != null && TEXTURE_RE.test(lower)) { await importDroppedTexture(tnode, file); return; }  // texture into ytd/ypt
@@ -1520,10 +1622,14 @@ function menuFor(node) {
   const multiSel = selection.length > 1 && node && isSelected(node);
   if (multiSel) items.push({ label: `Extract ${selection.length} items…`, action: () => extractMany(selection) });
   else if (node && (node.kind === 'file' || node.kind === 'archive')) items.push({ label: 'Extract…', action: () => extract(node) });
+  // Export as XML (CodeWalker XML — re-importable by dropping the .xml back in).
+  if (multiSel) items.push({ label: `Export ${selection.length} as XML…`, action: () => exportXmlMany(selection) });
+  else if (node && node.kind === 'file') items.push({ label: 'Export as XML…', action: () => exportXml(node) });
   items.push({ label: 'Extract all…', action: () => extractAll(target) });
   if (node && node.id !== 0) {
     items.push({ sep: true });
     const multi = selection.length > 1 && isSelected(node);
+    if (!multi) items.push({ label: 'Rename', accel: 'F2', action: () => rename(node) });
     items.push({ label: multi ? `Delete ${selection.length} items` : 'Delete', accel: 'Del', action: () => deleteNodes(multi ? selection : [node]) });
   }
   items.push({ sep: true });
@@ -1548,6 +1654,22 @@ async function extract(n) {
   if (res.ok) setStatus(`Extracted ${n.name} → ${res.path} (${fmtSize(res.size)})`);
   else setStatus('Extract failed: ' + (res.message || ''), true);
 }
+async function exportXml(n) {
+  setStatus(`Converting ${n.name} to XML…`);
+  const res = await call('exportXml', { node: n.id });
+  if (res.canceled) { setStatus('Export canceled'); return; }
+  if (res.ok) setStatus(`Exported ${n.name} as XML → ${res.path}`);
+  else setStatus('Export as XML failed: ' + (res.message || ''), true);
+}
+async function exportXmlMany(nodes) {
+  const ids = nodes.filter(n => n && n.id !== 0 && n.kind === 'file').map(n => n.id);
+  if (!ids.length) { setStatus('Select files to export as XML.', true); return; }
+  setStatus(`Exporting ${ids.length} files as XML…`);
+  const res = await call('exportXmlMany', { nodes: ids });
+  if (res.canceled) { setStatus('Export canceled'); return; }
+  if (res.ok) setStatus(`Exported ${res.count.toLocaleString()} as XML → ${res.path}` + (res.failed ? ` (${res.failed} not convertible)` : ''));
+  else setStatus('Export failed: ' + (res.message || ''), true);
+}
 async function extractMany(nodes) {
   const ids = nodes.filter(n => n && n.id !== 0 && (n.kind === 'file' || n.kind === 'archive' || n.kind === 'dir' || n.kind === 'folder')).map(n => n.id);
   if (!ids.length) { setStatus('Nothing extractable selected.', true); return; }
@@ -1567,16 +1689,19 @@ async function extractAll(target) {
 }
 
 // ---- create ----
-function promptDialog({ title, label, value = '', checkboxLabel = null }) {
+function promptDialog({ title, label, value = '', checkboxLabel = null, okLabel = 'Create', selectBasename = false }) {
   return new Promise(resolve => {
     const ov = document.createElement('div'); ov.className = 'modal';
     ov.innerHTML = `<div class="modal-card"><h3>${title}</h3>
       <label class="dlg-l">${label}</label>
-      <input class="dlg-in" type="text" spellcheck="false" value="${value}">
+      <input class="dlg-in" type="text" spellcheck="false" value="${esc(value)}">
       ${checkboxLabel ? `<label class="dlg-cb"><input type="checkbox" class="dlg-chk"> ${checkboxLabel}</label>` : ''}
-      <div class="modal-actions"><button class="btn ghost dlg-cancel">Cancel</button><button class="btn primary dlg-ok">Create</button></div></div>`;
+      <div class="modal-actions"><button class="btn ghost dlg-cancel">Cancel</button><button class="btn primary dlg-ok">${esc(okLabel)}</button></div></div>`;
     document.body.append(ov);
-    const input = ov.querySelector('.dlg-in'); input.focus(); input.select();
+    const input = ov.querySelector('.dlg-in'); input.focus();
+    // For rename, preselect just the base name (everything before the last dot), like Windows.
+    const dot = value.lastIndexOf('.');
+    if (selectBasename && dot > 0) input.setSelectionRange(0, dot); else input.select();
     const chk = ov.querySelector('.dlg-chk');
     const done = v => { ov.remove(); resolve(v); };
     ov.querySelector('.dlg-ok').onclick = () => { const n = input.value.trim(); if (n) done({ name: n, checked: chk ? chk.checked : false }); };
@@ -1603,6 +1728,18 @@ async function newYtd(target) {
 function afterCreate(res) {
   if (res.ok) { setStatus(`Created ${res.kind} “${res.name}”` + (res.note ? ` — ${res.note}` : '')); refreshCurrent(); }
   else setStatus('Create failed: ' + (res.message || ''), true);
+}
+
+// ---- rename (right-click / F2) ----
+async function rename(node) {
+  if (!node || node.id === 0) return;
+  const cur = node.name;
+  const r = await promptDialog({ title: 'Rename', label: 'New name', value: cur, okLabel: 'Rename', selectBasename: true });
+  if (!r || r.name === cur) return;
+  setStatus(`Renaming ${cur}…`);
+  const res = await call('rename', { node: node.id, name: r.name });
+  if (res.ok) { node.name = res.name; setStatus(`Renamed to “${res.name}”`); refreshCurrent(); }
+  else setStatus('Rename failed: ' + (res.message || ''), true);
 }
 
 // Re-read the folder currently shown (and the tree roots if at the top level),
@@ -1688,6 +1825,13 @@ window.addEventListener('keydown', e => {
     else if (selectedRow && selectedRow.__node) { e.preventDefault(); deleteNode(selectedRow.__node); }
     return;
   }
+  if (e.key === 'F2') {
+    const n = (selection.length === 1 && selection[0]) ||
+              (selectedTreeEl && selectedTreeEl.__node) ||
+              (selectedRow && selectedRow.__node);
+    if (n && n.id !== 0) { e.preventDefault(); rename(n); }
+    return;
+  }
   if (!e.ctrlKey || e.altKey) return;
   const k = e.key.toLowerCase();
   if (k === 'z' && !e.shiftKey) { e.preventDefault(); undoDelete(); }
@@ -1753,6 +1897,181 @@ async function enterPopout(info) {
                 data: p.data, nodeId: p.nodeId, noClose: true };
   tabs.push(tab);
   activate(tab);
+}
+
+// ---------------------------------------------------------------- .epic extensions
+// Install (drag a .epic onto the app, or the Extension button) and a builder that
+// assembles a manifest of operations and packs them into an encrypted .epic.
+$('extBtn').onclick = e => {
+  e.stopPropagation();   // don't let the global click-to-close fire on this same click
+  const r = e.currentTarget.getBoundingClientRect();
+  showMenu([
+    { label: 'Install extension…', action: epicPickInstall },
+    { label: 'Create extension…', action: openExtBuilder },
+  ], r.left, r.bottom + 4);
+};
+
+// The GTA-root-relative vpath of the currently selected explorer file (for the builder).
+function selectedVpath() {
+  const n = (selection && selection[0]) || (selectedRow && selectedRow.__node);
+  if (!n || n.container) return '';
+  return [...explorer.crumbs.slice(1).map(c => c.name), n.name].join('/');
+}
+
+function modalShell(title, sub) {
+  const ov = document.createElement('div'); ov.className = 'modal';
+  ov.innerHTML = `<div class="modal-card ext-card"><h3>${esc(title)}</h3>${sub ? `<p class="muted" style="white-space:normal;margin:-4px 0 10px">${esc(sub)}</p>` : ''}<div class="ext-body"></div><div class="modal-actions"></div></div>`;
+  document.body.append(ov);
+  ov.onkeydown = ev => { if (ev.key === 'Escape') ov.remove(); };
+  return { ov, body: ov.querySelector('.ext-body'), actions: ov.querySelector('.modal-actions'), close: () => ov.remove() };
+}
+function addBtn(host, label, cls, fn) { const b = document.createElement('button'); b.className = 'btn ' + cls; b.textContent = label; b.onclick = fn; host.append(b); return b; }
+
+// ---- install ----
+async function epicPickInstall() {
+  const r = await call('pickEpic');
+  if (!r.path) return;
+  epicPreviewThenInstall({ path: r.path });
+}
+async function epicInstallFromBytes(bytes) { epicPreviewThenInstall({ content: bytesToB64(bytes) }); }
+
+async function epicPreviewThenInstall(srcArg) {
+  setStatus('Reading extension…');
+  const info = await withProgress(call('inspectEpic', srcArg), 0);
+  if (!info.ok) { setStatus('Not a valid .epic: ' + (info.message || ''), true); return; }
+  const m = modalShell(`Install: ${info.name || 'extension'}`,
+    `${info.version ? 'v' + info.version : ''}${info.author ? ' · by ' + info.author : ''}${info.target ? ' · ' + info.target : ''}`);
+  let h = '';
+  if (info.description) h += `<div class="ext-desc">${esc(info.description)}</div>`;
+  h += `<div class="ext-plan-h">This will perform ${info.operations.length} operation${info.operations.length === 1 ? '' : 's'}:</div>`;
+  h += `<div class="ext-plan">` + (info.plan || []).map(p => `<div>${esc(p)}</div>`).join('') + `</div>`;
+  h += `<div class="muted" style="margin-top:8px;font-size:11px">Originals are backed up to GTAV\\EpicRpf_backups before any change.</div>`;
+  m.body.innerHTML = h;
+  addBtn(m.actions, 'Cancel', 'ghost', m.close);
+  addBtn(m.actions, 'Install', 'primary', async () => {
+    m.close(); setStatus('Installing extension…');
+    const res = await withProgress(call('installEpic', srcArg), 0);
+    if (!res.ok && res.message) { setStatus('Install failed: ' + res.message, true); }
+    showEpicResults(res);
+    await refreshCurrent();
+  });
+}
+function showEpicResults(res) {
+  const fails = (res.results || []).filter(r => !r.ok);
+  setStatus(res.ok ? `Installed “${res.name}” — ${res.okCount} operation(s) applied`
+                   : `Installed with ${res.failCount} failure(s) — ${res.okCount} ok`, !res.ok);
+  const m = modalShell(res.ok ? 'Extension installed' : 'Extension installed with errors',
+    res.backup ? 'Backups: ' + res.backup : '');
+  m.body.innerHTML = `<div class="ext-plan">` + (res.results || []).map(r =>
+    `<div class="${r.ok ? 'ext-ok' : 'ext-fail'}">[${r.ok ? 'OK' : 'FAIL'}] ${esc(r.op)} ${esc(r.target)} — ${esc(r.message)}</div>`).join('') + `</div>`;
+  addBtn(m.actions, 'Close', 'primary', m.close);
+}
+
+// ---- builder ----
+function openExtBuilder() {
+  const m = modalShell('Create extension (.epic)', 'Assemble operations, then build an encrypted .epic others can drag-drop to install.');
+  const ops = [];
+  m.body.innerHTML = `
+    <div class="ext-meta">
+      <label>Name <input class="ext-in" id="exName" value="My Extension"></label>
+      <label>Author <input class="ext-in" id="exAuthor"></label>
+      <label>Version <input class="ext-in" id="exVer" value="1.0"></label>
+      <label class="wide">Description <input class="ext-in" id="exDesc"></label>
+    </div>
+    <div class="ext-ops-h"><span>Operations</span><button class="btn ghost sm" id="exAdd">+ Add operation</button></div>
+    <div class="ext-ops" id="exOps"></div>`;
+  const opsEl = m.body.querySelector('#exOps');
+  const render = () => {
+    opsEl.innerHTML = '';
+    ops.forEach((op, i) => opsEl.append(opRow(op, i, () => { ops.splice(i, 1); render(); })));
+    if (!ops.length) opsEl.innerHTML = '<div class="muted" style="padding:8px">No operations yet — click “Add operation”.</div>';
+  };
+  m.body.querySelector('#exAdd').onclick = () => { ops.push({ op: 'replaceFile', target: selectedVpath(), source: '', createIfMissing: true }); render(); };
+  render();
+  addBtn(m.actions, 'Cancel', 'ghost', m.close);
+  addBtn(m.actions, 'Build .epic…', 'primary', async () => {
+    const manifest = {
+      format: 'epic/1',
+      name: m.body.querySelector('#exName').value.trim() || 'extension',
+      author: m.body.querySelector('#exAuthor').value.trim(),
+      version: m.body.querySelector('#exVer').value.trim() || '1.0',
+      description: m.body.querySelector('#exDesc').value.trim(),
+      target: 'update.rpf',
+      operations: ops.filter(o => o.target),
+    };
+    if (!manifest.operations.length) { setStatus('Add at least one operation with a target.', true); return; }
+    const bad = manifest.operations.find(o => o.op === 'replaceFile' && !o.source);
+    if (bad) { setStatus('A replace-file operation has no source file picked.', true); return; }
+    m.close(); setStatus('Building extension…');
+    const res = await withProgress(call('createEpic', { manifest: JSON.stringify(manifest) }), 0);
+    if (res.canceled) { setStatus('Build canceled'); return; }
+    setStatus(res.ok ? `Built ${res.path} (${fmtSize(res.size)}, ${res.ops} ops)` : 'Build failed: ' + (res.message || ''), !res.ok);
+  });
+}
+
+function opRow(op, idx, onRemove) {
+  const row = document.createElement('div'); row.className = 'ext-op';
+  const head = document.createElement('div'); head.className = 'ext-op-head';
+  const typeSel = document.createElement('select'); typeSel.className = 'ext-in';
+  for (const [v, l] of [['replaceFile', 'Replace / add file'], ['xml', 'XML edit'], ['text', 'Text edit'], ['deleteFile', 'Delete file']]) {
+    const o = document.createElement('option'); o.value = v; o.textContent = l; if (op.op === v) o.selected = true; typeSel.append(o);
+  }
+  head.innerHTML = `<span class="ext-op-n">#${idx + 1}</span>`;
+  head.append(typeSel);
+  const rm = document.createElement('button'); rm.className = 'ext-x'; rm.textContent = '✕'; rm.title = 'Remove'; rm.onclick = onRemove; head.append(rm);
+  const fields = document.createElement('div'); fields.className = 'ext-op-fields';
+  row.append(head, fields);
+
+  const field = (label, key, ph) => {
+    const w = document.createElement('label'); w.className = 'ext-f';
+    const inp = document.createElement('input'); inp.className = 'ext-in'; inp.value = op[key] || ''; inp.placeholder = ph || '';
+    inp.oninput = () => op[key] = inp.value;
+    w.append(document.createTextNode(label), inp); fields.append(w); return inp;
+  };
+  const select = (label, key, choices, def) => {
+    const w = document.createElement('label'); w.className = 'ext-f';
+    const sel = document.createElement('select'); sel.className = 'ext-in';
+    for (const c of choices) { const o = document.createElement('option'); o.value = c; o.textContent = c; if ((op[key] || def) === c) o.selected = true; sel.append(o); }
+    op[key] = op[key] || def; sel.onchange = () => { op[key] = sel.value; build(); };
+    w.append(document.createTextNode(label), sel); fields.append(w); return sel;
+  };
+  const targetField = () => {
+    const w = document.createElement('label'); w.className = 'ext-f wide';
+    const inp = document.createElement('input'); inp.className = 'ext-in'; inp.value = op.target || ''; inp.placeholder = 'update/update.rpf/common/data/...';
+    inp.oninput = () => op.target = inp.value;
+    const use = document.createElement('button'); use.className = 'btn ghost sm'; use.textContent = 'Use selected'; use.title = 'Use the file selected in the explorer';
+    use.onclick = () => { const v = selectedVpath(); if (v) { inp.value = v; op.target = v; } else setStatus('Select a file in the explorer first.', true); };
+    w.append(document.createTextNode('Target vpath'), inp, use); fields.append(w); return inp;
+  };
+
+  function build() {
+    fields.innerHTML = '';
+    op.op = typeSel.value;
+    targetField();
+    if (op.op === 'replaceFile') {
+      const sf = field('Source file', 'source', 'pick a file from disk');
+      const pick = document.createElement('button'); pick.className = 'btn ghost sm'; pick.textContent = 'Pick…';
+      pick.onclick = async () => { const r = await call('pickFile'); if (r.path) { op.source = r.path; sf.value = r.path; } };
+      sf.parentElement.append(pick);
+    } else if (op.op === 'xml') {
+      const act = select('Action', 'action', ['add', 'replace', 'remove', 'setattr', 'settext'], 'add');
+      field('XPath', 'xpath', 'e.g. //dataFiles  or  (//spec)[1]');
+      const a = op.action || 'add';
+      if (a === 'add' || a === 'replace') field('XML node', 'xml', '<Item>…</Item>');
+      if (a === 'setattr') { field('Attribute', 'attr', 'value'); field('Value', 'value', ''); }
+      if (a === 'settext') field('Text', 'value', '');
+    } else if (op.op === 'text') {
+      const act = select('Action', 'action', ['append', 'insertBefore', 'insertAfter', 'replace', 'delete'], 'append');
+      const a = op.action || 'append';
+      if (a !== 'append') field('Find (line/text)', 'find', '');
+      if (a !== 'delete') field('Value', 'value', '');
+    }
+    const note = field('Note (optional)', 'note', 'shown in the install preview');
+    note.parentElement.classList.add('wide');
+  }
+  typeSel.onchange = build;
+  build();
+  return row;
 }
 
 // ---------------------------------------------------------------- boot
@@ -1840,5 +2159,22 @@ async function autoload() {
   detectAndMount();
 }
 
+// Open an arbitrary file on disk in a tab (used by the file-association single-instance
+// forwarder, and by viewer mode). Exposed on window so C# can invoke it via ExecuteScript.
+async function openExternalFile(path) {
+  try {
+    const r = await call('openPath', { path });
+    if (!r || !r.ok || !r.node) { setStatus('Could not open ' + path + (r && r.message ? ': ' + r.message : ''), true); return; }
+    openFile({ id: r.node, name: r.name, viewer: r.viewer });
+    setStatus('Opened ' + r.name);
+  } catch (e) { setStatus('Open failed: ' + e.message, true); }
+}
+window.__openExternalFile = openExternalFile;
+
 if (window.__POPOUT) enterPopout(window.__POPOUT);
+else if (window.__VIEWFILE) {            // launched to view a single file (no instance was running)
+  document.body.classList.add('popout', 'viewfile');
+  $('popoutTitle').textContent = window.__VIEWFILE.split(/[\\/]/).pop();
+  openExternalFile(window.__VIEWFILE);
+}
 else autoload();

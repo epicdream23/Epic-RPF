@@ -48,7 +48,8 @@ internal static class WebHost
             pickSavePath: name => PickSavePath(window, name),
             windowAction: action => window.Dispatcher.Invoke(() => DoWindowAction(window, action)),
             openPopout: (id, title) => window.Dispatcher.Invoke(() => OpenPopout(id, title)),
-            startDrag: paths => StartFileDrag(web, paths));
+            startDrag: paths => StartFileDrag(web, paths),
+            pickOpenPath: filter => PickOpenPath(window, filter));
 
         core.WebMessageReceived += (_, args) =>
         {
@@ -165,6 +166,12 @@ internal static class WebHost
     private static string? PickSavePath(Window w, string name) => w.Dispatcher.Invoke(() =>
     {
         var dlg = new SaveFileDialog { FileName = name, Title = "Save file" };
+        return dlg.ShowDialog(w) == true ? dlg.FileName : null;
+    });
+
+    private static string? PickOpenPath(Window w, string filter) => w.Dispatcher.Invoke(() =>
+    {
+        var dlg = new OpenFileDialog { Title = "Open file", Filter = string.IsNullOrEmpty(filter) ? "All files (*.*)|*.*" : filter };
         return dlg.ShowDialog(w) == true ? dlg.FileName : null;
     });
 

@@ -186,6 +186,34 @@ body.resizing #gl { pointer-events: none; }
 .node.open > .row > .twisty { transform: rotate(90deg); }
 .icon { width: 18px; text-align: center; flex: 0 0 auto; font-size: 12px; }
 .label { overflow: hidden; text-overflow: ellipsis; }
+/* "epic" folders: shimmering, glowing teal label */
+.label.epic-glow {
+  font-weight: 600;
+  background: linear-gradient(90deg, #4fd1c5 0%, #a7f3ee 25%, #4fd1c5 50%, #3b82f6 75%, #4fd1c5 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+  animation: epicShimmer 3.2s linear infinite, epicGlow 2.4s ease-in-out infinite;
+}
+@keyframes epicShimmer { to { background-position: -220% 0; } }
+@keyframes epicGlow {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(79,209,197,.45)); }
+  50% { filter: drop-shadow(0 0 7px rgba(79,209,197,.85)); }
+}
+/* The glow's drop-shadow extends past the text box; don't let the label (or its
+   row containers, which clip long names with overflow:hidden) cut it off. The
+   negative margins keep the text in place while giving the blur room to breathe. */
+.label.epic-glow,
+.row-item .c-name .label.epic-glow,
+.result-row .c-name .label.epic-glow,
+.list-body.view-icons .row-item .label.epic-glow {
+  overflow: visible;
+  padding: 1px 8px;
+  margin: -1px -8px;
+}
+.node > .row:has(.epic-glow),
+.row-item .c-name:has(.epic-glow),
+.result-row .c-name:has(.epic-glow) { overflow: visible; }
 .size { margin-left: auto; padding-left: 12px; color: var(--muted); font-size: 11px; flex: 0 0 auto; }
 .children { display: none; }
 .node.open > .children { display: block; }
@@ -247,7 +275,13 @@ body.resizing #gl { pointer-events: none; }
   text-transform: uppercase; letter-spacing: .4px; border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
 }
-.list-body { overflow: auto; flex: 1 1 auto; }
+.list-body { overflow: auto; flex: 1 1 auto; position: relative; }
+/* rubber-band (marquee) selection box */
+.marquee {
+  position: absolute; z-index: 6; pointer-events: none; border-radius: 1px;
+  border: 1px solid var(--accent);
+  background: rgba(79, 209, 197, .14);
+}
 .row-item { padding: 4px 12px; font-size: 13px; }
 .row-item:hover { background: var(--bg-3); }
 .row-item.selected { background: #1d2740; }
@@ -276,6 +310,33 @@ body.resizing #gl { pointer-events: none; }
 .modal-card { background: var(--panel); border: 1px solid var(--border-2); border-radius: 12px;
   padding: 20px 22px; width: 540px; max-width: 90vw; box-shadow: 0 20px 60px rgba(0,0,0,.6); }
 .modal-card h3 { margin: 0 0 4px; }
+
+/* .epic extension modals */
+.ext-card { width: 680px; max-height: 86vh; display: flex; flex-direction: column; }
+.ext-body { overflow: auto; margin: 6px 0 12px; }
+.ext-desc { background: var(--bg-3); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; font-size: 12.5px; white-space: pre-wrap; }
+.ext-plan-h { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+.ext-plan { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px; background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 320px; overflow: auto; }
+.ext-plan > div { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ext-ok { color: #6ee7b7; } .ext-fail { color: var(--danger, #f87171); }
+.ext-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-bottom: 12px; }
+.ext-meta label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-dim); }
+.ext-meta label.wide { grid-column: 1 / -1; }
+.ext-in { padding: 5px 8px; font-size: 12.5px; border-radius: 5px; background: var(--bg-3); color: var(--text); border: 1px solid var(--border-2); }
+.ext-in:focus { outline: none; border-color: var(--accent); }
+.ext-ops-h { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--accent); }
+.ext-ops { display: flex; flex-direction: column; gap: 8px; }
+.ext-op { border: 1px solid var(--border-2); border-radius: 8px; background: var(--bg-2); padding: 8px 10px; }
+.ext-op-head { display: flex; align-items: center; gap: 8px; }
+.ext-op-n { font-family: monospace; color: var(--muted); }
+.ext-x { margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; }
+.ext-x:hover { color: var(--danger, #f87171); }
+.ext-op-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-top: 8px; }
+.ext-f { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-dim); }
+.ext-f.wide { grid-column: 1 / -1; }
+.ext-f input, .ext-f select { width: 100%; }
+.ext-f .btn { align-self: flex-start; margin-top: 2px; }
 .modal-list { margin: 14px 0; display: flex; flex-direction: column; gap: 8px; }
 .install { display: flex; align-items: center; gap: 12px; padding: 11px 13px; background: var(--bg-3);
   border: 1px solid var(--border-2); border-radius: 8px; }

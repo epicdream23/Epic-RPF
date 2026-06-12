@@ -11,7 +11,7 @@
 ;     "Install for all users" remains available via the privileges dialog.
 
 #define MyAppName "Epic RPF"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "Epic RPF"
 #define MyAppExeName "EpicRpf.exe"
 
@@ -48,6 +48,7 @@ Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescri
 
 [Files]
 Source: "..\dist\publish\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "..\changelog.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; WebView2 Evergreen bootstrapper — only executed when the runtime is missing (see [Run]).
 Source: "redist\MicrosoftEdgeWebView2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
@@ -59,6 +60,10 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{tmp}\MicrosoftEdgeWebView2Setup.exe"; Parameters: "/silent /install"; \
   StatusMsg: "Installing Microsoft Edge WebView2 Runtime…"; Check: not WebView2Installed; \
   Flags: waituntilterminated
+; Optional (checked by default) — opens changelog.txt in the user's default text
+; editor on the final wizard page. Uncheck to skip; never runs on a silent install.
+Filename: "{app}\changelog.txt"; Description: "View the changelog"; \
+  Flags: shellexec nowait postinstall skipifsilent runasoriginaluser
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; \
   Flags: nowait postinstall skipifsilent
 

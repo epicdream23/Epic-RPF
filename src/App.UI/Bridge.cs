@@ -29,6 +29,7 @@ public sealed class Bridge
     private readonly Action<string>? _windowAction;     // "min" | "max" | "close"
     private readonly Action<int, string>? _openPopout;  // (popoutId, title) -> new window
     private readonly Action<string[]>? _startDrag;      // begin a native OS file drag with these paths
+    private readonly Func<string, string?>? _pickOpenPath;  // open-file dialog (filter) -> path
 
     // The mounted game is shared across all windows (main + torn-off popouts), so
     // these are static: a popout window's Bridge reuses the already-mounted set.
@@ -59,7 +60,7 @@ public sealed class Bridge
 
     public Bridge(Action<string> post, Func<string?> pickFolder, Func<string, string?> pickSavePath,
                   Action<string>? windowAction = null, Action<int, string>? openPopout = null,
-                  Action<string[]>? startDrag = null)
+                  Action<string[]>? startDrag = null, Func<string, string?>? pickOpenPath = null)
     {
         _post = post;
         _pickFolder = pickFolder;
@@ -67,6 +68,7 @@ public sealed class Bridge
         _windowAction = windowAction;
         _openPopout = openPopout;
         _startDrag = startDrag;
+        _pickOpenPath = pickOpenPath;
     }
 
     // Native OS drag-out. Called on the UI thread the instant the front-end detects a
@@ -159,6 +161,7 @@ public sealed class Bridge
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
         public int[]? Nodes { get; set; }         // multi-select (extract many)
+        public string? Manifest { get; set; }     // createEpic: the manifest JSON the builder assembled
     }
 
     private static readonly HashSet<string> ImageExts = new(StringComparer.Ordinal)
@@ -275,16 +278,26 @@ public sealed class Bridge
             case "decodeDds": CmdDecodeDds(r); break;
             case "extract": CmdExtract(r); break;
             case "extractMany": CmdExtractMany(r); break;
+            case "exportXml": CmdExportXml(r); break;
+            case "exportXmlMany": CmdExportXmlMany(r); break;
             case "extractAll": CmdExtractAll(r); break;
             case "createFolder": CmdCreateFolder(r); break;
             case "createRpf": CmdCreateRpf(r); break;
             case "createYtd": CmdCreateYtd(r); break;
             case "importFile": CmdImportFile(r); break;
+            case "inspectEpic": CmdInspectEpic(r); break;
+            case "installEpic": CmdInstallEpic(r); break;
+            case "createEpic": CmdCreateEpic(r); break;
+            case "pickEpic": Send(new { type = "epicPicked", reqId = r.Id, path = _pickOpenPath?.Invoke("Epic RPF extension (*.epic)|*.epic") }); break;
+            case "pickFile": Send(new { type = "filePicked", reqId = r.Id, path = _pickOpenPath?.Invoke("All files (*.*)|*.*") }); break;
             case "delete": CmdDelete(r); break;
+            case "rename": CmdRename(r); break;
             case "undo": CmdUndo(r); break;
             case "modelPart": CmdModelPart(r); break;
             case "texImage": CmdTexImage(r); break;
             case "replaceTexture": CmdReplaceTexture(r); break;
+            case "deleteTexture": CmdDeleteTexture(r); break;
+            case "openPath": CmdOpenPath(r); break;
             case "renameModel": CmdRenameModel(r); break;
             case "winMin": _windowAction?.Invoke("min"); break;
             case "winMax": _windowAction?.Invoke("max"); break;
@@ -339,6 +352,11 @@ public sealed class Bridge
 
         _broadcast = Send;     // the mounting window relays fs-change events
         StartWatcher(folder);
+
+        // Warm the NG encrypt tables in the background so writes into NG-encrypted
+        // archives (most base rpfs) don't fail with "tables not loaded" — first run
+        // computes + caches them, later runs load the cache in well under a second.
+        _ = Task.Run(() => { try { NgEncrypt.Ensure(); } catch { } });
 
         Send(new
         {
@@ -676,6 +694,19 @@ public sealed class Bridge
 
     // Tear a tab off into a new OS window. The front-end serializes the tab's
     // already-rendered viewer state; we stash it and open a window that fetches it.
+    // Open a loose file given by absolute path (file-association double-click). Registers
+    // a disk node and returns it so the front-end opens it through the normal viewer flow
+    // — works without a mounted game; the file is editable (saves back to disk).
+    private void CmdOpenPath(Req r)
+    {
+        string path = r.Path ?? "";
+        if (!File.Exists(path)) { Send(new { type = "pathNode", reqId = r.Id, ok = false, message = "file not found" }); return; }
+        var di = new DiskItem { Path = path, IsDir = false };
+        int id = Register(di);
+        string name = Path.GetFileName(path);
+        Send(new { type = "pathNode", reqId = r.Id, ok = true, node = id, name, viewer = FileTypes.Route(name).ToString().ToLowerInvariant() });
+    }
+
     private void CmdPopout(Req r)
     {
         if (_openPopout == null) { Send(new { type = "popout", reqId = r.Id, ok = false }); return; }
@@ -736,6 +767,80 @@ public sealed class Bridge
             catch { failed++; }
         }
         Send(new { type = "extractedMany", reqId = r.Id, ok = count > 0, path = outDir, count, failed, bytes });
+    }
+
+    // Convert an entry to CodeWalker XML, writing any embedded textures as .dds into
+    // <baseDir>\<shortname>\ so the export round-trips. Returns the xml + its name (e.g.
+    // carcols.ymt.pso.xml). For an already-text file the text passes through as
+    // <name>.xml. Returns null xml only if it's binary with no XML mapping.
+    private static (string? xml, string xmlName) ToXml(RpfFileEntry fe, string baseDir)
+    {
+        byte[] bytes = RpfWorkspace.Extract(fe);
+        try
+        {
+            string xml = MetaXml.GetXml(fe, bytes, out string xmlName, baseDir);
+            if (!string.IsNullOrEmpty(xml)) return (xml, xmlName);
+        }
+        catch { }
+        if (LooksText(bytes))
+        {
+            string nm = fe.NameLower.EndsWith(".xml", StringComparison.Ordinal) ? fe.Name : fe.Name + ".xml";
+            return (DecodeText(bytes), nm);
+        }
+        return (null, fe.Name + ".xml");
+    }
+
+    // Export ONE file as CodeWalker XML via a Save dialog (embedded textures saved into
+    // a sibling folder next to the chosen .xml so a later reimport works).
+    private void CmdExportXml(Req r)
+    {
+        if (!_nodes.TryGetValue(r.Node, out var obj) || obj is not RpfFileEntry fe)
+        { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = "select a file" }); return; }
+        try
+        {
+            string tmp = Path.Combine(Path.GetTempPath(), "EpicRpf_xmlexport", Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(tmp);
+            var (xml, xmlName) = ToXml(fe, tmp);
+            if (xml == null) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = "this file can't be converted to XML — extract it normally" }); return; }
+
+            string? path = _pickSavePath(xmlName);
+            if (path == null) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, canceled = true }); return; }
+            File.WriteAllText(path, xml, new UTF8Encoding(false));
+
+            // copy the texture folder (if GetXml produced one) next to the .xml
+            string ddsSrc = Path.Combine(tmp, fe.GetShortName());
+            if (Directory.Exists(ddsSrc))
+            {
+                string ddsDst = Path.Combine(Path.GetDirectoryName(path)!, fe.GetShortName());
+                CopyDir(ddsSrc, ddsDst);
+            }
+            try { Directory.Delete(tmp, true); } catch { }
+            Send(new { type = "exportedXml", reqId = r.Id, ok = true, path });
+        }
+        catch (Exception ex) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Export several files as XML into one chosen folder (textures land in per-file subfolders).
+    private void CmdExportXmlMany(Req r)
+    {
+        var ids = r.Nodes ?? Array.Empty<int>();
+        if (ids.Length == 0) { Send(new { type = "exportedXmlMany", reqId = r.Id, ok = false, message = "nothing selected" }); return; }
+        string? outDir = _pickFolder();
+        if (outDir == null) { Send(new { type = "exportedXmlMany", reqId = r.Id, ok = false, canceled = true }); return; }
+        int count = 0, failed = 0;
+        foreach (var id in ids)
+        {
+            if (!_nodes.TryGetValue(id, out var obj) || obj is not RpfFileEntry fe) { failed++; continue; }
+            try
+            {
+                var (xml, xmlName) = ToXml(fe, outDir);
+                if (xml == null) { failed++; continue; }
+                File.WriteAllText(Path.Combine(outDir, SafeName(xmlName)), xml, new UTF8Encoding(false));
+                count++;
+            }
+            catch { failed++; }
+        }
+        Send(new { type = "exportedXmlMany", reqId = r.Id, ok = count > 0, path = outDir, count, failed });
     }
 
     // ---- openers ----------------------------------------------------------
@@ -911,7 +1016,7 @@ public sealed class Bridge
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             // Point the display cache at the new dict so thumbnails reflect the edit.
@@ -922,6 +1027,57 @@ public sealed class Bridge
         {
             Send(new { type = "replaced", reqId = r.Id, ok = false, message = ex.Message });
         }
+    }
+
+    // Delete a texture from an open .ytd / .ypt and write the dictionary back.
+    private void CmdDeleteTexture(Req r)
+    {
+        if (!_modelCache.TryGetValue(r.Node, out var mc))
+        { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "texture source not open" }); return; }
+
+        var fe = mc.Entry;
+        if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
+            && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh) { fe = fresh; mc.Entry = fresh; }
+
+        string fileLower = (fe?.NameLower ?? Path.GetFileName(mc.DiskPath)).ToLowerInvariant();
+        bool isYpt = fileLower.EndsWith(".ypt", StringComparison.Ordinal);
+        bool isYtd = fileLower.EndsWith(".ytd", StringComparison.Ordinal);
+        if (!isYpt && !isYtd) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "only .ytd / .ypt textures can be deleted" }); return; }
+        if (fe == null && string.IsNullOrEmpty(mc.DiskPath)) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "no writable source" }); return; }
+
+        try
+        {
+            YtdFile? ytd = null; YptFile? ypt = null; TextureDictionary? dict;
+            if (fe != null)
+            {
+                if (isYtd) { ytd = _ws!.Manager.GetFile<YtdFile>(fe); dict = ytd?.TextureDict; }
+                else { ypt = _ws!.Manager.GetFile<YptFile>(fe); dict = ypt?.PtfxList?.TextureDictionary; }
+            }
+            else
+            {
+                byte[] raw = File.ReadAllBytes(mc.DiskPath);
+                if (isYtd) { ytd = RpfFile.GetResourceFile<YtdFile>(raw); dict = ytd?.TextureDict; }
+                else { ypt = RpfFile.GetResourceFile<YptFile>(raw); dict = ypt?.PtfxList?.TextureDictionary; }
+            }
+            if (dict == null) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "no texture dictionary in file" }); return; }
+
+            var list = (dict.Textures?.data_items ?? Array.Empty<Texture>()).Where(t => t != null).ToList();
+            string targetName = r.Name ?? "";
+            Texture? tex = list.FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
+            if (tex == null && r.Index >= 0 && r.Index < list.Count) tex = list[r.Index];
+            if (tex == null) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "texture not found" }); return; }
+
+            list.Remove(tex);
+            dict.BuildFromTextureList(list);
+
+            byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
+            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
+
+            mc.LocalDict = dict;
+            Send(new { type = "texDeleted", reqId = r.Id, ok = true, node = r.Node, name = targetName, count = list.Count, size = data.Length, textures = TextureMeta(dict) });
+        }
+        catch (Exception ex) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     // Map a RAGE texture format to an encoder format string (for image imports —
@@ -1227,7 +1383,9 @@ public sealed class Bridge
 
         if (target == "export")
         {
-            string suggested = r.Format == "meta" ? fileName + ".xml" : fileName;
+            // For a binary-meta-as-XML view, use CodeWalker's conversion name (e.g.
+            // carcols.ymt.pso.xml) so a later drag-drop reimport can detect the format.
+            string suggested = r.Format == "meta" ? (string.IsNullOrEmpty(r.MetaName) ? fileName + ".xml" : r.MetaName!) : fileName;
             string? path = _pickSavePath(suggested);
             if (path == null) { Send(new { type = "saved", reqId = r.Id, ok = false, canceled = true }); return; }
             File.WriteAllText(path, content, new UTF8Encoding(false));
@@ -1258,7 +1416,7 @@ public sealed class Bridge
 
         try
         {
-            if (fe != null) { MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(di!.Path); File.WriteAllBytes(di.Path, data); }
             Send(new { type = "saved", reqId = r.Id, ok = true, target = "rpf", size = data.Length });
         }
@@ -1533,10 +1691,110 @@ public sealed class Bridge
             }
 
             if (disk != null) { var p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, data); }
-            else { MarkSelfWrite(SafePhysical(dir!.File)); RpfFile.CreateFile(dir!, outName, data, true); }
+            else { NgEncrypt.EnsureFor(dir!.File); MarkSelfWrite(SafePhysical(dir!.File)); RpfFile.CreateFile(dir!, outName, data, true); }
             Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = data.Length });
         }
         catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // ---- .epic extensions -------------------------------------------------
+
+    private static readonly JsonSerializerOptions EpicJson = new()
+    { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+
+    // The .epic bytes for a request: dropped file (base64 in Content) or a picked path.
+    // Open a .epic the UI referenced either by file path (streamed — no giant in-memory
+    // buffer) or by base64 bytes (drag-drop). Caller disposes the returned package.
+    private static EpicPackage OpenEpic(Req r)
+    {
+        if (!string.IsNullOrEmpty(r.Path) && File.Exists(r.Path)) return EpicPackage.OpenFile(r.Path);
+        if (!string.IsNullOrEmpty(r.Content)) return EpicPackage.Open(Convert.FromBase64String(r.Content));
+        throw new Exception("no extension supplied");
+    }
+
+    private void CmdInspectEpic(Req r)
+    {
+        EpicPackage pkg;
+        try { pkg = OpenEpic(r); }
+        catch (Exception ex) { Send(new { type = "epicInfo", reqId = r.Id, ok = false, message = ex.Message }); return; }
+        using (pkg)
+        {
+            var m = pkg.Manifest;
+            var plan = _ws != null ? EpicInstaller.Plan(pkg, _ws.Manager, _gtaFolder) : new List<string> { "(mount a game folder to preview targets)" };
+            Send(new
+            {
+                type = "epicInfo", reqId = r.Id, ok = true,
+                name = m.Name, author = m.Author, version = m.Version, description = m.Description, target = m.Target,
+                operations = m.Operations.ConvertAll(o => new { op = o.Op, target = o.Target, action = o.Action, note = o.Note }),
+                plan,
+            });
+        }
+    }
+
+    private void CmdInstallEpic(Req r)
+    {
+        if (_ws == null) { Send(new { type = "epicInstalled", reqId = r.Id, ok = false, message = "mount a GTA folder first" }); return; }
+        EpicPackage pkg;
+        try { pkg = OpenEpic(r); }
+        catch (Exception ex) { Send(new { type = "epicInstalled", reqId = r.Id, ok = false, message = ex.Message }); return; }
+        using (pkg)
+        {
+            string backup = Path.Combine(_gtaFolder, "EpicRpf_backups", DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            List<EpicOpResult> results;
+            try { results = EpicInstaller.Apply(pkg, _ws, backup); }
+            catch (Exception ex) { Send(new { type = "epicInstalled", reqId = r.Id, ok = false, message = ex.Message }); return; }
+
+            int ok = results.Count(x => x.Ok), fail = results.Count - ok;
+            Send(new
+            {
+                type = "epicInstalled", reqId = r.Id, ok = fail == 0, okCount = ok, failCount = fail,
+                name = pkg.Manifest.Name, backup,
+                results = results.ConvertAll(x => new { op = x.Op, target = x.Target, ok = x.Ok, message = x.Message }),
+            });
+        }
+    }
+
+    private void CmdCreateEpic(Req r)
+    {
+        EpicManifest? manifest;
+        try { manifest = JsonSerializer.Deserialize<EpicManifest>(r.Manifest ?? "", EpicJson); }
+        catch (Exception ex) { Send(new { type = "epicCreated", reqId = r.Id, ok = false, message = "bad manifest: " + ex.Message }); return; }
+        if (manifest == null) { Send(new { type = "epicCreated", reqId = r.Id, ok = false, message = "empty manifest" }); return; }
+
+        // Resolve payload sources to disk PATHS (streamed at pack time, never read fully into RAM).
+        var payload = new List<(string name, string path)>();
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var op in manifest.Operations.Where(o => o.Op == "replaceFile" && !string.IsNullOrEmpty(o.Source)))
+            {
+                if (!File.Exists(op.Source!)) throw new Exception("payload file not found: " + op.Source);
+                string name = Path.GetFileName(op.Source!);
+                if (!used.Add(name)) { name = Guid.NewGuid().ToString("N")[..8] + "_" + name; used.Add(name); }
+                payload.Add((name, op.Source!));
+                op.Source = name;   // store in-package name
+            }
+        }
+        catch (Exception ex) { Send(new { type = "epicCreated", reqId = r.Id, ok = false, message = ex.Message }); return; }
+
+        // Ask where to save BEFORE packing, so a cancel doesn't waste the (potentially large) pack.
+        string suggested = (string.IsNullOrWhiteSpace(manifest.Name) ? "extension" : SafeName(manifest.Name)) + ".epic";
+        string? path = _pickSavePath(suggested);
+        if (path == null) { Send(new { type = "epicCreated", reqId = r.Id, ok = false, canceled = true }); return; }
+        if (!path.EndsWith(".epic", StringComparison.OrdinalIgnoreCase)) path += ".epic";
+
+        try
+        {
+            using (var outFs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+                EpicPackage.PackToStream(manifest, payload, outFs);
+            long size = new FileInfo(path).Length;
+            Send(new { type = "epicCreated", reqId = r.Id, ok = true, path, size, ops = manifest.Operations.Count });
+        }
+        catch (Exception ex)
+        {
+            try { File.Delete(path); } catch { }
+            Send(new { type = "epicCreated", reqId = r.Id, ok = false, message = ex.Message });
+        }
     }
 
     private void AddRpfToManager(RpfFile rpf)
@@ -1588,6 +1846,56 @@ public sealed class Bridge
             Send(new { type = "deleted", reqId = r.Id, ok = true, name });
         }
         catch (Exception ex) { Send(new { type = "deleted", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Rename a disk file/folder or an entry inside an archive. We refuse to rename
+    // .rpf archives themselves: NG-encrypted archives are keyed by their filename, so
+    // renaming one breaks mounting (documented gotcha) — entries inside are fine.
+    private void CmdRename(Req r)
+    {
+        if (!_nodes.TryGetValue(r.Node, out var obj))
+        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "invalid node" }); return; }
+
+        string name = (r.Name ?? "").Trim();
+        if (name.Length == 0) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "name required" }); return; }
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "name contains invalid characters" }); return; }
+
+        try
+        {
+            switch (obj)
+            {
+                case DiskItem di:
+                {
+                    if (!di.IsDir && di.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
+                        throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
+                    string dir = Path.GetDirectoryName(di.Path) ?? "";
+                    string dest = Path.Combine(dir, name);
+                    if (string.Equals(dest, di.Path, StringComparison.Ordinal)) break;   // no change
+                    if (File.Exists(dest) || Directory.Exists(dest)) throw new Exception("a file or folder with that name already exists here");
+                    MarkSelfWrite(di.Path); MarkSelfWrite(dest);
+                    if (di.IsDir) Directory.Move(di.Path, dest); else File.Move(di.Path, dest);
+                    di.Path = dest;
+                    break;
+                }
+                case RpfFile:
+                    throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
+                case RpfFileEntry fe when fe.NameLower.EndsWith(".rpf", StringComparison.Ordinal):
+                    throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
+                case RpfFileEntry fe:
+                    MarkSelfWrite(SafePhysical(fe.File));
+                    RpfFile.RenameEntry(fe, name);
+                    break;
+                case RpfDirectoryEntry rd:
+                    MarkSelfWrite(SafePhysical(rd.File));
+                    RpfFile.RenameEntry(rd, name);
+                    break;
+                default:
+                    throw new Exception("can't rename this");
+            }
+            Send(new { type = "renamed", reqId = r.Id, ok = true, name });
+        }
+        catch (Exception ex) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     private static void PushUndo(UndoEntry e) { lock (_undoStack) _undoStack.Add(e); }

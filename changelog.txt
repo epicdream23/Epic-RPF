@@ -1,0 +1,55 @@
+Epic RPF — Changelog
+====================
+
+
+Version 2.0.0  (2026-06-12)
+---------------------------
+
+New:
+  * Open any supported file by double-clicking it in Windows. If Epic RPF is
+    already open the file appears in a new tab; if it's closed, it launches in a
+    clean single-file viewer (the right renderer for that file) — and stays fully
+    editable. File types are registered automatically on first run (no admin).
+  * Rename files, folders and items inside archives — right-click > Rename, or
+    press F2. (.rpf archives are intentionally not renamable; they're keyed by
+    filename and renaming one breaks it.)
+  * Rubber-band selection — drag a box over empty space in the file list to
+    select everything it touches (hold Ctrl to add to the current selection).
+  * Delete individual textures from a .ytd / .ypt — right-click a texture >
+    Delete texture; the dictionary is rebuilt and saved in place.
+  * One-click .epic mod extensions: package mods into a single encrypted .epic
+    file that installs by dragging it onto the app (auto-backs up every changed
+    file). Build them in-app via the Extension menu.
+  * Much faster .epic packaging: creating and opening an extension now streams the
+    payload instead of re-compressing it, so a large file (e.g. a ~2 GB update.rpf)
+    packs in a few seconds instead of minutes — with a progress bar while it works.
+  * Export as XML from the right-click menu (works on multi-selection); drop the
+    .xml back in to re-import it in the original binary format. Extracting a file
+    you're viewing as XML now asks whether you want the normal or XML format.
+  * Native OS drag-out: drag files (incl. multiple) straight out of the app to
+    Explorer, the desktop, or any other program.
+
+Cosmetic:
+  * Custom icon for .epic files — a distinct package icon, not the app icon.
+  * Folders named "epic" get a custom icon and a glowing, animated name.
+
+Fixes:
+  * The "epic" folder glow is no longer clipped on the right edge.
+  * Various texture/save robustness fixes (NG-encryption handling, stale-entry
+    corruption, sRGB DDS).
+
+
+Version 1.0.0  (2026-06-10)
+---------------------------
+
+  * Initial release. Mount and browse GTA V .rpf archives (Gen8), with a fast
+    HTML/WebGL interface.
+  * 3D model viewer (.ydr/.ydd/.yft/.ypt) with orbit camera, LODs, materials and
+    resolved textures.
+  * Texture viewer/editor for .ytd / .ypt — preview, replace/import images and
+    DDS, drag-and-drop import.
+  * Built-in XML/meta editor (Monaco) with binary-meta <-> XML round-trip and
+    save back into the archive.
+  * Scaleform (.gfx) viewer, global search, extract / extract-all, create
+    folder / RPF / YTD, delete-to-trash with undo, and live filesystem watching.
+  * Self-contained installer (bundles the .NET runtime + WebView2 bootstrapper).
