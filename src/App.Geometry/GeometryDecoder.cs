@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using CodeWalker.GameFiles;
 using SharpDX;
 
@@ -30,11 +31,22 @@ public static class GeometryDecoder
                 foreach (var s in shaders)
                     model.Materials.Add(MakeMaterial(s));
 
+            // bones whose skinned vertices form toggleable parts (vehicle extras)
+            bool[]? extraBones = null;
+            var bones = drawable.Skeleton?.Bones?.Items;
+            if (bones != null)
+            {
+                extraBones = new bool[bones.Length];
+                for (int i = 0; i < bones.Length; i++)
+                    extraBones[i] = bones[i]?.Name?.StartsWith("extra_", StringComparison.OrdinalIgnoreCase) == true;
+                if (!extraBones.Any(x => x)) extraBones = null;
+            }
+
             var dm = drawable.DrawableModels;
-            AddLod(model, "High", dm?.High);
-            AddLod(model, "Med", dm?.Med);
-            AddLod(model, "Low", dm?.Low);
-            AddLod(model, "VLow", dm?.VLow);
+            AddLod(model, "High", dm?.High, extraBones);
+            AddLod(model, "Med", dm?.Med, extraBones);
+            AddLod(model, "Low", dm?.Low, extraBones);
+            AddLod(model, "VLow", dm?.VLow, extraBones);
         }
         catch (Exception ex)
         {
@@ -44,7 +56,7 @@ public static class GeometryDecoder
         return model;
     }
 
-    private static void AddLod(ModelData model, string level, DrawableModel[]? models)
+    private static void AddLod(ModelData model, string level, DrawableModel[]? models, bool[]? extraBones = null)
     {
         if (models == null || models.Length == 0) return;
         var lod = new LodData { Level = level };
@@ -59,7 +71,14 @@ public static class GeometryDecoder
                 var r = DecodeGeometry(g);
                 if (r.Mesh != null)
                 {
-                    lod.Meshes.Add(r.Mesh);
+                    r.Mesh.BoneIndex = m!.BoneIndex;
+                    r.Mesh.HasSkin = m.HasSkin != 0;
+                    // A skinned geometry can MIX body and extra_* vertices (geometries
+                    // split by material, not by part) — carve the extra regions out
+                    // into their own meshes so they can be toggled individually.
+                    if (r.Mesh.HasSkin && extraBones != null && r.Mesh.BlendIndices != null)
+                        foreach (var piece in SplitByExtraBones(r.Mesh, extraBones)) { lod.Meshes.Add(piece); }
+                    else lod.Meshes.Add(r.Mesh);
                     model.RenderedCount++;
                 }
                 else
@@ -70,6 +89,101 @@ public static class GeometryDecoder
         }
 
         if (lod.Meshes.Count > 0) model.Lods.Add(lod);
+    }
+
+    // Split a skinned mesh into [rest] + [one mesh per extra_* bone]: a triangle whose
+    // three vertices are all dominated by the same extra bone moves into that bone's
+    // mesh (DominantBone set so the part is identified and toggleable downstream).
+    private static IEnumerable<MeshData> SplitByExtraBones(MeshData mesh, bool[] extraBones)
+    {
+        int count = mesh.VertexCount;
+        var bw = mesh.BlendWeights; var bi = mesh.BlendIndices!;
+        var vdom = new int[count];
+        bool any = false;
+        for (int v = 0; v < count; v++)
+        {
+            int idx = bi[v * 4];
+            if (bw != null)
+            {
+                float best = bw[v * 4];
+                for (int k = 1; k < 4; k++)
+                    if (bw[v * 4 + k] > best) { best = bw[v * 4 + k]; idx = bi[v * 4 + k]; }
+            }
+            vdom[v] = idx;
+            if (idx < extraBones.Length && extraBones[idx]) any = true;
+        }
+        if (!any) { yield return mesh; yield break; }
+
+        // assign each triangle to an extra bone (all 3 verts dominated by it) or -1
+        var idxs = mesh.Indices;
+        var triOwner = new int[idxs.Length / 3];
+        var owners = new HashSet<int>();
+        for (int t = 0; t < triOwner.Length; t++)
+        {
+            int a = vdom[idxs[t * 3]], b = vdom[idxs[t * 3 + 1]], c = vdom[idxs[t * 3 + 2]];
+            triOwner[t] = (a == b && b == c && a < extraBones.Length && extraBones[a]) ? a : -1;
+            if (triOwner[t] >= 0) owners.Add(triOwner[t]);
+        }
+        if (owners.Count == 0) { yield return mesh; yield break; }
+
+        foreach (int owner in owners.Append(-1))
+        {
+            var sub = ExtractSubMesh(mesh, idxs, triOwner, owner);
+            if (sub != null) { sub.DominantBone = owner; yield return sub; }
+        }
+    }
+
+    private static MeshData? ExtractSubMesh(MeshData src, uint[] idxs, int[] triOwner, int owner)
+    {
+        var newIdx = new List<uint>();
+        var map = new Dictionary<uint, uint>();
+        var order = new List<uint>();
+        for (int t = 0; t < triOwner.Length; t++)
+        {
+            if (triOwner[t] != owner) continue;
+            for (int k = 0; k < 3; k++)
+            {
+                uint ov = idxs[t * 3 + k];
+                if (!map.TryGetValue(ov, out uint nv)) { nv = (uint)order.Count; map[ov] = nv; order.Add(ov); }
+                newIdx.Add(nv);
+            }
+        }
+        if (newIdx.Count == 0) return null;
+
+        int n = order.Count;
+        float[]? Slice(float[]? a, int stride)
+        {
+            if (a == null) return null;
+            var o = new float[n * stride];
+            for (int i = 0; i < n; i++)
+                Array.Copy(a, order[i] * stride, o, i * stride, stride);
+            return o;
+        }
+        byte[]? SliceB(byte[]? a, int stride)
+        {
+            if (a == null) return null;
+            var o = new byte[n * stride];
+            for (int i = 0; i < n; i++)
+                Array.Copy(a, order[i] * stride, o, i * stride, stride);
+            return o;
+        }
+
+        return new MeshData
+        {
+            VertexCount = n,
+            Positions = Slice(src.Positions, 3)!,
+            Normals = Slice(src.Normals, 3),
+            TexCoords0 = Slice(src.TexCoords0, 2),
+            Colors0 = Slice(src.Colors0, 4),
+            BlendWeights = Slice(src.BlendWeights, 4),
+            BlendIndices = SliceB(src.BlendIndices, 4),
+            Indices = newIdx.ToArray(),
+            MaterialIndex = src.MaterialIndex,
+            BoundsMin = src.BoundsMin,
+            BoundsMax = src.BoundsMax,
+            BoneIndex = src.BoneIndex,
+            HasSkin = src.HasSkin,
+        };
     }
 
     /// <summary>
@@ -113,6 +227,8 @@ public static class GeometryDecoder
             float[]? normals = HasChannel(flags, VertexSemantics.Normal) ? new float[count * 3] : null;
             float[]? uv0 = HasChannel(flags, VertexSemantics.TexCoord0) ? new float[count * 2] : null;
             float[]? col0 = HasChannel(flags, VertexSemantics.Colour0) ? new float[count * 4] : null;
+            float[]? bw = HasChannel(flags, VertexSemantics.BlendWeights) ? new float[count * 4] : null;
+            byte[]? bi = HasChannel(flags, VertexSemantics.BlendIndices) ? new byte[count * 4] : null;
 
             // Precompute per-channel (offset, type) once, guarding against a
             // malformed declaration whose component would read past the stride.
@@ -169,8 +285,45 @@ public static class GeometryDecoder
                             col0[v * 4 + 2] = n > 2 ? tmp[2] : 1;
                             col0[v * 4 + 3] = n > 3 ? tmp[3] : 1;
                             break;
+                        case VertexSemantics.BlendWeights when bw != null:
+                            bw[v * 4 + 0] = tmp[0];
+                            bw[v * 4 + 1] = n > 1 ? tmp[1] : 0;
+                            bw[v * 4 + 2] = n > 2 ? tmp[2] : 0;
+                            bw[v * 4 + 3] = n > 3 ? tmp[3] : 0;
+                            break;
+                        case VertexSemantics.BlendIndices when bi != null:
+                        {
+                            // stored as UByte4 (decoded to 0..1) — recover the raw bone indices
+                            bi[v * 4 + 0] = (byte)Math.Clamp(tmp[0] * 255f + 0.5f, 0, 255);
+                            bi[v * 4 + 1] = n > 1 ? (byte)Math.Clamp(tmp[1] * 255f + 0.5f, 0, 255) : (byte)0;
+                            bi[v * 4 + 2] = n > 2 ? (byte)Math.Clamp(tmp[2] * 255f + 0.5f, 0, 255) : (byte)0;
+                            bi[v * 4 + 3] = n > 3 ? (byte)Math.Clamp(tmp[3] * 255f + 0.5f, 0, 255) : (byte)0;
+                            break;
+                        }
                     }
                 }
+            }
+
+            // Dominant bone: when one bone owns (weighted) nearly every vertex, this
+            // geometry is a rigid REGION of a skinned model (doors, vehicle extras…).
+            int dominant = -1;
+            if (bi != null)
+            {
+                var counts = new Dictionary<int, int>();
+                for (int v = 0; v < count; v++)
+                {
+                    int idx = bi[v * 4];   // primary influence
+                    if (bw != null)
+                    {
+                        // pick the highest-weighted influence rather than slot 0
+                        float best = bw[v * 4]; idx = bi[v * 4];
+                        for (int k = 1; k < 4; k++)
+                            if (bw[v * 4 + k] > best) { best = bw[v * 4 + k]; idx = bi[v * 4 + k]; }
+                    }
+                    counts[idx] = counts.TryGetValue(idx, out int c) ? c + 1 : 1;
+                }
+                foreach (var kv in counts)
+                    if (kv.Value >= count * 9 / 10) { dominant = kv.Key; break; }
             }
 
             // Indices: validate bounds. RAGE uses 16-bit indices; widen to 32.
@@ -191,10 +344,13 @@ public static class GeometryDecoder
                 Normals = normals,
                 TexCoords0 = uv0,
                 Colors0 = col0,
+                BlendWeights = bw,
+                BlendIndices = bi,
                 Indices = outIdx,
                 MaterialIndex = g.ShaderID,
                 BoundsMin = count > 0 ? new Vec3(bmin.X, bmin.Y, bmin.Z) : Vec3.Zero,
                 BoundsMax = count > 0 ? new Vec3(bmax.X, bmax.Y, bmax.Z) : Vec3.Zero,
+                DominantBone = dominant,
             };
             return GeometryResult.Ok(mesh);
         }

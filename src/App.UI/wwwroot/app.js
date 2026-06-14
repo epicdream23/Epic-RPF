@@ -13,6 +13,16 @@ function call(cmd, payload = {}) {
 }
 // Fire-and-forget (no reply expected) — used for window controls.
 function post(cmd, payload = {}) { window.chrome.webview.postMessage({ id: 0, cmd, ...payload }); }
+// Like call(), but also hands File objects to the host, which receives their REAL
+// disk paths (postMessageWithAdditionalObjects). Imports use paths instead of base64 —
+// a base64 string of a big file blows past JS's max string length.
+function callWithFiles(cmd, payload, files) {
+  return new Promise(resolve => {
+    const id = seq++;
+    pending.set(id, resolve);
+    window.chrome.webview.postMessageWithAdditionalObjects({ id, cmd, ...payload }, files);
+  });
+}
 window.chrome.webview.addEventListener('message', ev => {
   const m = ev.data;
   if (m && m.reqId && pending.has(m.reqId)) {
@@ -21,8 +31,14 @@ window.chrome.webview.addEventListener('message', ev => {
     r(m);
   } else if (m && m.type === 'fschange') {
     onFsChange(m);
+  } else if (m && m.type === 'dragOutDone') {
+    // Our own OLE drag finished; ignore drop events for a moment — a drop back onto
+    // our own window arrives as a normal HTML drop and must NOT be re-imported.
+    dragOutUntil = performance.now() + 1000;
   }
 });
+let dragOutUntil = 0;   // while now() < this, drops are our own drag-out — ignore
+function selfDropActive() { return performance.now() < dragOutUntil; }
 
 // ---------------------------------------------------------------- dom
 const $ = id => document.getElementById(id);
@@ -35,7 +51,10 @@ const listBody = $('listBody'), crumbsEl = $('crumbs');
 const modal = $('modal'), modalList = $('modalList'), modalCancel = $('modalCancel');
 
 function setStatus(msg, isErr = false) {
+  msg = String(msg == null ? '' : msg);
+  if (msg.length > 300) msg = msg.slice(0, 300) + '…';   // keep the status bar readable
   statusLeft.textContent = msg;
+  statusLeft.title = msg;
   statusLeft.style.color = isErr ? 'var(--danger)' : '';
 }
 
@@ -218,7 +237,7 @@ function crumbsFromTree(el) {
   const chain = [];
   let cur = el;
   while (cur && cur.classList && cur.classList.contains('node')) {
-    chain.unshift({ id: cur.__node.id, name: cur.__node.name });
+    chain.unshift({ id: cur.__node.id, name: cur.__node.name, path: cur.__node.path });
     cur = cur.parentElement.closest('.node');
   }
   return [{ id: 0, name: rootName }, ...chain];
@@ -500,13 +519,15 @@ function beginRowDrag(it, e) {
 window.addEventListener('pointermove', e => {
   if (!dragRow) return;
   if (!(e.buttons & 1)) { dragRow = null; return; }     // button released — not a drag
-  if (Math.abs(e.clientX - dragRow.x) + Math.abs(e.clientY - dragRow.y) < 6) return;
+  // Generous threshold: a tiny wiggle while clicking must not start an OS drag.
+  if (Math.abs(e.clientX - dragRow.x) + Math.abs(e.clientY - dragRow.y) < 14) return;
   const it = dragRow.it; dragRow = null;
   const set = (isSelected(it) && selection.length > 1) ? selection : [it];
   const ids = set.filter(n => n && n.id !== 0 &&
     (n.kind === 'file' || n.kind === 'archive' || n.kind === 'dir' || n.kind === 'folder')).map(n => n.id);
   if (!ids.length) return;
   setStatus(ids.length === 1 ? `Dragging ${it.name}…` : `Dragging ${ids.length} items…`);
+  dragOutUntil = Infinity;            // suppress drops until the bridge says the drag ended
   post('dragOut', { nodes: ids });
 });
 window.addEventListener('pointerup', () => { dragRow = null; });
@@ -592,7 +613,7 @@ function updateSortHeaders() {
 })();
 
 function onItemDbl(item) {
-  if (item.container) navigate([...explorer.crumbs, { id: item.id, name: item.name }]);
+  if (item.container) navigate([...explorer.crumbs, { id: item.id, name: item.name, path: item.path }]);
   else openFile(item);
 }
 
@@ -726,10 +747,16 @@ let modelTextures = [], curModel = null;
 function fillModel(res) {
   curModel = res;
   collapseTextures();
+  $('tgSkel').classList.remove('on');   // fresh model: skeleton overlay off
+  viewport.setSkeleton(false);
+  viewport.stopClip();
+  additionsEnabled = new Set();         // additions start hidden on every model
+  viewport.setAdditions([]);
   viewport.loadModel(res);
   fillModelList();
   fillLodSelector();
   fillModelTextures(res.textures || [], res.node);
+  renderDetails();
   requestAnimationFrame(() => requestAnimationFrame(() => viewport.fit()));
   updateVpStats();
 }
@@ -767,6 +794,7 @@ async function selectPart(idx) {
   viewport.setPart(idx);
   for (const el of $('vpModels').querySelectorAll('.vp-model')) el.classList.toggle('sel', parseInt(el.dataset.idx, 10) === idx);
   fillLodSelector();
+  renderDetails();
   updateVpStats();
 }
 // Inline-rename a model; the name is saved client-side (LUT), never into the file.
@@ -964,11 +992,406 @@ chip('tgVColor', viewport.setVertexColors, false);
 chip('tgBox', viewport.setBox, false);
 chip('tgGrid', viewport.setGrid, true);
 chip('tgLight', viewport.setLit, true);
+chip('tgSkel', viewport.setSkeleton, false);
 $('tgTex').onclick = () => { const on = $('tgTex').classList.toggle('on'); $('vpTextures').hidden = !on; };
 $('btnFit').onclick = () => viewport.fit();
 $('lodSel').onchange = e => { viewport.setLod(e.target.value); updateVpStats(); };
 $('btnTexExpand').onclick = expandTextures;
 $('btnTexCollapse').onclick = collapseTextures;
+
+// ---------------------------------------------------------------- model details
+// Right-side panel: per-material shader info (samplers + EDITABLE value params)
+// and the skeleton bone tree (click a bone to flash it in the 3D view).
+let vdTab = 'mats';
+$('vdTabMats').onclick = () => { vdTab = 'mats'; renderDetails(); };
+$('vdTabSkel').onclick = () => { vdTab = 'skel'; renderDetails(); };
+$('vdTabAnims').onclick = () => { vdTab = 'anims'; renderDetails(); };
+$('vpDetailsToggle').onclick = () => {
+  const el = $('vpDetails');
+  const c = el.classList.toggle('collapsed');
+  $('vpDetailsToggle').innerHTML = c ? '&#x27E8;' : '&#x27E9;';
+  localStorage.setItem('panelc_vpdetails', c ? '1' : '0');
+};
+if (localStorage.getItem('panelc_vpdetails') === '1') { $('vpDetails').classList.add('collapsed'); $('vpDetailsToggle').innerHTML = '&#x27E8;'; }
+$('btnAddYtd').onclick = () => ytdPickerDialog();
+
+function curPartIdx() { const i = viewport.currentPart(); return i >= 0 ? i : 0; }
+function curPart() { return curModel && curModel.parts ? curModel.parts[curPartIdx()] : null; }
+
+function renderDetails() {
+  const panel = $('vpDetails');
+  const part = curPart();
+  if (!curModel || !part) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const hasSkel = !!(part.skeleton && part.skeleton.length);
+  $('vdTabSkel').hidden = !hasSkel;
+  $('vdTabAnims').hidden = !hasSkel;       // animations drive the rig
+  $('tgSkel').hidden = !hasSkel;
+  if (!hasSkel && (vdTab === 'skel' || vdTab === 'anims')) vdTab = 'mats';
+  $('vdTabMats').classList.toggle('on', vdTab === 'mats');
+  $('vdTabSkel').classList.toggle('on', vdTab === 'skel');
+  $('vdTabAnims').classList.toggle('on', vdTab === 'anims');
+  $('vdTabSkel').textContent = hasSkel ? `Skeleton (${part.skeleton.length})` : 'Skeleton';
+
+  const body = $('vdBody');
+  body.innerHTML = '';
+  if (part.lazy) { body.innerHTML = '<div class="vd-empty">Select the model to load its details.</div>'; return; }
+  if (vdTab === 'mats') { renderAdditions(body); renderMatDetails(body, part); }
+  else if (vdTab === 'skel') renderSkelDetails(body, part);
+  else renderAnimDetails(body);
+}
+
+// ---- additions (extra_* parts — hidden unless ticked) ----
+let additionsEnabled = new Set();
+function renderAdditions(body) {
+  const names = viewport.partAdditions();
+  if (!names.length) return;
+  const h = document.createElement('div'); h.className = 'vd-sect'; h.textContent = `Additions (${names.length})`;
+  const box = document.createElement('div'); box.className = 'vd-adds';
+  const all = document.createElement('label'); all.className = 'vd-add';
+  all.innerHTML = `<input type="checkbox" id="addAll"> <b>All</b>`;
+  box.append(all);
+  const update = () => {
+    viewport.setAdditions([...additionsEnabled]);
+    all.querySelector('input').checked = names.every(n => additionsEnabled.has(n));
+  };
+  all.querySelector('input').onchange = e => {
+    additionsEnabled = e.target.checked ? new Set(names) : new Set();
+    box.querySelectorAll('input[data-add]').forEach(i => i.checked = e.target.checked);
+    update();
+  };
+  for (const n of names) {
+    const w = document.createElement('label'); w.className = 'vd-add';
+    const c = document.createElement('input'); c.type = 'checkbox'; c.dataset.add = n; c.checked = additionsEnabled.has(n);
+    c.onchange = () => { if (c.checked) additionsEnabled.add(n); else additionsEnabled.delete(n); update(); };
+    w.append(c, document.createTextNode(' ' + n));
+    box.append(w);
+  }
+  body.append(h, box);
+  update();
+}
+
+// ---- grip fine-tune (live, persisted) ----
+const DEFAULT_GRIP = { ox: 0.15, oy: -0.04, oz: 0.012, rx: 0, ry: 0, rz: 0 };
+function loadGrip() {
+  try { return { ...DEFAULT_GRIP, ...JSON.parse(localStorage.getItem('gripAdjust') || '{}') }; }
+  catch { return { ...DEFAULT_GRIP }; }
+}
+function saveGrip(g) { try { localStorage.setItem('gripAdjust', JSON.stringify(g)); } catch {} }
+function applyGripToViewport(g) { viewport.setGripOffset(g.ox, g.oy, g.oz); viewport.setGripRot(g.rx, g.ry, g.rz); }
+
+// ---- animations (.ycd discovery + playback) ----
+let animTimer = null;
+function renderAnimDetails(body) {
+  // playback controls
+  const bar = document.createElement('div'); bar.className = 'vd-anim-bar';
+  bar.innerHTML = `
+    <button class="chip" id="anPlay" title="Play / pause">▶</button>
+    <button class="chip" id="anStop" title="Stop & reset pose">⏹</button>
+    <select id="anSpeed" class="ext-in" style="width:62px" title="Speed">
+      <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option><option value="2">2×</option>
+    </select>
+    <span class="vd-anim-time" id="anTime">–</span>`;
+  const slider = document.createElement('input');
+  slider.type = 'range'; slider.min = '0'; slider.max = '1000'; slider.value = '0'; slider.className = 'vd-anim-slider'; slider.id = 'anSlider';
+  // character toggle — most clips animate the PED skeleton (arms, spine, legs…), not the
+  // weapon's own bones, so they only look right on a full body holding the weapon. The
+  // full character means run/walk/melee/aim all play. Offered for weapon models (w_*).
+  const isWeapon = /^w_/i.test(curModel.file || '');
+  const armsRow = document.createElement('label'); armsRow.className = 'vd-add'; armsRow.style.marginBottom = '6px';
+  armsRow.hidden = !isWeapon;
+  armsRow.innerHTML = `<input type="checkbox" id="anArms"> Show character (full body — for run/aim/reload anims)`;
+  // live grip adjustment (so the weapon can be positioned exactly in the hand)
+  const grip = loadGrip();
+  const gripBox = document.createElement('div'); gripBox.className = 'vd-grip'; gripBox.hidden = !viewport.hasArms();
+  gripBox.innerHTML = '<div class="vd-sect">Grip adjust (live · saved)</div>';
+  const gaxes = [['ox', 'fwd', -0.4, 0.4, 0.005], ['oy', 'down', -0.4, 0.4, 0.005], ['oz', 'side', -0.4, 0.4, 0.005],
+                 ['rx', 'pitch', -180, 180, 1], ['ry', 'yaw', -180, 180, 1], ['rz', 'roll', -180, 180, 1]];
+  const fmtG = (k, v) => k[0] === 'o' ? v.toFixed(3) : Math.round(v).toString();
+  for (const [key, label, min, max, step] of gaxes) {
+    const row = document.createElement('div'); row.className = 'vd-grip-row';
+    const nm = document.createElement('span'); nm.className = 'gname'; nm.textContent = label;
+    const sl = document.createElement('input'); sl.type = 'range'; sl.min = min; sl.max = max; sl.step = step; sl.value = grip[key];
+    const num = document.createElement('input'); num.type = 'text'; num.className = 'gnum'; num.value = fmtG(key, grip[key]);
+    sl.oninput = () => { grip[key] = parseFloat(sl.value); num.value = fmtG(key, grip[key]); applyGripToViewport(grip); saveGrip(grip); };
+    num.onchange = () => { const v = parseFloat(num.value); if (!Number.isNaN(v)) { grip[key] = v; sl.value = v; applyGripToViewport(grip); saveGrip(grip); } };
+    row.append(nm, sl, num); gripBox.append(row);
+  }
+  const greset = document.createElement('button'); greset.className = 'btn ghost sm'; greset.style.width = '100%';
+  greset.textContent = 'Reset grip';
+  greset.onclick = () => { localStorage.removeItem('gripAdjust'); applyGripToViewport(DEFAULT_GRIP); renderDetails(); };
+  gripBox.append(greset);
+
+  const list = document.createElement('div'); list.id = 'anList';
+  const browse = document.createElement('button'); browse.className = 'btn ghost sm'; browse.style.cssText = 'width:100%;margin-top:7px';
+  browse.textContent = '+ Browse any .ycd…';
+  body.append(bar, slider, armsRow, gripBox, list, browse);
+
+  const armsChk = armsRow.querySelector('#anArms');
+  armsChk.checked = viewport.hasArms();
+  armsChk.onchange = async () => {
+    if (armsChk.checked) {
+      if (!window.__pedBody) {
+        setStatus('Loading character…');
+        const res = await withProgress(call('pedBody', {}), 0);
+        if (!res.ok) { setStatus('Could not load character: ' + (res.message || ''), true); armsChk.checked = false; return; }
+        window.__pedBody = res;
+      }
+      applyGripToViewport(grip);          // restore saved grip before attaching
+      viewport.setArms(true, window.__pedBody);
+      gripBox.hidden = false;
+      setStatus('Character attached — play a clip, fine-tune the grip below');
+    } else { viewport.setArms(false); gripBox.hidden = true; }
+  };
+
+  bar.querySelector('#anPlay').onclick = () => {
+    const st = viewport.clipState();
+    if (!st.duration) return;
+    viewport.pauseClip(st.playing);
+    bar.querySelector('#anPlay').textContent = st.playing ? '▶' : '⏸';
+  };
+  bar.querySelector('#anStop').onclick = () => { viewport.stopClip(); bar.querySelector('#anPlay').textContent = '▶'; };
+  bar.querySelector('#anSpeed').onchange = e => viewport.setClipSpeed(parseFloat(e.target.value));
+  slider.oninput = () => {
+    const st = viewport.clipState();
+    if (st.duration) { viewport.pauseClip(true); bar.querySelector('#anPlay').textContent = '▶'; viewport.setClipTime(slider.value / 1000 * st.duration); }
+  };
+  clearInterval(animTimer);
+  animTimer = setInterval(() => {
+    if (!document.body.contains(slider)) { clearInterval(animTimer); return; }
+    const st = viewport.clipState();
+    $('anTime') && ($('anTime').textContent = st.duration ? `${st.time.toFixed(2)} / ${st.duration.toFixed(2)}s` : '–');
+    if (st.playing && st.duration) slider.value = String(Math.round(st.time / st.duration * 1000));
+  }, 150);
+
+  renderAnimDicts(list);
+  browse.onclick = async () => {
+    const p = await call('pickYcd');
+    if (p.path) addAnimDict(list, { name: p.path.split(/[\\/]/).pop(), path: p.path, node: 0, source: 'disk' }, true);
+  };
+}
+
+async function renderAnimDicts(list) {
+  list.innerHTML = '<div class="vd-empty">Searching for linked animations…</div>';
+  if (!curModel.__anims) {
+    const res = await call('findAnims', { node: curModel.node });
+    curModel.__anims = res.ok ? (res.items || []) : [];
+  }
+  list.innerHTML = '';
+  if (!curModel.__anims.length) {
+    list.innerHTML = '<div class="vd-empty">No linked .ycd found — use “Browse any .ycd…” below.</div>';
+    return;
+  }
+  for (const d of curModel.__anims) addAnimDict(list, d, false);
+}
+
+function addAnimDict(list, d, open) {
+  const card = document.createElement('div'); card.className = 'vd-mat';
+  const head = document.createElement('div'); head.className = 'vd-mat-head';
+  const srcBadge = d.source === 'epic' ? '<span class="vd-badge ems">epic</span>'
+                 : d.source === 'update' ? '<span class="vd-badge nrm">update</span>' : '';
+  head.innerHTML = `<span class="vd-mat-name" title="${esc(d.path || '')}">${esc(d.name)}</span>${srcBadge}`;
+  const bodyEl = document.createElement('div'); bodyEl.className = 'vd-mat-body';
+  card.append(head, bodyEl);
+  let loaded = false;
+  const toggle = async () => {
+    card.classList.toggle('open');
+    if (loaded || !card.classList.contains('open')) return;
+    loaded = true;
+    bodyEl.innerHTML = '<div class="vd-empty">Loading clips…</div>';
+    const res = await call('animClips', { ycd: d.node, path: d.disk || d.path });
+    bodyEl.innerHTML = '';
+    if (!res.ok || !res.clips.length) { bodyEl.innerHTML = `<div class="vd-empty">${esc(res.message || 'No clips.')}</div>`; return; }
+    for (const c of res.clips) {
+      const row = document.createElement('div'); row.className = 'vd-bone';
+      row.innerHTML = `▶ ${esc(c.name)} <span class="btag">${c.duration ? c.duration.toFixed(2) + 's' : ''}</span>`;
+      row.onclick = async () => {
+        setStatus(`Baking ${c.name}…`);
+        const bake = await withProgress(call('animBake', { ycd: d.node, path: d.disk || d.path, clip: c.hash }), 0);
+        if (!bake.ok) { setStatus('Could not play clip: ' + (bake.message || ''), true); return; }
+        const n = viewport.playClip(bake);
+        const play = $('anPlay'); if (play) play.textContent = '⏸';
+        setStatus(n ? `Playing ${c.name} (${n} bone tracks)` : 'Clip has no tracks matching this skeleton', !n);
+        bodyEl.querySelectorAll('.vd-bone.sel').forEach(x => x.classList.remove('sel'));
+        row.classList.add('sel');
+      };
+      bodyEl.append(row);
+    }
+  };
+  head.onclick = toggle;
+  list.append(card);
+  if (open) toggle();
+}
+
+function renderMatDetails(body, part) {
+  const mats = part.materials || [];
+  if (!mats.length) { body.innerHTML = '<div class="vd-empty">No materials.</div>'; return; }
+  const partIdx = curPartIdx();
+  mats.forEach((mi, idx) => body.append(matCard(mi, idx, partIdx)));
+}
+
+// What kind of material is it? Badges summarise the lighting features in play.
+function matBadges(mi) {
+  const b = [];
+  if (mi.emissive) b.push('<span class="vd-badge ems">emissive</span>');
+  if (mi.nrmTex) b.push('<span class="vd-badge nrm">normal</span>');
+  if (mi.spcTex) b.push('<span class="vd-badge spc">spec</span>');
+  return b.join('');
+}
+
+function matCard(mi, matIdx, partIdx) {
+  const card = document.createElement('div'); card.className = 'vd-mat';
+  const head = document.createElement('div'); head.className = 'vd-mat-head';
+  head.innerHTML = `<span class="vd-mat-idx">#${matIdx}</span>
+    <span class="vd-mat-name" title="${esc(mi.sps || mi.shader || '')}">${esc(mi.shader || 'shader')}</span>${matBadges(mi)}`;
+  const bodyEl = document.createElement('div'); bodyEl.className = 'vd-mat-body';
+  head.onclick = () => { card.classList.toggle('open'); viewport.flashMaterial(partIdx, matIdx); };
+  card.append(head, bodyEl);
+
+  // textures (every sampler the shader declares)
+  const texs = mi.texs || [];
+  if (texs.length) {
+    const h = document.createElement('div'); h.className = 'vd-sect'; h.textContent = 'Textures';
+    bodyEl.append(h);
+    for (const t of texs) {
+      const row = document.createElement('div'); row.className = 'vd-tex' + (t.found ? '' : ' missing');
+      row.title = `${t.sampler}${t.embedded ? ' (embedded)' : ''}${t.found ? '' : ' — not found'}`;
+      row.innerHTML = `<span class="role">${esc(t.role)}</span>
+        <span class="tname">${esc(t.name || '—')}</span>
+        <span class="tdim">${t.found ? `${t.w}×${t.h} ${esc(t.fmt)}` : 'missing'}</span>`;
+      bodyEl.append(row);
+    }
+  }
+
+  // editable value parameters
+  const prms = mi.params || [];
+  if (prms.length) {
+    const h = document.createElement('div'); h.className = 'vd-sect'; h.textContent = 'Parameters';
+    bodyEl.append(h);
+    const edited = new Map();   // name -> values[]
+    let saveBtn = null;
+    for (const p of prms) {
+      const row = document.createElement('div'); row.className = 'vd-prm';
+      const nm = document.createElement('span'); nm.className = 'pname';
+      nm.textContent = p.name + (p.count > 1 ? ` [${p.count}]` : '');
+      nm.title = p.name;
+      row.append(nm);
+      p.values.forEach((v, vi) => {
+        const inp = document.createElement('input');
+        inp.type = 'text'; inp.value = fmtF(v);
+        inp.oninput = () => {
+          const f = parseFloat(inp.value);
+          if (Number.isNaN(f)) return;
+          p.values[vi] = f;
+          inp.classList.add('edited');
+          edited.set(p.name, p.values.slice());
+          if (saveBtn) saveBtn.hidden = false;
+          viewport.updateMaterialParams(partIdx, matIdx, prms);   // live preview
+        };
+        row.append(inp);
+      });
+      bodyEl.append(row);
+    }
+    saveBtn = document.createElement('button');
+    saveBtn.className = 'btn primary sm vd-mat-save'; saveBtn.textContent = 'Save changes to file'; saveBtn.hidden = true;
+    saveBtn.onclick = async () => {
+      const params = [...edited].map(([name, values]) => ({ name, values }));
+      setStatus('Saving shader parameters…');
+      const res = await withProgress(call('setShaderParams', { node: curModel.node, index: partIdx, mat: matIdx, save: true, params }), 0);
+      if (res.ok) { setStatus(`Saved ${res.applied} parameter(s)${res.saved ? ` — file rewritten (${fmtSize(res.size)})` : ''}`); edited.clear(); saveBtn.hidden = true; bodyEl.querySelectorAll('input.edited').forEach(i => i.classList.remove('edited')); }
+      else setStatus('Save failed: ' + (res.message || ''), true);
+    };
+    bodyEl.append(saveBtn);
+  }
+  if (!texs.length && !prms.length) {
+    const e = document.createElement('div'); e.className = 'vd-empty'; e.textContent = 'No shader data.'; bodyEl.append(e);
+  }
+  return card;
+}
+
+function renderSkelDetails(body, part) {
+  const bones = part.skeleton || [];
+  // children lookup for correct hierarchy order (roots first, depth-first)
+  const kids = new Map();
+  bones.forEach(b => { if (!kids.has(b.parent)) kids.set(b.parent, []); kids.get(b.parent).push(b); });
+  const partIdx = curPartIdx();
+  let selEl = null;
+  const addRow = (b, depth) => {
+    const el = document.createElement('div'); el.className = 'vd-bone';
+    el.style.paddingLeft = (6 + depth * 12) + 'px';
+    el.innerHTML = `${depth ? '└ ' : ''}${esc(b.name)} <span class="btag">#${b.i} tag ${b.tag}</span>`;
+    el.title = `${b.name}  (index ${b.i}, tag ${b.tag}, parent ${b.parent})`;
+    el.onclick = () => {
+      if (selEl) selEl.classList.remove('sel');
+      selEl = el; el.classList.add('sel');
+      if (!$('tgSkel').classList.contains('on')) { $('tgSkel').classList.add('on'); viewport.setSkeleton(true); }
+      viewport.highlightBone(b.i);
+    };
+    body.append(el);
+    for (const c of (kids.get(b.i) || [])) addRow(c, depth + 1);
+  };
+  const roots = bones.filter(b => b.parent < 0 || !bones[b.parent]);
+  if (!roots.length && bones.length) roots.push(bones[0]);
+  roots.forEach(b => addRow(b, 0));
+  if (!bones.length) body.innerHTML = '<div class="vd-empty">No skeleton in this model.</div>';
+}
+
+function fmtF(v) { const s = (Math.round(v * 10000) / 10000).toString(); return s; }
+
+// ---- user-picked .ytd texture sources ----
+function ytdPickerDialog() {
+  if (!curModel) return;
+  const m = modalShell('Textures from .ytd', 'Resolve this model’s textures from any texture dictionary — search the mounted game files or browse a loose .ytd on disk. Newest picks win.');
+  m.body.innerHTML = `<input class="dlg-in" id="ytdSearch" placeholder="Search .ytd by name… (min 2 chars)" spellcheck="false">
+    <div class="ytd-list" id="ytdList"><div class="vd-empty">Type to search the mounted game files.</div></div>`;
+  const inp = m.body.querySelector('#ytdSearch'), list = m.body.querySelector('#ytdList');
+  let seq = 0, timer = null;
+  inp.oninput = () => { clearTimeout(timer); timer = setTimeout(run, 250); };
+  inp.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(timer); run(); } };
+  async function run() {
+    const q = inp.value.trim();
+    if (q.length < 2) { list.innerHTML = '<div class="vd-empty">Type at least 2 characters.</div>'; return; }
+    const my = ++seq;
+    const res = await call('search', { query: q, ext: false, scope: 'none', node: 0, limit: 600 });
+    if (my !== seq) return;
+    const ytds = (res.results || []).filter(x => x.name.toLowerCase().endsWith('.ytd')).slice(0, 150);
+    list.innerHTML = ytds.length ? '' : '<div class="vd-empty">No .ytd matches.</div>';
+    for (const x of ytds) {
+      const row = document.createElement('div'); row.className = 'ytd-row';
+      row.innerHTML = `<span class="yname">${esc(x.name)}</span><span class="ypath">${esc(x.path)}</span>`;
+      row.onclick = () => { m.close(); useTxd({ rid: x.rid }, x.name); };
+      list.append(row);
+    }
+  }
+  addBtn(m.actions, 'Browse disk…', 'ghost', async () => {
+    const p = await call('pickYtd');
+    if (p.path) { m.close(); useTxd({ path: p.path }, p.path.split(/[\\/]/).pop()); }
+  });
+  addBtn(m.actions, 'Close', 'ghost', m.close);
+  inp.focus();
+}
+
+// Register the picked txd, then re-resolve the displayed part with it (other loaded
+// parts are marked lazy so they pick the new textures up when next selected).
+async function useTxd(srcArg, label) {
+  if (!curModel) return;
+  setStatus(`Loading ${label || '.ytd'}…`);
+  const res = await withProgress(call('useTxd', { node: curModel.node, ...srcArg }), 0);
+  if (!res.ok) { setStatus('Could not use that .ytd: ' + (res.message || ''), true); return; }
+  setStatus(`Using ${res.name} (${res.count} textures) — re-resolving…`);
+  const idx = curPartIdx();
+  curModel.parts.forEach((p, i) => { if (i !== idx && p && !p.lazy) p.lazy = true; });
+  const pr = await withProgress(call('modelPart', { node: curModel.node, index: idx }), 0);
+  if (pr.ok) {
+    curModel.parts[idx] = pr.part;
+    viewport.setPartData(idx, pr.part);
+    viewport.setPart(viewport.currentPart());   // rebuild with new materials
+    renderDetails();
+    setStatus(`Textures from ${res.name} applied (${res.count} textures)`);
+  }
+}
 
 // ---------------------------------------------------------------- editor pane
 function fillEdit(tab) {
@@ -1511,35 +1934,65 @@ function currentFolder() { return explorer.crumbs.length ? explorer.crumbs[explo
 let dragDepth = 0;
 window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('dragenter', e => {
-  e.preventDefault(); dragDepth++;
+  e.preventDefault();
+  if (selfDropActive()) return;                  // our own drag-out hovering back over us
+  dragDepth++;
   const dz = $('dropZone'), msg = dz.querySelector('div'), folder = currentFolder();
   msg.textContent = dropTargetNode() != null
-    ? `Drop images → ${dropTargetName()} · other files → ${folder ? folder.name : 'folder'}`
-    : (folder ? `Drop files to import into ${folder.name}` : 'Mount a folder to import files');
+    ? `Drop images → ${dropTargetName()} · .epic → install · other files → ${folder ? folder.name : 'folder'}`
+    : (folder ? `Drop files to import into ${folder.name} · .epic extensions install` : 'Mount a folder to import files · .epic extensions install');
   dz.hidden = false;
 });
 window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('dropZone').hidden = true; } });
 window.addEventListener('drop', async e => {
   e.preventDefault(); dragDepth = 0; $('dropZone').hidden = true;
-  const files = e.dataTransfer.files; if (!files || !files.length) return;
-  for (const file of files) await handleDroppedFile(file);
+  if (selfDropActive()) { setStatus('Ignored drop of our own drag'); return; }   // never re-import a drag-out
+  const files = [...e.dataTransfer.files]; if (!files.length) return;
+  // Resolve the dropped files' REAL disk paths once via the host (WebView2 hands
+  // them over natively) — imports then go by path, with no size limits.
+  let paths = [];
+  try { const pr = await callWithFiles('pathsOf', {}, files); paths = pr.paths || []; } catch { }
+  for (let i = 0; i < files.length; i++) {
+    try { await handleDroppedFile(files[i], paths[i] || null); }
+    catch (err) { setStatus(`Import failed (${files[i].name}): ${err.message || err}`, true); }
+  }
 });
 
-async function handleDroppedFile(file) {
+async function handleDroppedFile(file, srcPath) {
   const lower = file.name.toLowerCase();
-  if (lower.endsWith('.epic')) { await epicInstallFromBytes(new Uint8Array(await file.arrayBuffer())); return; }  // drop an extension to install
-  if (XML_REIMPORT_RE.test(lower)) { await importDroppedFile(file, true); return; }      // XML export -> original binary
+  if (lower.endsWith('.epic')) {                          // drop an extension to install
+    if (srcPath) epicPreviewThenInstall({ path: srcPath });
+    else await epicInstallFromBytes(new Uint8Array(await file.arrayBuffer()));
+    return;
+  }
+  if (XML_REIMPORT_RE.test(lower)) { await importDroppedFile(file, true); return; }      // XML export -> original binary (small, text)
   const tnode = dropTargetNode();
   if (tnode != null && TEXTURE_RE.test(lower)) { await importDroppedTexture(tnode, file); return; }  // texture into ytd/ypt
-  await importDroppedFile(file, false);                                                  // raw file into current folder
+  if (srcPath) { await importByPath(srcPath, file.name); return; }                        // raw file by PATH (any size)
+  await importDroppedFile(file, false);                                                   // fallback: small files via base64
 }
+
+// Path-based raw import — the host reads the source straight from disk.
+async function importByPath(srcPath, name) {
+  const folder = currentFolder();
+  if (!folder) { setStatus('Mount a folder before importing files', true); return; }
+  setStatus(`Importing ${name}…`);
+  const res = await withProgress(call('importPath', { node: folder.id, path: folder.path, name, srcPath }), 0);
+  if (res.ok) { setStatus(`Imported ${res.name} into ${folder.name} (${fmtSize(res.size)})${res.note ? ' — ' + res.note : ''}`); await refreshCurrent(); }
+  else setStatus('Import failed: ' + (res.message || ''), true);
+}
+
 async function importDroppedFile(file, asXml) {
   const folder = currentFolder();
   if (!folder) { setStatus('Mount a folder before importing files', true); return; }
+  if (!asXml && file.size > 200 * 1024 * 1024) {   // base64 fallback can't carry big files
+    setStatus(`Import failed: ${file.name} is too large for this drop path — drag it from a real folder (not an archive inside another app).`, true);
+    return;
+  }
   try {
     const payload = asXml
-      ? { node: folder.id, name: file.name, as: 'xml', content: await file.text() }
-      : { node: folder.id, name: file.name, content: bytesToB64(new Uint8Array(await file.arrayBuffer())) };
+      ? { node: folder.id, path: folder.path, name: file.name, as: 'xml', content: await file.text() }
+      : { node: folder.id, path: folder.path, name: file.name, content: bytesToB64(new Uint8Array(await file.arrayBuffer())) };
     setStatus(`Importing ${file.name}…`);
     const res = await withProgress(call('importFile', payload), 250);
     if (res.ok) { setStatus(`Imported ${res.name} into ${folder.name} (${fmtSize(res.size)})`); await refreshCurrent(); }
@@ -1631,6 +2084,8 @@ function menuFor(node) {
     const multi = selection.length > 1 && isSelected(node);
     if (!multi) items.push({ label: 'Rename', accel: 'F2', action: () => rename(node) });
     items.push({ label: multi ? `Delete ${selection.length} items` : 'Delete', accel: 'Del', action: () => deleteNodes(multi ? selection : [node]) });
+    if (!multi && node.kind === 'archive')
+      items.push({ label: 'Convert to OPEN encryption', action: () => convertEncryption(node) });
   }
   items.push({ sep: true });
   items.push({ label: 'Sort by', submenu: [
@@ -1656,19 +2111,19 @@ async function extract(n) {
 }
 async function exportXml(n) {
   setStatus(`Converting ${n.name} to XML…`);
-  const res = await call('exportXml', { node: n.id });
+  const res = await call('exportXml', { node: n.id, path: n.path });
   if (res.canceled) { setStatus('Export canceled'); return; }
   if (res.ok) setStatus(`Exported ${n.name} as XML → ${res.path}`);
   else setStatus('Export as XML failed: ' + (res.message || ''), true);
 }
 async function exportXmlMany(nodes) {
-  const ids = nodes.filter(n => n && n.id !== 0 && n.kind === 'file').map(n => n.id);
-  if (!ids.length) { setStatus('Select files to export as XML.', true); return; }
-  setStatus(`Exporting ${ids.length} files as XML…`);
-  const res = await call('exportXmlMany', { nodes: ids });
+  const sel = nodes.filter(n => n && n.id !== 0 && n.kind === 'file');
+  if (!sel.length) { setStatus('Select files to export as XML.', true); return; }
+  setStatus(`Exporting ${sel.length} files as XML…`);
+  const res = await call('exportXmlMany', { nodes: sel.map(n => n.id), paths: sel.map(n => n.path || '') });
   if (res.canceled) { setStatus('Export canceled'); return; }
-  if (res.ok) setStatus(`Exported ${res.count.toLocaleString()} as XML → ${res.path}` + (res.failed ? ` (${res.failed} not convertible)` : ''));
-  else setStatus('Export failed: ' + (res.message || ''), true);
+  if (res.ok) setStatus(`Exported ${res.count.toLocaleString()} as XML → ${res.path}` + (res.failed ? ` (${res.failed} failed: ${res.message || 'not convertible'})` : ''));
+  else setStatus('Export failed: ' + (res.message || 'not convertible'), true);
 }
 async function extractMany(nodes) {
   const ids = nodes.filter(n => n && n.id !== 0 && (n.kind === 'file' || n.kind === 'archive' || n.kind === 'dir' || n.kind === 'folder')).map(n => n.id);
@@ -1713,21 +2168,37 @@ function badTarget(t) { if (!t) { setStatus('No location selected.', true); retu
 async function newFolder(target) {
   target = target || createTarget(null); if (badTarget(target)) return;
   const r = await promptDialog({ title: 'New folder', label: 'Folder name', value: 'new_folder' });
-  if (r) afterCreate(await call('createFolder', { node: target.id, name: r.name }));
+  if (r) afterCreate(await call('createFolder', { node: target.id, path: target.path, name: r.name }));
 }
 async function newRpf(target) {
   target = target || createTarget(null); if (badTarget(target)) return;
   const r = await promptDialog({ title: 'New RPF', label: 'RPF name', value: 'new.rpf', checkboxLabel: 'Create content override (register in content.xml)' });
-  if (r) afterCreate(await call('createRpf', { node: target.id, name: r.name, override: r.checked }));
+  if (r) afterCreate(await call('createRpf', { node: target.id, path: target.path, name: r.name, override: r.checked }));
 }
 async function newYtd(target) {
   target = target || createTarget(null); if (badTarget(target)) return;
   const r = await promptDialog({ title: 'New YTD', label: 'Texture dictionary name', value: 'new.ytd' });
-  if (r) afterCreate(await call('createYtd', { node: target.id, name: r.name }));
+  if (r) afterCreate(await call('createYtd', { node: target.id, path: target.path, name: r.name }));
 }
 function afterCreate(res) {
   if (res.ok) { setStatus(`Created ${res.kind} “${res.name}”` + (res.note ? ` — ${res.note}` : '')); refreshCurrent(); }
   else setStatus('Create failed: ' + (res.message || ''), true);
+}
+
+// ---- encryption converter (right-click an .rpf) ----
+async function convertEncryption(node) {
+  const yes = await confirmDialog({
+    title: 'Convert to OPEN encryption',
+    body: `Rewrite “${node.name}” (and every nested .rpf inside it) with OPEN encryption? ` +
+          `The game loads OPEN archives normally, and future edits no longer need NG encryption — ` +
+          `this is the safest state for modded archives. This rewrites the archive headers on disk.`,
+    okLabel: 'Convert',
+  });
+  if (!yes) return;
+  setStatus(`Converting ${node.name} to OPEN encryption…`);
+  const res = await withProgress(call('convertEncryption', { node: node.id, path: node.path }), 0);
+  if (res.ok) { setStatus(`${res.name}: ${res.before} → ${res.after} encryption`); await refreshCurrent(); }
+  else setStatus('Convert failed: ' + (res.message || ''), true);
 }
 
 // ---- rename (right-click / F2) ----
@@ -1737,7 +2208,7 @@ async function rename(node) {
   const r = await promptDialog({ title: 'Rename', label: 'New name', value: cur, okLabel: 'Rename', selectBasename: true });
   if (!r || r.name === cur) return;
   setStatus(`Renaming ${cur}…`);
-  const res = await call('rename', { node: node.id, name: r.name });
+  const res = await call('rename', { node: node.id, path: node.path, name: r.name });
   if (res.ok) { node.name = res.name; setStatus(`Renamed to “${res.name}”`); refreshCurrent(); }
   else setStatus('Rename failed: ' + (res.message || ''), true);
 }
@@ -1765,7 +2236,7 @@ async function deleteNodes(nodes) {
   const batch = batchSeq++;
   let force = false, ok = 0;
   for (const n of nodes) {
-    let res = await call('delete', { node: n.id, batch, force });
+    let res = await call('delete', { node: n.id, path: n.path, batch, force });
     if (res.needConfirm && !force) {
       const yes = await confirmDialog({
         title: 'Trash is full',
@@ -1774,7 +2245,7 @@ async function deleteNodes(nodes) {
       });
       if (!yes) { setStatus('Delete canceled'); break; }
       force = true;
-      res = await call('delete', { node: n.id, batch, force: true });
+      res = await call('delete', { node: n.id, path: n.path, batch, force: true });
     }
     if (res.ok) ok++; else setStatus('Delete failed: ' + (res.message || ''), true);
   }
@@ -2047,11 +2518,24 @@ function opRow(op, idx, onRemove) {
   function build() {
     fields.innerHTML = '';
     op.op = typeSel.value;
-    targetField();
+    const ti = targetField();
     if (op.op === 'replaceFile') {
       const sf = field('Source file', 'source', 'pick a file from disk');
       const pick = document.createElement('button'); pick.className = 'btn ghost sm'; pick.textContent = 'Pick…';
-      pick.onclick = async () => { const r = await call('pickFile'); if (r.path) { op.source = r.path; sf.value = r.path; } };
+      pick.onclick = async () => {
+        const r = await call('pickFile');
+        if (!r.path) return;
+        op.source = r.path; sf.value = r.path;
+        // A folder-ish target (empty / trailing slash / no dot in the last segment)
+        // gets the picked file's name appended, so the destination is a full path.
+        const fname = r.path.split(/[\\/]/).pop();
+        const t = (op.target || '').trim();
+        const lastSeg = t.split(/[\\/]/).pop();
+        if (!t || /[\\/]$/.test(t) || (lastSeg && !lastSeg.includes('.'))) {
+          op.target = t ? t.replace(/[\\/]+$/, '') + '/' + fname : fname;
+          ti.value = op.target;
+        }
+      };
       sf.parentElement.append(pick);
     } else if (op.op === 'xml') {
       const act = select('Action', 'action', ['add', 'replace', 'remove', 'setattr', 'settext'], 'add');
@@ -2140,6 +2624,15 @@ async function autoload() {
       const up = mountRoots.find(k => k.name.toLowerCase() === 'update');
       if (up) { const c1 = await getChildren(up.id); const rpf = c1.find(k => k.name.toLowerCase() === 'update.rpf');
         if (rpf) await navigate([{ id: 0, name: rootName }, { id: up.id, name: up.name }, { id: rpf.id, name: rpf.name }]); }
+      return;
+    }
+    if (a.open && a.open.startsWith('named:')) {       // open any entry by exact file name
+      const res = await call('openByName', { name: a.open.slice(6) });
+      if (res.type === 'model') openModelTab(res, res.node);
+      else if (res.type === 'texture') openTab('auto', 'texture', res.name, res);
+      else if (res.type === 'edit') openTab('auto', 'edit', res.name, res);
+      else if (res.type === 'gfx') openTab('auto', 'gfx', res.name, res);
+      else if (res.message) setStatus(res.message, true);
       return;
     }
     const wantYpt = a.open === 'ypt' || a.open === 'yptxml' || a.open === 'yptexp' || a.open === 'yptpop';

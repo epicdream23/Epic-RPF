@@ -81,7 +81,11 @@ public sealed class Bridge
     {
         if (_startDrag == null) return;
         var paths = PrepareDragPaths(ids);
-        if (paths.Length > 0) _startDrag(paths);
+        if (paths.Length > 0) _startDrag(paths);   // modal: returns after the drop/cancel
+        // Tell the front-end the OLE drag finished. Dropping the dragged files back onto
+        // our OWN window raises the normal HTML drop event — without this signal the app
+        // would treat its own drag-out as an external import (and re-import the files).
+        Send(new { type = "dragOutDone" });
     }
 
     public string[] PrepareDragPaths(int[] ids)
@@ -161,7 +165,23 @@ public sealed class Bridge
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
         public int[]? Nodes { get; set; }         // multi-select (extract many)
+        public string[]? Paths { get; set; }       // stable paths paired with Nodes (stale/loose fallback)
         public string? Manifest { get; set; }     // createEpic: the manifest JSON the builder assembled
+        public int Mat { get; set; }              // setShaderParams: material (shader) index
+        public int Ytd { get; set; }              // useTxd: node id of the .ytd to draw textures from
+        public int Rid { get; set; }              // useTxd: search-result id (separate id space from nodes!)
+        public string? SrcPath { get; set; }      // importPath: source file on disk (no base64 round-trip)
+        public string[]? DroppedPaths { get; set; } // set host-side from postMessageWithAdditionalObjects
+        public int Ycd { get; set; }              // animClips/animBake: node id of the clip dictionary
+        public string? Clip { get; set; }         // animBake: clip hash (hex) inside the dictionary
+        public bool Save { get; set; }            // setShaderParams: also write the file back
+        public ParamEdit[]? Params { get; set; }  // setShaderParams: edited shader values
+    }
+
+    public sealed class ParamEdit
+    {
+        public string Name { get; set; } = "";
+        public float[] Values { get; set; } = Array.Empty<float>();
     }
 
     private static readonly HashSet<string> ImageExts = new(StringComparer.Ordinal)
@@ -202,6 +222,9 @@ public sealed class Bridge
     private const long TrashLimitBytes = 4L * 1024 * 1024 * 1024; // 4 GB
 
     // undo (Ctrl+Z): restore the most recent batch of deletions from trash.
+    // The parent is stored as its stable PATH, never as a graph object — a background
+    // remount swaps the graph, and restoring through a stale RpfDirectoryEntry would
+    // write outdated entry tables into the archive (= corruption).
     private sealed class UndoEntry
     {
         public long Batch;
@@ -209,7 +232,7 @@ public sealed class Bridge
         public string TrashPath = "";
         public bool IsDir;
         public string OrigPath = "";
-        public RpfDirectoryEntry? Parent;
+        public string ParentPath = "";
         public string Name = "";
     }
     private static readonly List<UndoEntry> _undoStack = new();
@@ -224,6 +247,8 @@ public sealed class Bridge
         public string EntryPath = "";  // archive path of Entry, to re-resolve after a remount
         public string File = "";
         public string DiskPath = "";   // set for loose (on-disk) ytd/ypt, for writing texture edits back
+        public List<TextureDictionary> ExtraDicts = new();   // user-picked .ytd texture sources (highest priority)
+        public object? OwnerFile;      // the typed YdrFile/YddFile/YftFile/YptFile, for shader-param save-back
     }
     private static readonly Dictionary<int, ModelCache> _modelCache = new();
     private static readonly List<int> _modelCacheOrder = new();
@@ -240,11 +265,20 @@ public sealed class Bridge
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EpicRpf", "names.json");
     private static Dictionary<string, Dictionary<string, string>>? _namesLut;
 
-    public void HandleMessage(string json)
+    public void HandleMessage(string json) => HandleMessage(json, null);
+
+    /// <summary>
+    /// <paramref name="droppedPaths"/> carries the REAL disk paths of files the front-end
+    /// passed via postMessageWithAdditionalObjects (drag-drop). Shipping paths instead of
+    /// base64 bytes is what makes multi-GB imports possible — a base64 string of a big
+    /// file exceeds JavaScript's maximum string length ("Invalid string length").
+    /// </summary>
+    public void HandleMessage(string json, string[]? droppedPaths)
     {
         Req req;
         try { req = JsonSerializer.Deserialize<Req>(json, JsonOpts) ?? new Req(); }
         catch { return; }
+        req.DroppedPaths = droppedPaths;
 
         _ = Task.Run(async () =>
         {
@@ -273,6 +307,7 @@ public sealed class Bridge
             case "gfxScene": CmdGfxScene(r); break;
             case "firstProp": CmdFirstProp(r); break;
             case "firstYpt": CmdFirstYpt(r); break;
+            case "openByName": CmdOpenByName(r); break;
             case "save": CmdSave(r); break;
             case "encodeDds": CmdEncodeDds(r); break;
             case "decodeDds": CmdDecodeDds(r); break;
@@ -285,6 +320,8 @@ public sealed class Bridge
             case "createRpf": CmdCreateRpf(r); break;
             case "createYtd": CmdCreateYtd(r); break;
             case "importFile": CmdImportFile(r); break;
+            case "importPath": CmdImportPath(r); break;
+            case "pathsOf": Send(new { type = "paths", reqId = r.Id, paths = r.DroppedPaths ?? Array.Empty<string>() }); break;
             case "inspectEpic": CmdInspectEpic(r); break;
             case "installEpic": CmdInstallEpic(r); break;
             case "createEpic": CmdCreateEpic(r); break;
@@ -292,8 +329,17 @@ public sealed class Bridge
             case "pickFile": Send(new { type = "filePicked", reqId = r.Id, path = _pickOpenPath?.Invoke("All files (*.*)|*.*") }); break;
             case "delete": CmdDelete(r); break;
             case "rename": CmdRename(r); break;
+            case "convertEncryption": CmdConvertEncryption(r); break;
             case "undo": CmdUndo(r); break;
             case "modelPart": CmdModelPart(r); break;
+            case "useTxd": CmdUseTxd(r); break;
+            case "pickYtd": Send(new { type = "ytdPicked", reqId = r.Id, path = _pickOpenPath?.Invoke("Texture dictionary (*.ytd)|*.ytd") }); break;
+            case "findAnims": CmdFindAnims(r); break;
+            case "animClips": CmdAnimClips(r); break;
+            case "animBake": CmdAnimBake(r); break;
+            case "pedBody": CmdPedBody(r); break;
+            case "pickYcd": Send(new { type = "ycdPicked", reqId = r.Id, path = _pickOpenPath?.Invoke("Clip dictionary (*.ycd)|*.ycd") }); break;
+            case "setShaderParams": CmdSetShaderParams(r); break;
             case "texImage": CmdTexImage(r); break;
             case "replaceTexture": CmdReplaceTexture(r); break;
             case "deleteTexture": CmdDeleteTexture(r); break;
@@ -449,6 +495,16 @@ public sealed class Bridge
         lock (_selfWrites) _selfWrites[path] = DateTime.UtcNow.Ticks;
     }
 
+    // An imported/restored .rpf is invisible until the mount re-scans it (self-write
+    // marking suppresses the watcher, so nothing else would pick it up) — without this
+    // a dragged-in archive opens as a plain hex file instead of an archive.
+    private static void RescanIfArchive(string name)
+    {
+        if (!name.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) return;
+        _watchRpfChanged = true;
+        _watchDebounce?.Change(400, Timeout.Infinite);
+    }
+
     private static bool IsSelfWrite(string path)
     {
         lock (_selfWrites)
@@ -530,10 +586,9 @@ public sealed class Bridge
             switch (FileTypes.Route(name))
             {
                 case ViewerKind.Model:
-                    TextureDictionary? ld = null;
-                    var dws = DrawableLoader.LoadLoose(bytes, name);
-                    if (ext == "ypt") { try { ld = RpfFile.GetResourceFile<YptFile>(bytes)?.PtfxList?.TextureDictionary; } catch { } }
-                    SendModelData(r, name, di.Path, dws, ld, null);
+                    var dws = DrawableLoader.LoadLoose(bytes, name, out var owner);
+                    TextureDictionary? ld = (owner as YptFile)?.PtfxList?.TextureDictionary;
+                    SendModelData(r, name, di.Path, dws, ld, null, owner);
                     break;
                 case ViewerKind.Texture:
                     SendTextures(r, name, RpfFile.GetResourceFile<YtdFile>(bytes)?.TextureDict, null, di.Path);
@@ -662,6 +717,23 @@ public sealed class Bridge
         Send(new { type = "error", reqId = r.Id, message = "no prop with sibling .ytd found" });
     }
 
+    // Dev helper: open the first entry with this exact file name (routed like a
+    // normal double-click). Drives deep-links / automated viewer tests by name.
+    private void CmdOpenByName(Req r)
+    {
+        if (_ws == null || string.IsNullOrEmpty(r.Name))
+        { Send(new { type = "error", reqId = r.Id, message = "not mounted / no name" }); return; }
+        string nl = r.Name.ToLowerInvariant();
+        foreach (var rpf in _ws.AllRpfs)
+        {
+            if (rpf.AllEntries == null) continue;
+            foreach (var e in rpf.AllEntries)
+                if (e is RpfFileEntry fe && fe.NameLower == nl)
+                { r.Node = Register(fe); CmdOpen(r); return; }
+        }
+        Send(new { type = "error", reqId = r.Id, message = "entry not found: " + r.Name });
+    }
+
     // Dev helper: open core.ypt if present (has both drawables and textures),
     // otherwise the first .ypt that carries drawables.
     private void CmdFirstYpt(Req r)
@@ -773,45 +845,76 @@ public sealed class Bridge
     // <baseDir>\<shortname>\ so the export round-trips. Returns the xml + its name (e.g.
     // carcols.ymt.pso.xml). For an already-text file the text passes through as
     // <name>.xml. Returns null xml only if it's binary with no XML mapping.
-    private static (string? xml, string xmlName) ToXml(RpfFileEntry fe, string baseDir)
+    // Convert an archive entry OR a loose disk file to CodeWalker XML.
+    // <paramref name="err"/> receives the real reason on failure (so the UI can show it
+    // instead of a generic "export failed").
+    private static (string? xml, string xmlName) ToXml(object node, string baseDir, out string? err)
     {
-        byte[] bytes = RpfWorkspace.Extract(fe);
+        err = null;
+        string name; byte[] bytes;
+        RpfFileEntry entry;
         try
         {
-            string xml = MetaXml.GetXml(fe, bytes, out string xmlName, baseDir);
-            if (!string.IsNullOrEmpty(xml)) return (xml, xmlName);
+            if (node is RpfFileEntry fe) { entry = fe; name = fe.Name; bytes = RpfWorkspace.Extract(fe); }
+            else if (node is DiskItem di && !di.IsDir && File.Exists(di.Path))
+            {
+                name = Path.GetFileName(di.Path);
+                // Build a resource entry from the loose RSC7 file so MetaXml can convert it
+                // (the same synthetic-entry path GetResourceFile uses), or a binary entry.
+                byte[] raw = File.ReadAllBytes(di.Path);
+                if (raw.Length > 4 && BitConverter.ToUInt32(raw, 0) == 0x37435352u)   // 'RSC7'
+                {
+                    byte[] d = raw;
+                    var re = RpfFile.CreateResourceFileEntry(ref d, 0u);
+                    bytes = ResourceBuilder.Decompress(d);
+                    re.Name = name; re.NameLower = name.ToLowerInvariant();
+                    entry = re;
+                }
+                else { entry = new RpfBinaryFileEntry { Name = name, NameLower = name.ToLowerInvariant(), FileSize = (uint)raw.Length, FileUncompressedSize = (uint)raw.Length }; bytes = raw; }
+            }
+            else { err = "select a file"; return (null, "file.xml"); }
         }
-        catch { }
+        catch (Exception ex) { err = "read failed: " + ex.Message; return (null, "file.xml"); }
+
+        try
+        {
+            string xml = MetaXml.GetXml(entry, bytes, out string xmlName, baseDir);
+            if (!string.IsNullOrEmpty(xml) && xml.Length > 64) return (xml, xmlName);
+        }
+        catch (Exception ex) { err = ex.Message; }
         if (LooksText(bytes))
         {
-            string nm = fe.NameLower.EndsWith(".xml", StringComparison.Ordinal) ? fe.Name : fe.Name + ".xml";
+            string nm = name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ? name : name + ".xml";
             return (DecodeText(bytes), nm);
         }
-        return (null, fe.Name + ".xml");
+        if (err == null) err = "this file type has no XML conversion — extract it normally";
+        return (null, name + ".xml");
     }
 
     // Export ONE file as CodeWalker XML via a Save dialog (embedded textures saved into
     // a sibling folder next to the chosen .xml so a later reimport works).
     private void CmdExportXml(Req r)
     {
-        if (!_nodes.TryGetValue(r.Node, out var obj) || obj is not RpfFileEntry fe)
+        var obj = ResolveNode(r.Node, r.Path);
+        if (obj == null)
         { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = "select a file" }); return; }
         try
         {
             string tmp = Path.Combine(Path.GetTempPath(), "EpicRpf_xmlexport", Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(tmp);
-            var (xml, xmlName) = ToXml(fe, tmp);
-            if (xml == null) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = "this file can't be converted to XML — extract it normally" }); return; }
+            var (xml, xmlName) = ToXml(obj, tmp, out var convErr);
+            if (xml == null) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, message = convErr ?? "could not convert to XML" }); return; }
 
             string? path = _pickSavePath(xmlName);
             if (path == null) { Send(new { type = "exportedXml", reqId = r.Id, ok = false, canceled = true }); return; }
             File.WriteAllText(path, xml, new UTF8Encoding(false));
 
             // copy the texture folder (if GetXml produced one) next to the .xml
-            string ddsSrc = Path.Combine(tmp, fe.GetShortName());
+            string shortName = Path.GetFileNameWithoutExtension(xmlName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ? xmlName[..^4] : xmlName);
+            string ddsSrc = Path.Combine(tmp, shortName);
             if (Directory.Exists(ddsSrc))
             {
-                string ddsDst = Path.Combine(Path.GetDirectoryName(path)!, fe.GetShortName());
+                string ddsDst = Path.Combine(Path.GetDirectoryName(path)!, shortName);
                 CopyDir(ddsSrc, ddsDst);
             }
             try { Directory.Delete(tmp, true); } catch { }
@@ -828,40 +931,41 @@ public sealed class Bridge
         string? outDir = _pickFolder();
         if (outDir == null) { Send(new { type = "exportedXmlMany", reqId = r.Id, ok = false, canceled = true }); return; }
         int count = 0, failed = 0;
-        foreach (var id in ids)
+        string? lastErr = null;
+        for (int k = 0; k < ids.Length; k++)
         {
-            if (!_nodes.TryGetValue(id, out var obj) || obj is not RpfFileEntry fe) { failed++; continue; }
+            int id = ids[k];
+            string? p = r.Paths != null && k < r.Paths.Length ? r.Paths[k] : null;
+            var obj = ResolveNode(id, p);
+            if (obj == null) { failed++; lastErr = "item no longer available"; continue; }
             try
             {
-                var (xml, xmlName) = ToXml(fe, outDir);
-                if (xml == null) { failed++; continue; }
+                var (xml, xmlName) = ToXml(obj, outDir, out var convErr);
+                if (xml == null) { failed++; lastErr = convErr ?? lastErr; continue; }
                 File.WriteAllText(Path.Combine(outDir, SafeName(xmlName)), xml, new UTF8Encoding(false));
                 count++;
             }
-            catch { failed++; }
+            catch (Exception ex) { failed++; lastErr = ex.Message; }
         }
-        Send(new { type = "exportedXmlMany", reqId = r.Id, ok = count > 0, path = outDir, count, failed });
+        Send(new { type = "exportedXmlMany", reqId = r.Id, ok = count > 0, path = outDir, count, failed, message = lastErr });
     }
 
     // ---- openers ----------------------------------------------------------
 
     private void OpenModel(Req r, RpfFileEntry fe)
     {
-        var drawables = DrawableLoader.Load(_ws!.Manager, fe);
+        var drawables = DrawableLoader.Load(_ws!.Manager, fe, out var owner);
 
         // A .ypt keeps its textures in the particle list's own dictionary (not inside
         // each drawable's shader group), so resolve diffuse textures against it and
         // surface the dictionary for the viewer's texture strip.
-        TextureDictionary? localDict = null;
-        if (fe.NameLower.EndsWith(".ypt", StringComparison.Ordinal))
-        {
-            try { localDict = _ws.Manager.GetFile<YptFile>(fe)?.PtfxList?.TextureDictionary; } catch { }
-        }
-        SendModelData(r, fe.Name, fe.Path, drawables, localDict, fe);
+        TextureDictionary? localDict = (owner as YptFile)?.PtfxList?.TextureDictionary;
+        SendModelData(r, fe.Name, fe.Path, drawables, localDict, fe, owner);
     }
 
     private void SendModelData(Req r, string name, string path,
-        List<DrawableLoader.NamedDrawable> drawables, TextureDictionary? localDict, RpfFileEntry? modelEntry)
+        List<DrawableLoader.NamedDrawable> drawables, TextureDictionary? localDict, RpfFileEntry? modelEntry,
+        object? ownerFile = null)
     {
         if (drawables.Count == 0 && localDict == null)
         {
@@ -872,7 +976,7 @@ public sealed class Bridge
         // Cache the loaded drawables/dict so other parts and textures load on demand.
         // For a loose file (no archive entry) keep the disk path so texture edits can save.
         int cacheKey = r.Node > 0 ? r.Node : _synthSeq--;
-        CacheModel(cacheKey, new ModelCache { Drawables = drawables, LocalDict = localDict, Entry = modelEntry, EntryPath = modelEntry?.Path ?? "", File = name, DiskPath = modelEntry == null ? path : "" });
+        CacheModel(cacheKey, new ModelCache { Drawables = drawables, LocalDict = localDict, Entry = modelEntry, EntryPath = modelEntry?.Path ?? "", File = name, DiskPath = modelEntry == null ? path : "", OwnerFile = ownerFile });
 
         // Only decode the first drawable now (the viewer shows one at a time); the
         // rest are placeholders loaded when selected. Textures stream in lazily too.
@@ -881,7 +985,7 @@ public sealed class Bridge
         object stats = new { geometryCount = 0, rendered = 0, skipped = 0, skipSamples = Array.Empty<string>() };
         for (int i = 0; i < drawables.Count; i++)
         {
-            if (i == 0) { parts.Add(BuildPart(drawables[i], modelEntry, localDict, fileLower, out stats)); }
+            if (i == 0) { parts.Add(BuildPart(drawables[i], modelEntry, localDict, fileLower, out stats, null, ownerFile)); }
             else parts.Add(LazyPart(drawables[i], fileLower));
         }
 
@@ -906,24 +1010,530 @@ public sealed class Bridge
     }
 
     // Decode one drawable into a full part DTO (geometry + its diffuse textures).
-    private object BuildPart(DrawableLoader.NamedDrawable nd, RpfFileEntry? modelEntry, TextureDictionary? localDict, string fileLower, out object stats)
+    private object BuildPart(DrawableLoader.NamedDrawable nd, RpfFileEntry? modelEntry, TextureDictionary? localDict, string fileLower, out object stats,
+        List<TextureDictionary>? extraDicts = null, object? ownerFile = null)
     {
+        EnsureShaderNames();   // BEFORE Decode — material names resolve there
         var model = GeometryDecoder.Decode(nd.Drawable, nd.Name);
         stats = new { geometryCount = model.GeometryCount, rendered = model.RenderedCount, skipped = model.SkippedReasons.Count, skipSamples = model.SkippedReasons.Take(5).ToArray() };
-        var dto = (Dictionary<string, object?>)BuildModelDto(model, nd.Drawable, modelEntry, localDict);
+        var dto = (Dictionary<string, object?>)BuildModelDto(model, nd.Drawable, modelEntry, localDict, extraDicts);
         string hashHex = nd.Hash.ToString("X8");
         dto["hash"] = hashHex;
         dto["lazy"] = false;
         dto["name"] = DisplayName(fileLower, hashHex, nd.Name);
+
+        // Fragment children (wheels, breakable pieces, child extras): geometry that
+        // lives OUTSIDE the main drawable, placed at its bone in the rig.
+        if (ownerFile is YftFile yft && ReferenceEquals(yft.Fragment?.Drawable, nd.Drawable))
+            dto["fragChildren"] = FragChildrenDto(yft, nd.Drawable, modelEntry, localDict, extraDicts);
         return dto;
+    }
+
+    // Children of PhysicsLOD1 that carry their own geometry (e.g. vehicle wheels —
+    // ONE wheel drawable instanced at every wheel_* bone; extra_* child parts).
+    private object? FragChildrenDto(YftFile yft, DrawableBase main, RpfFileEntry? modelEntry, TextureDictionary? localDict, List<TextureDictionary>? extras)
+    {
+        try
+        {
+            var kids = yft.Fragment?.PhysicsLODGroup?.PhysicsLOD1?.Children?.data_items;
+            if (kids == null) return null;
+            var bones = main.Skeleton?.Bones?.Items;
+            int[] wheelTags = bones?.Where(b => b?.Name != null && b.Name.StartsWith("wheel_", StringComparison.OrdinalIgnoreCase))
+                                    .Select(b => (int)b.Tag).ToArray() ?? Array.Empty<int>();
+            bool wheelPlaced = false;
+            var list = new List<object>();
+            foreach (var c in kids)
+            {
+                var d1 = c?.Drawable1;
+                if (c == null || d1?.DrawableModels?.High == null || d1.DrawableModels.High.Length == 0) continue;
+                var model = GeometryDecoder.Decode(d1, c.GroupName ?? "child");
+                if (model.Lods.Count == 0) continue;
+                string group = c.GroupName ?? ("child_" + c.BoneTag);
+                bool isWheel = group.StartsWith("wheel_", StringComparison.OrdinalIgnoreCase);
+                int[] inst = isWheel && !wheelPlaced && wheelTags.Length > 0 ? wheelTags : new[] { (int)c.BoneTag };
+                if (isWheel) wheelPlaced = true;
+                var cdto = (Dictionary<string, object?>)BuildModelDto(model, d1, modelEntry, localDict, extras);
+                list.Add(new
+                {
+                    group,
+                    boneTag = (int)c.BoneTag,
+                    inst,
+                    extra = group.StartsWith("extra_", StringComparison.OrdinalIgnoreCase),
+                    materials = cdto["materials"],
+                    lods = cdto["lods"],
+                });
+            }
+            return list.Count > 0 ? list : null;
+        }
+        catch { return null; }
     }
 
     private void CmdModelPart(Req r)
     {
         if (!_modelCache.TryGetValue(r.Node, out var mc) || r.Index < 0 || r.Index >= mc.Drawables.Count)
         { Send(new { type = "modelPart", reqId = r.Id, ok = false }); return; }
-        var part = BuildPart(mc.Drawables[r.Index], mc.Entry, mc.LocalDict, mc.File.ToLowerInvariant(), out var stats);
+        var part = BuildPart(mc.Drawables[r.Index], mc.Entry, mc.LocalDict, mc.File.ToLowerInvariant(), out var stats, mc.ExtraDicts, mc.OwnerFile);
         Send(new { type = "modelPart", reqId = r.Id, ok = true, index = r.Index, part, stats });
+    }
+
+    // ---- model details: user txd sources + shader parameter editing -------
+
+    // Add a user-picked .ytd (archive node or loose disk path) as a texture source
+    // for an open model. Picked dicts take priority over the automatic resolver,
+    // so the user can fix any unresolved/wrong texture by pointing at the right txd.
+    private void CmdUseTxd(Req r)
+    {
+        if (!_modelCache.TryGetValue(r.Node, out var mc))
+        { Send(new { type = "txdUsed", reqId = r.Id, ok = false, message = "model not open" }); return; }
+        try
+        {
+            TextureDictionary? dict = null;
+            string src = "";
+            if (!string.IsNullOrEmpty(r.Path) && File.Exists(r.Path))
+            {
+                dict = RpfFile.GetResourceFile<YtdFile>(File.ReadAllBytes(r.Path))?.TextureDict;
+                src = Path.GetFileName(r.Path);
+            }
+            else if (r.Rid != 0 && _searchResults.TryGetValue(r.Rid, out var sfe)
+                     && sfe.NameLower.EndsWith(".ytd", StringComparison.Ordinal))
+            {
+                // From the picker's search list. Search rids are a SEPARATE id space
+                // from node ids (they'd collide), hence the dedicated field.
+                dict = _ws?.Manager.GetFile<YtdFile>(sfe)?.TextureDict; src = sfe.Name;
+            }
+            else if (r.Ytd != 0 && _nodes.TryGetValue(r.Ytd, out var obj))
+            {
+                if (obj is RpfFileEntry fe && fe.NameLower.EndsWith(".ytd", StringComparison.Ordinal))
+                { dict = _ws?.Manager.GetFile<YtdFile>(fe)?.TextureDict; src = fe.Name; }
+                else if (obj is DiskItem di && !di.IsDir)
+                { dict = RpfFile.GetResourceFile<YtdFile>(File.ReadAllBytes(di.Path))?.TextureDict; src = Path.GetFileName(di.Path); }
+            }
+            int count = dict?.Textures?.data_items?.Length ?? 0;
+            if (dict == null || count == 0)
+            { Send(new { type = "txdUsed", reqId = r.Id, ok = false, message = "no textures found in that .ytd" }); return; }
+            mc.ExtraDicts.Insert(0, dict);   // newest picks win
+            Send(new { type = "txdUsed", reqId = r.Id, ok = true, name = src, count });
+        }
+        catch (Exception ex) { Send(new { type = "txdUsed", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Edit shader value parameters (e.g. emissiveMultiple, bumpiness) on one material.
+    // Always updates the in-memory drawable (so re-decodes see it); with Save=true the
+    // owning ydr/ydd/yft/ypt is rebuilt and written back to its archive / disk file.
+    private void CmdSetShaderParams(Req r)
+    {
+        if (!_modelCache.TryGetValue(r.Node, out var mc) || r.Index < 0 || r.Index >= mc.Drawables.Count)
+        { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "model not open" }); return; }
+        var edits = r.Params ?? Array.Empty<ParamEdit>();
+        if (edits.Length == 0)
+        { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "no parameters supplied" }); return; }
+
+        try
+        {
+            var shaders = mc.Drawables[r.Index].Drawable?.ShaderGroup?.Shaders?.data_items;
+            if (shaders == null || r.Mat < 0 || r.Mat >= shaders.Length)
+            { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "material not found" }); return; }
+            var ps = shaders[r.Mat]?.ParametersList?.Parameters;
+            var hs = shaders[r.Mat]?.ParametersList?.Hashes;
+            if (ps == null || hs == null)
+            { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "shader has no parameters" }); return; }
+
+            int applied = 0;
+            foreach (var e in edits)
+            {
+                for (int i = 0; i < ps.Length && i < hs.Length; i++)
+                {
+                    if (!string.Equals(ParamName(hs[i]), e.Name, StringComparison.OrdinalIgnoreCase)) continue;
+                    var v = new SharpDX.Vector4(
+                        e.Values.Length > 0 ? e.Values[0] : 0,
+                        e.Values.Length > 1 ? e.Values[1] : 0,
+                        e.Values.Length > 2 ? e.Values[2] : 0,
+                        e.Values.Length > 3 ? e.Values[3] : 0);
+                    if (ps[i].Data is SharpDX.Vector4) { ps[i].Data = v; applied++; }
+                    else if (ps[i].Data is SharpDX.Vector4[] arr && arr.Length > 0) { arr[0] = v; applied++; }
+                    break;
+                }
+            }
+            if (applied == 0)
+            { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "no matching editable parameter" }); return; }
+
+            if (!r.Save)
+            { Send(new { type = "shaderParams", reqId = r.Id, ok = true, applied, saved = false }); return; }
+
+            // Save-back: rebuild the owning resource and write it where it came from.
+            byte[]? data = mc.OwnerFile switch
+            {
+                YdrFile y => y.Save(),
+                YddFile y => y.Save(),
+                YftFile y => y.Save(),
+                YptFile y => y.Save(),
+                _ => null,
+            };
+            if (data == null)
+            { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "saving isn't supported for this file type" }); return; }
+
+            // Re-resolve the entry against the live mount (same guard as texture replace).
+            var fe = mc.Entry;
+            if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
+                && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh) { fe = fresh; mc.Entry = fresh; }
+
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            else if (!string.IsNullOrEmpty(mc.DiskPath)) { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
+            else { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "no writable destination" }); return; }
+
+            Send(new { type = "shaderParams", reqId = r.Id, ok = true, applied, saved = true, size = data.Length });
+        }
+        catch (Exception ex) { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // ---- animations (.ycd) -------------------------------------------------
+
+    // Rank a vpath for the animation override rules: anything in an "epic" folder
+    // wins, then update.rpf, then everything else (x64*/dlc packs).
+    private static int RankAnimPath(string path)
+    {
+        string p = path.Replace('/', '\\').ToLowerInvariant();
+        if (p.Contains(@"\epic\") || p.StartsWith(@"epic\")) return 0;
+        if (p.StartsWith(@"update\update.rpf")) return 1;
+        return 2;
+    }
+
+    // Weapon-model → clip-dictionary hashes, resolved through the game's metas:
+    // weapon*.meta (<Model> → <Name>), weaponanimations*.meta (Item key=WEAPON_X →
+    // children named *ClipSet*), clip_sets* (clipset → clipDictionaryName). Keys and
+    // dictionary names in clip_sets are often unresolved hashes ("hash_XXXXXXXX"),
+    // so the whole pipeline matches by Jenkins hash. Cached per mount.
+    private static Dictionary<string, string>? _weaponByModel;     // model lower -> WEAPON_NAME
+    private static List<XmlDocument>? _weaponAnimDocs;
+    private static Dictionary<uint, uint>? _clipSetToDict;         // jenk(clipset) -> jenk(dictionary)
+    private static readonly object _animMetaGate = new();
+
+    // "name" or "hash_XXXXXXXX" -> Jenkins hash (plain names hashed lowercased).
+    private static uint AnimHashOf(string s)
+    {
+        s = s.Trim();
+        if (s.StartsWith("hash_", StringComparison.OrdinalIgnoreCase)
+            && uint.TryParse(s.AsSpan(5), System.Globalization.NumberStyles.HexNumber, null, out uint h))
+            return h;
+        return JenkHash.GenHash(s.ToLowerInvariant());
+    }
+
+    private void EnsureWeaponAnimIndex()
+    {
+        if (_weaponByModel != null || _ws == null) return;
+        lock (_animMetaGate)
+        {
+            if (_weaponByModel != null) return;
+            var byModel = new Dictionary<string, (int rank, string name)>(OIC);
+            var animDocs = new List<XmlDocument>();
+            var setMap = new Dictionary<uint, uint>();
+            foreach (var rpf in _ws.AllRpfs)
+            {
+                if (rpf.AllEntries == null) continue;
+                foreach (var e in rpf.AllEntries)
+                {
+                    if (e is not RpfFileEntry fe) continue;
+                    string nl = fe.NameLower;
+                    bool isWeaponMeta = (nl.StartsWith("weapon") || nl == "weapons.meta") && nl.EndsWith(".meta") && !nl.Contains("animation");
+                    bool isWeaponAnim = nl.Contains("weaponanimation") && nl.EndsWith(".meta");
+                    bool isClipSets = nl.StartsWith("clip_sets");
+                    if (!isWeaponMeta && !isWeaponAnim && !isClipSets) continue;
+                    string? xml = null;
+                    try { xml = GameFs.ReadEditable(_ws.Manager, _gtaFolder, fe.Path, out _); } catch { }
+                    if (string.IsNullOrEmpty(xml)) continue;
+                    try
+                    {
+                        var doc = new XmlDocument();
+                        doc.LoadXml(xml);
+                        if (isWeaponAnim) { animDocs.Add(doc); continue; }
+                        if (isClipSets)
+                        {
+                            foreach (XmlNode it in doc.SelectNodes("//Item[@key]") ?? (XmlNodeList)new XmlDocument().ChildNodes)
+                            {
+                                string key = (it as XmlElement)?.GetAttribute("key") ?? "";
+                                var dictN = it.SelectSingleNode("clipDictionaryName")?.InnerText;
+                                if (key.Length > 0 && !string.IsNullOrWhiteSpace(dictN))
+                                    setMap[AnimHashOf(key)] = AnimHashOf(dictN!);
+                            }
+                            continue;
+                        }
+                        // weapon archetype meta: <Name>WEAPON_X</Name> + <Model>w_xx</Model> per Item
+                        int rank = RankAnimPath(fe.Path);
+                        foreach (XmlNode it in doc.SelectNodes("//Item[Name and Model]") ?? (XmlNodeList)new XmlDocument().ChildNodes)
+                        {
+                            string wn = it.SelectSingleNode("Name")?.InnerText ?? "";
+                            string mdl = it.SelectSingleNode("Model")?.InnerText ?? "";
+                            if (!wn.StartsWith("WEAPON_", StringComparison.OrdinalIgnoreCase) || mdl.Length == 0) continue;
+                            string key = mdl.ToLowerInvariant();
+                            if (!byModel.TryGetValue(key, out var cur) || rank < cur.rank) byModel[key] = (rank, wn);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            _weaponAnimDocs = animDocs;
+            _clipSetToDict = setMap;
+            _weaponByModel = byModel.ToDictionary(kv => kv.Key, kv => kv.Value.name, OIC);
+        }
+    }
+
+    // Clip-dictionary HASHES linked to a weapon model (w_ar_carbinerifle →
+    // WEAPON_CARBINERIFLE → every non-empty *ClipSet* value → dictionary hash).
+    private HashSet<uint> WeaponClipDictHashes(string modelBaseLower)
+    {
+        var dicts = new HashSet<uint>();
+        try
+        {
+            EnsureWeaponAnimIndex();
+            string? weapon = null;
+            if (_weaponByModel != null) _weaponByModel.TryGetValue(modelBaseLower, out weapon);
+            if (weapon == null && modelBaseLower.StartsWith("w_", StringComparison.Ordinal))
+            {
+                // naming convention fallback: w_ar_carbinerifle -> WEAPON_CARBINERIFLE
+                int us = modelBaseLower.IndexOf('_', 2);
+                if (us > 0 && us + 1 < modelBaseLower.Length) weapon = "WEAPON_" + modelBaseLower[(us + 1)..].ToUpperInvariant();
+            }
+            if (weapon == null) return dicts;
+            foreach (var doc in _weaponAnimDocs ?? new List<XmlDocument>())
+                foreach (XmlNode it in doc.SelectNodes($"//Item[@key='{weapon}']") ?? (XmlNodeList)new XmlDocument().ChildNodes)
+                    foreach (XmlNode n in it.ChildNodes)
+                        if (n.Name.Contains("ClipSet", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(n.InnerText))
+                        {
+                            uint cs = AnimHashOf(n.InnerText);
+                            dicts.Add(cs);   // many clipsets ARE their dictionary
+                            if (_clipSetToDict != null && _clipSetToDict.TryGetValue(cs, out var d)) dicts.Add(d);
+                        }
+        }
+        catch { }
+        return dicts;
+    }
+
+    // Find clip dictionaries for the open model: weapon meta chain + name match,
+    // ranked epic folder > update.rpf > rest; same-named dicts keep only the winner.
+    private void CmdFindAnims(Req r)
+    {
+        if (_ws == null || !_modelCache.TryGetValue(r.Node, out var mc))
+        { Send(new { type = "anims", reqId = r.Id, ok = false, message = "model not open" }); return; }
+
+        string baseName = Path.GetFileNameWithoutExtension(mc.File).ToLowerInvariant();
+        foreach (var suf in new[] { "+hi", "_hi" })
+            if (baseName.EndsWith(suf, StringComparison.Ordinal)) baseName = baseName[..^suf.Length];
+
+        var dictHashes = WeaponClipDictHashes(baseName);
+        bool NameMatch(string shortName) =>
+            dictHashes.Contains(JenkHash.GenHash(shortName))
+            || (baseName.Length >= 4 && shortName.Contains(baseName, StringComparison.Ordinal));
+
+        var best = new Dictionary<string, (int rank, RpfFileEntry? fe, string? disk)>(OIC);
+        foreach (var rpf in _ws.AllRpfs)
+        {
+            if (rpf.AllEntries == null) continue;
+            foreach (var e in rpf.AllEntries)
+            {
+                if (e is not RpfFileEntry fe || !fe.NameLower.EndsWith(".ycd", StringComparison.Ordinal)) continue;
+                if (!NameMatch(fe.NameLower[..^4])) continue;
+                int rank = RankAnimPath(fe.Path);
+                if (!best.TryGetValue(fe.NameLower, out var cur) || rank < cur.rank) best[fe.NameLower] = (rank, fe, null);
+            }
+        }
+        // loose .ycd files inside any "epic" folder beat everything
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(_gtaFolder, "*.ycd", SearchOption.AllDirectories))
+            {
+                if (!f.ToLowerInvariant().Contains(@"\epic\")) continue;
+                string nm = Path.GetFileName(f).ToLowerInvariant();
+                if (NameMatch(nm[..^4])) best[nm] = (-1, null, f);
+            }
+        }
+        catch { }
+
+        var items = best.OrderBy(kv => kv.Value.rank).ThenBy(kv => kv.Key, OIC).Take(60).Select(kv => new
+        {
+            name = kv.Key,
+            path = kv.Value.disk ?? kv.Value.fe!.Path,
+            node = kv.Value.fe != null ? Register(kv.Value.fe) : 0,
+            disk = kv.Value.disk,
+            source = kv.Value.rank <= 0 ? "epic" : kv.Value.rank == 1 ? "update" : "base",
+        }).ToArray();
+        Send(new { type = "anims", reqId = r.Id, ok = true, items, weapon = dictHashes.Count > 0 });
+    }
+
+    // A full FREEMODE MALE character: the full 128-bone skeleton (every SKEL_* bone any
+    // ped clip can animate — so run/walk/melee/aim all play) + all body component meshes
+    // (head, torso+arms+hands=uppr, legs=lowr, feet), skinned. The weapon attaches to the
+    // right hand. Cached after first build.
+    private static (object skeleton, object[] meshes, int handTag)? _pedBodyDto;
+    private void CmdPedBody(Req r)
+    {
+        try
+        {
+            if (_pedBodyDto == null)
+            {
+                if (_ws == null) { Send(new { type = "pedBody", reqId = r.Id, ok = false, message = "not mounted" }); return; }
+                var all = _ws.AllRpfs.SelectMany(rp => rp.AllEntries ?? Enumerable.Empty<RpfEntry>()).OfType<RpfFileEntry>();
+                var pedYft = all.FirstOrDefault(e => e.NameLower == "mp_m_freemode_01.yft");
+                var drawable = pedYft != null ? _ws.Manager.GetFile<YftFile>(pedYft)?.Fragment?.Drawable : null;
+                var skel = drawable?.Skeleton;
+                if (skel?.Bones?.Items == null) { Send(new { type = "pedBody", reqId = r.Id, ok = false, message = "ped skeleton not found" }); return; }
+
+                // each body component (variation _000), skinned to the shared skeleton
+                RpfFileEntry? Comp(string prefix) =>
+                    all.FirstOrDefault(e => e.NameLower.StartsWith(prefix) && e.NameLower.EndsWith(".ydd")
+                        && e.Path.ToLowerInvariant().Contains("mp_m_freemode_01"))
+                    ?? all.FirstOrDefault(e => e.NameLower.StartsWith(prefix) && e.NameLower.EndsWith(".ydd"));
+
+                var meshDtos = new List<object>();
+                foreach (var prefix in new[] { "head_000", "uppr_000", "lowr_000", "feet_000" })
+                {
+                    var comp = Comp(prefix);
+                    if (comp == null) continue;
+                    var dws = _ws.Manager.GetFile<YddFile>(comp)?.DrawableDict?.Drawables?.data_items;
+                    var cd = dws?.FirstOrDefault(d => d?.DrawableModels?.High?.Length > 0);
+                    if (cd == null) continue;
+                    var md = GeometryDecoder.Decode(cd, comp.Name);
+                    foreach (var l in md.Lods)
+                        if (l.Level == "High")
+                            foreach (var mesh in l.Meshes) meshDtos.Add(MeshDto(mesh));
+                }
+                // GTA attaches weapons to the PHYSICS hand bone (PH_R_Hand) — it sits in
+                // the palm (~5cm past the wrist toward the fingers), which is exactly where
+                // the grip belongs. Fall back to IK_R_Hand, then the wrist.
+                Bone? FindBone(params string[] ns) => skel.Bones.Items.FirstOrDefault(b => b?.Name != null && ns.Any(n => b.Name.Equals(n, StringComparison.OrdinalIgnoreCase)));
+                var hand = FindBone("PH_R_Hand", "IK_R_Hand", "SKEL_R_Hand");
+                _pedBodyDto = (SkeletonDto(drawable)!, meshDtos.ToArray(), hand != null ? (int)hand.Tag : 28422);
+            }
+            var dto = _pedBodyDto.Value;
+            Send(new { type = "pedBody", reqId = r.Id, ok = true, skeleton = dto.skeleton, meshes = dto.meshes, handTag = dto.handTag });
+        }
+        catch (Exception ex) { Send(new { type = "pedBody", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    private YcdFile? LoadYcd(Req r, out string name)
+    {
+        name = "";
+        var obj = ResolveNode(r.Ycd, r.Path);
+        if (obj is RpfFileEntry fe && fe.NameLower.EndsWith(".ycd", StringComparison.Ordinal))
+        { name = fe.Name; return _ws?.Manager.GetFile<YcdFile>(fe); }
+        string? p = (obj as DiskItem)?.Path ?? r.Path;
+        if (!string.IsNullOrEmpty(p) && File.Exists(p) && p.EndsWith(".ycd", StringComparison.OrdinalIgnoreCase))
+        { name = Path.GetFileName(p); return RpfFile.GetResourceFile<YcdFile>(File.ReadAllBytes(p)); }
+        return null;
+    }
+
+    private void CmdAnimClips(Req r)
+    {
+        try
+        {
+            var ycd = LoadYcd(r, out string name);
+            if (ycd?.ClipMapEntries == null)
+            { Send(new { type = "animClips", reqId = r.Id, ok = false, message = "could not read the clip dictionary" }); return; }
+            var clips = new List<(string hash, string name, float dur)>();
+            foreach (var cme in ycd.ClipMapEntries)
+            {
+                var clip = cme?.Clip;
+                if (clip == null) continue;
+                float dur = clip switch
+                {
+                    ClipAnimation ca when ca.Rate > 0 => (ca.EndTime - ca.StartTime) / ca.Rate,
+                    ClipAnimationList cl => cl.Duration,
+                    _ => 0f,
+                };
+                string cn = clip.ShortName;
+                if (string.IsNullOrEmpty(cn)) cn = clip.Name ?? ((uint)cme!.Hash).ToString("X8");
+                clips.Add((((uint)cme!.Hash).ToString("X8"), cn, dur));
+            }
+            Send(new
+            {
+                type = "animClips", reqId = r.Id, ok = true, name,
+                clips = clips.OrderBy(c => c.name, OIC).Select(c => new { hash = c.hash, name = c.name, duration = c.dur }).ToArray(),
+            });
+        }
+        catch (Exception ex) { Send(new { type = "animClips", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Bake a clip into per-bone keyframe tracks the renderer can play directly.
+    // A clip is usually a LIST of animations (e.g. a root-mover anim + the real body
+    // anim, or upper/lower-body splits) — each covers a DIFFERENT subset of bones, so
+    // we bake them ALL and merge, or whole-body bones go missing. Each track carries
+    // its own fps (animations in one clip can have different rates/lengths).
+    private void CmdAnimBake(Req r)
+    {
+        try
+        {
+            var ycd = LoadYcd(r, out string name);
+            var cme = ycd?.ClipMapEntries?.FirstOrDefault(c =>
+                c != null && ((uint)c.Hash).ToString("X8").Equals(r.Clip, StringComparison.OrdinalIgnoreCase));
+            var clip = cme?.Clip;
+            if (clip == null)
+            { Send(new { type = "animBaked", reqId = r.Id, ok = false, message = "clip not found" }); return; }
+
+            var anims = clip switch
+            {
+                ClipAnimation ca when ca.Animation != null => new[] { ca.Animation },
+                ClipAnimationList cl => cl.Animations?.Data?.Where(a => a?.Animation != null).Select(a => a!.Animation).ToArray() ?? Array.Empty<Animation>(),
+                _ => Array.Empty<Animation>(),
+            };
+            if (anims.Length == 0)
+            { Send(new { type = "animBaked", reqId = r.Id, ok = false, message = "clip has no animation data" }); return; }
+
+            // merge by (tag, track); when an animation repeats a bone, keep the richer
+            // (more frames) one — typically only one anim drives a given bone anyway.
+            var baked = new Dictionary<(int tag, int track), (int n, float fps, string data)>();
+            float maxDur = 0f;
+            foreach (var anim in anims)
+            {
+                if (anim?.Sequences?.data_items == null || anim.BoneIds?.data_items == null || anim.Frames == 0) continue;
+                int frames = anim.Frames;
+                int chunk = anim.SequenceFrameLimit > 0 ? anim.SequenceFrameLimit : frames;
+                var seqs = anim.Sequences.data_items;
+                var bids = anim.BoneIds.data_items;
+                float fps = anim.Duration > 0.001f ? frames / anim.Duration : 30f;
+                maxDur = Math.Max(maxDur, anim.Duration > 0.001f ? anim.Duration : frames / 30f);
+
+                for (int bidx = 0; bidx < bids.Length; bidx++)
+                {
+                    byte track = bids[bidx].Track;
+                    if (track != 0 && track != 1) continue;   // bone position / rotation only (skip mover/IK/facial)
+                    var key = ((int)bids[bidx].BoneId, (int)track);
+                    if (baked.TryGetValue(key, out var ex2) && ex2.n >= frames) continue;
+                    bool rot = track == 1;
+                    var data = new float[frames * (rot ? 4 : 3)];
+                    bool ok = true;
+                    for (int f = 0; f < frames && ok; f++)
+                    {
+                        int si = Math.Min(f / chunk, seqs.Length - 1);
+                        var sub = seqs[si]?.Sequences;
+                        if (sub == null || bidx >= sub.Length || sub[bidx] == null) { ok = false; break; }
+                        int sf = f - si * chunk;
+                        try
+                        {
+                            if (rot)
+                            {
+                                var q = sub[bidx].EvaluateQuaternion(sf);
+                                data[f * 4] = q.X; data[f * 4 + 1] = q.Y; data[f * 4 + 2] = q.Z; data[f * 4 + 3] = q.W;
+                            }
+                            else
+                            {
+                                var v = sub[bidx].EvaluateVector(sf);
+                                data[f * 3] = v.X; data[f * 3 + 1] = v.Y; data[f * 3 + 2] = v.Z;
+                            }
+                        }
+                        catch { ok = false; }
+                    }
+                    if (ok) baked[key] = (frames, fps, B64(data));
+                }
+            }
+
+            var tracks = baked.Select(kv => new { tag = kv.Key.tag, track = kv.Key.track, n = kv.Value.n, fps = kv.Value.fps, data = kv.Value.data }).ToArray();
+            Send(new
+            {
+                type = "animBaked", reqId = r.Id, ok = tracks.Length > 0,
+                name, clip = r.Clip, duration = maxDur > 0 ? maxDur : 1f, tracks,
+                message = tracks.Length > 0 ? null : "no usable bone tracks in this clip",
+            });
+        }
+        catch (Exception ex) { Send(new { type = "animBaked", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     private void CmdTexImage(Req r)
@@ -1016,7 +1626,7 @@ public sealed class Bridge
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             // Point the display cache at the new dict so thumbnails reflect the edit.
@@ -1071,7 +1681,7 @@ public sealed class Bridge
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             mc.LocalDict = dict;
@@ -1416,7 +2026,7 @@ public sealed class Bridge
 
         try
         {
-            if (fe != null) { NgEncrypt.EnsureFor(fe.File); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(di!.Path); File.WriteAllBytes(di.Path, data); }
             Send(new { type = "saved", reqId = r.Id, ok = true, target = "rpf", size = data.Length });
         }
@@ -1546,8 +2156,13 @@ public sealed class Bridge
         }
         stack.Reverse();
 
-        var crumbs = new List<object> { new { id = 0, name = _rootName } };
-        foreach (var (node, name) in stack) crumbs.Add(new { id = Register(node), name });
+        var crumbs = new List<object> { new { id = 0, name = _rootName, path = (string?)null } };
+        foreach (var (node, name) in stack)
+            crumbs.Add(new
+            {
+                id = Register(node), name,
+                path = node switch { RpfEntry e => e.Path, RpfFile f => f.Path, DiskItem di => di.Path, _ => null },
+            });
 
         Send(new
         {
@@ -1581,13 +2196,63 @@ public sealed class Bridge
         _ => null,
     };
 
+    // ---- write safety ------------------------------------------------------
+    // (1) A background remount (file watcher) swaps the archive graph and clears
+    //     _nodes; writing through a STALE graph object rewrites the archive with
+    //     outdated entry tables and CORRUPTS it. Commands re-resolve their target
+    //     by its stable PATH against the live graph whenever the node id is gone.
+    // (2) Before any archive write, probe the physical file for write access so a
+    //     locked archive (GTA V / launcher running) fails fast with a clear message
+    //     instead of dying midway through CodeWalker's write sequence.
+    // (3) NG-encrypted archives need the NG ENCRYPT tables before ANY header write
+    //     (create/rename/delete/import/undo) — EnsureFor is part of the same gate.
+
+    private object? ResolveByPath(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        if (path.Length > 1 && path[1] == ':')   // absolute disk path (loose file/folder)
+            return Directory.Exists(path) ? new DiskItem { Path = path, IsDir = true }
+                 : File.Exists(path) ? new DiskItem { Path = path, IsDir = false } : null;
+        if (_ws == null) return null;
+        object? entry = _ws.Manager.GetEntry(path);
+        if (entry != null) return entry;
+        return _ws.AllRpfs.FirstOrDefault(x => string.Equals(x.Path, path, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Node lookup with stale-fallback: a live node id wins (same mount generation);
+    // a cleared/recycled id re-resolves through the stable path.
+    private object? ResolveNode(int nodeId, string? path)
+        => _nodes.TryGetValue(nodeId, out var obj) ? obj : ResolveByPath(path);
+
+    // Friendly pre-check that an archive's physical file is writable right now.
+    private static string? WriteLockError(RpfFile? archive)
+    {
+        string? phys = SafePhysical(archive);
+        if (phys == null) return null;
+        try { using var fs = File.Open(phys, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite); return null; }
+        catch (IOException) { return Path.GetFileName(phys) + " is locked by another program — if GTA V or a launcher is running, close it and try again."; }
+        catch (UnauthorizedAccessException) { return "No write permission for " + Path.GetFileName(phys) + "."; }
+    }
+
+    // Everything that must hold before writing into an archive: not locked + NG ready.
+    // Returns an error message, or null when it's safe to proceed.
+    private static string? PrepareArchiveWrite(RpfFile? archive)
+    {
+        var err = WriteLockError(archive);
+        if (err != null) return err;
+        NgEncrypt.EnsureFor(archive);
+        return null;
+    }
+    private static string? PrepareArchiveWrite(RpfDirectoryEntry dir) => PrepareArchiveWrite(dir.File);
+
     // A create target is either a real disk directory or a directory inside an
     // archive. nodeId 0 = the GTA V root folder (so you can create at the top level).
-    private bool ResolveTarget(int nodeId, out string? diskDir, out RpfDirectoryEntry? rpfDir, out string? err)
+    private bool ResolveTarget(Req r, out string? diskDir, out RpfDirectoryEntry? rpfDir, out string? err)
     {
         diskDir = null; rpfDir = null; err = null;
-        if (nodeId == 0) { diskDir = _gtaFolder; return diskDir.Length > 0; }
-        if (!_nodes.TryGetValue(nodeId, out var obj)) { err = "invalid location"; return false; }
+        if (r.Node == 0 && string.IsNullOrEmpty(r.Path)) { diskDir = _gtaFolder; return diskDir.Length > 0; }
+        var obj = ResolveNode(r.Node, r.Path);
+        if (obj == null) { err = "That location is no longer available (the archives were re-scanned) — go back to the folder and try again."; return false; }
         if (obj is DiskItem di && di.IsDir) { diskDir = di.Path; return true; }
         rpfDir = ResolveDir(obj);
         if (rpfDir != null) return true;
@@ -1597,14 +2262,19 @@ public sealed class Bridge
 
     private void CmdCreateFolder(Req r)
     {
-        if (!ResolveTarget(r.Node, out var disk, out var dir, out var err))
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
         { Send(new { type = "created", reqId = r.Id, ok = false, message = err }); return; }
         string name = (r.Name ?? "").Trim();
         if (name.Length == 0) { Send(new { type = "created", reqId = r.Id, ok = false, message = "name required" }); return; }
         try
         {
             if (disk != null) { var p = Path.Combine(disk, name); MarkSelfWrite(p); Directory.CreateDirectory(p); }
-            else RpfFile.CreateDirectory(dir!, name);
+            else
+            {
+                if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+                MarkSelfWrite(SafePhysical(dir!.File));
+                RpfFile.CreateDirectory(dir!, name);
+            }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "folder", name });
         }
         catch (Exception ex) { Send(new { type = "created", reqId = r.Id, ok = false, message = ex.Message }); }
@@ -1612,7 +2282,7 @@ public sealed class Bridge
 
     private void CmdCreateRpf(Req r)
     {
-        if (!ResolveTarget(r.Node, out var disk, out var dir, out var err))
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
         { Send(new { type = "created", reqId = r.Id, ok = false, message = err }); return; }
         string name = (r.Name ?? "").Trim();
         if (name.Length == 0) { Send(new { type = "created", reqId = r.Id, ok = false, message = "name required" }); return; }
@@ -1630,8 +2300,9 @@ public sealed class Bridge
             }
             else
             {
-                RpfFile.CreateNew(dir!, name, RpfEncryption.OPEN);
+                if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
                 MarkSelfWrite(SafePhysical(dir!.File));
+                RpfFile.CreateNew(dir!, name, RpfEncryption.OPEN);
                 note = r.Override ? TryAddContentOverride(dir, name) : null;
             }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "rpf", name, note });
@@ -1641,7 +2312,7 @@ public sealed class Bridge
 
     private void CmdCreateYtd(Req r)
     {
-        if (!ResolveTarget(r.Node, out var disk, out var dir, out var err))
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
         { Send(new { type = "created", reqId = r.Id, ok = false, message = err }); return; }
         string name = (r.Name ?? "").Trim();
         if (name.Length == 0) { Send(new { type = "created", reqId = r.Id, ok = false, message = "name required" }); return; }
@@ -1652,7 +2323,12 @@ public sealed class Bridge
             ytd.TextureDict.BuildFromTextureList(new List<Texture>());
             byte[] data = ytd.Save();
             if (disk != null) { var p = Path.Combine(disk, name); MarkSelfWrite(p); File.WriteAllBytes(p, data); }
-            else { RpfFile.CreateFile(dir!, name, data, true); MarkSelfWrite(SafePhysical(dir!.File)); }
+            else
+            {
+                if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+                MarkSelfWrite(SafePhysical(dir!.File));
+                RpfFile.CreateFile(dir!, name, data, true);
+            }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "ytd", name });
         }
         catch (Exception ex) { Send(new { type = "created", reqId = r.Id, ok = false, message = ex.Message }); }
@@ -1664,7 +2340,7 @@ public sealed class Bridge
     // binary resource, saved as name.<ext> — the reverse of "Edit as XML"/extract.
     private void CmdImportFile(Req r)
     {
-        if (!ResolveTarget(r.Node, out var disk, out var dir, out var err))
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
         { Send(new { type = "imported", reqId = r.Id, ok = false, message = err }); return; }
         string name = (r.Name ?? "").Trim();
         if (name.Length == 0) { Send(new { type = "imported", reqId = r.Id, ok = false, message = "name required" }); return; }
@@ -1691,8 +2367,51 @@ public sealed class Bridge
             }
 
             if (disk != null) { var p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, data); }
-            else { NgEncrypt.EnsureFor(dir!.File); MarkSelfWrite(SafePhysical(dir!.File)); RpfFile.CreateFile(dir!, outName, data, true); }
+            else
+            {
+                if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+                MarkSelfWrite(SafePhysical(dir!.File));
+                RpfFile.CreateFile(dir!, outName, data, true);
+            }
+            RescanIfArchive(outName);
             Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = data.Length });
+        }
+        catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Import a file straight from its disk path (drag-drop hands us the real path via
+    // postMessageWithAdditionalObjects). No base64 round-trip through the JS bridge, so
+    // size is unlimited for disk targets (streamed copy) and bounded only by the
+    // archive-entry format for .rpf targets.
+    private void CmdImportPath(Req r)
+    {
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
+        { Send(new { type = "imported", reqId = r.Id, ok = false, message = err }); return; }
+        string src = r.SrcPath ?? "";
+        if (!File.Exists(src))
+        { Send(new { type = "imported", reqId = r.Id, ok = false, message = "source file not found: " + src }); return; }
+        string name = string.IsNullOrWhiteSpace(r.Name) ? Path.GetFileName(src) : r.Name.Trim();
+        try
+        {
+            long len = new FileInfo(src).Length;
+            if (disk != null)
+            {
+                string p = Path.Combine(disk, name);
+                if (string.Equals(Path.GetFullPath(p), Path.GetFullPath(src), StringComparison.OrdinalIgnoreCase))
+                { Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len, note = "already here" }); return; }
+                MarkSelfWrite(p);
+                File.Copy(src, p, true);   // streamed by the OS — any size
+            }
+            else
+            {
+                if (len > 1_900_000_000)
+                    throw new Exception($"{name} is {len / 1048576:N0} MB — too large for an archive entry. Import it into a normal folder instead.");
+                if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+                MarkSelfWrite(SafePhysical(dir!.File));
+                RpfFile.CreateFile(dir!, name, File.ReadAllBytes(src), true);
+            }
+            RescanIfArchive(name);
+            Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len });
         }
         catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
     }
@@ -1809,8 +2528,9 @@ public sealed class Bridge
 
     private void CmdDelete(Req r)
     {
-        if (!_nodes.TryGetValue(r.Node, out var obj))
-        { Send(new { type = "deleted", reqId = r.Id, ok = false, message = "invalid node" }); return; }
+        var obj = ResolveNode(r.Node, r.Path);
+        if (obj == null)
+        { Send(new { type = "deleted", reqId = r.Id, ok = false, message = "That item is no longer available — refresh and try again." }); return; }
 
         string name; long incoming;
         switch (obj)
@@ -1821,6 +2541,17 @@ public sealed class Bridge
             case RpfDirectoryEntry rd: name = rd.Name; incoming = 0; break;
             default: Send(new { type = "deleted", reqId = r.Id, ok = false, message = "can't delete this" }); return;
         }
+
+        // Pre-flight: deleting an archive entry rewrites the archive — fail fast and
+        // clearly when the archive is locked (game running) or NG tables are missing.
+        string? werr = obj switch
+        {
+            RpfFileEntry fe => PrepareArchiveWrite(fe.File),
+            RpfDirectoryEntry rd => PrepareArchiveWrite(rd.File),
+            RpfFile rf => WriteLockError(rf),
+            _ => null,
+        };
+        if (werr != null) { Send(new { type = "deleted", reqId = r.Id, ok = false, message = werr }); return; }
 
         long trash = TrashSize();
         if (!r.Force && trash + incoming > TrashLimitBytes)
@@ -1853,8 +2584,9 @@ public sealed class Bridge
     // renaming one breaks mounting (documented gotcha) — entries inside are fine.
     private void CmdRename(Req r)
     {
-        if (!_nodes.TryGetValue(r.Node, out var obj))
-        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "invalid node" }); return; }
+        var obj = ResolveNode(r.Node, r.Path);
+        if (obj == null)
+        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "That item is no longer available — refresh and try again." }); return; }
 
         string name = (r.Name ?? "").Trim();
         if (name.Length == 0) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "name required" }); return; }
@@ -1883,10 +2615,12 @@ public sealed class Bridge
                 case RpfFileEntry fe when fe.NameLower.EndsWith(".rpf", StringComparison.Ordinal):
                     throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
                 case RpfFileEntry fe:
+                    if (PrepareArchiveWrite(fe.File) is string we1) throw new Exception(we1);
                     MarkSelfWrite(SafePhysical(fe.File));
                     RpfFile.RenameEntry(fe, name);
                     break;
                 case RpfDirectoryEntry rd:
+                    if (PrepareArchiveWrite(rd.File) is string we2) throw new Exception(we2);
                     MarkSelfWrite(SafePhysical(rd.File));
                     RpfFile.RenameEntry(rd, name);
                     break;
@@ -1896,6 +2630,41 @@ public sealed class Bridge
             Send(new { type = "renamed", reqId = r.Id, ok = true, name });
         }
         catch (Exception ex) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Convert an .rpf archive (plus all nested child archives, and any encrypted
+    // parents) to OPEN encryption — CodeWalker's own pre-edit conversion. OPEN
+    // archives load fine in the game and sidestep NG encryption on every future
+    // write, which is the safest state for modded archives.
+    private void CmdConvertEncryption(Req r)
+    {
+        var obj = ResolveNode(r.Node, r.Path);
+        RpfFile? rpf = obj switch
+        {
+            RpfFile f => f,
+            RpfFileEntry fe when fe.NameLower.EndsWith(".rpf", StringComparison.Ordinal) => fe.File?.FindChildArchive(fe),
+            _ => null,
+        };
+        if (rpf == null)
+        { Send(new { type = "encryptionConverted", reqId = r.Id, ok = false, message = "select an .rpf archive" }); return; }
+
+        try
+        {
+            if (WriteLockError(rpf) is string lockErr)
+            { Send(new { type = "encryptionConverted", reqId = r.Id, ok = false, message = lockErr }); return; }
+
+            string before = rpf.Encryption.ToString();
+            int converted = 0;
+            MarkSelfWrite(SafePhysical(rpf));
+            bool ok = RpfFile.EnsureValidEncryption(rpf, f => { converted++; return true; }, recursive: true);
+            MarkSelfWrite(SafePhysical(rpf));   // refresh the watcher window after the (possibly long) run
+            Send(new
+            {
+                type = "encryptionConverted", reqId = r.Id, ok,
+                name = rpf.Name, before, after = rpf.Encryption.ToString(),
+            });
+        }
+        catch (Exception ex) { Send(new { type = "encryptionConverted", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     private static void PushUndo(UndoEntry e) { lock (_undoStack) _undoStack.Add(e); }
@@ -1932,9 +2701,9 @@ public sealed class Bridge
         // re-import it as the correct entry kind instead of a corrupt binary file.
         try { File.WriteAllBytes(dest, RpfWorkspace.ExtractForSave(fe)); } catch { }
         MarkSelfWrite(SafePhysical(fe.File));
-        var parent = fe.Parent;
+        string parentPath = fe.Parent?.Path ?? "";
         RpfFile.DeleteEntry(fe);
-        PushUndo(new UndoEntry { Batch = batch, Kind = "rpfFile", TrashPath = dest, Parent = parent, Name = fe.Name });
+        PushUndo(new UndoEntry { Batch = batch, Kind = "rpfFile", TrashPath = dest, ParentPath = parentPath, Name = fe.Name });
     }
 
     private void MoveRpfDirToTrash(RpfDirectoryEntry rd, long batch)
@@ -1942,9 +2711,9 @@ public sealed class Bridge
         string dest = UniqueTrashPath(rd.Name);
         try { int c = 0; long b = 0; ExtractDir(rd, dest, ref c, ref b); } catch { }
         MarkSelfWrite(SafePhysical(rd.File));
-        var parent = rd.Parent;
+        string parentPath = rd.Parent?.Path ?? "";
         RpfFile.DeleteEntry(rd);
-        PushUndo(new UndoEntry { Batch = batch, Kind = "rpfDir", TrashPath = dest, Parent = parent, Name = rd.Name });
+        PushUndo(new UndoEntry { Batch = batch, Kind = "rpfDir", TrashPath = dest, ParentPath = parentPath, Name = rd.Name });
     }
 
     private void CmdUndo(Req r)
@@ -1971,26 +2740,42 @@ public sealed class Bridge
 
     private void RestoreUndo(UndoEntry e)
     {
+        // Restore targets re-resolve through the LIVE graph by path — never through a
+        // graph object captured at delete time (stale after a remount = corruption).
+        RpfDirectoryEntry? Parent()
+        {
+            var p = ResolveByPath(e.ParentPath) as RpfDirectoryEntry
+                 ?? (ResolveByPath(e.ParentPath) is RpfFile rf ? rf.Root : null);
+            if (p == null) throw new Exception("restore target gone: " + e.ParentPath);
+            if (PrepareArchiveWrite(p) is string werr) throw new Exception(werr);
+            return p;
+        }
         switch (e.Kind)
         {
             case "disk":
                 Directory.CreateDirectory(Path.GetDirectoryName(e.OrigPath)!);
                 MarkSelfWrite(e.OrigPath); MarkSelfWrite(e.TrashPath);
                 if (e.IsDir) Directory.Move(e.TrashPath, e.OrigPath); else File.Move(e.TrashPath, e.OrigPath);
+                RescanIfArchive(e.OrigPath);
                 break;
             case "rpfFile":
-                if (e.Parent == null) return;
-                MarkSelfWrite(SafePhysical(e.Parent.File));
-                RpfFile.CreateFile(e.Parent, e.Name, File.ReadAllBytes(e.TrashPath), true);
+            {
+                var parent = Parent()!;
+                MarkSelfWrite(SafePhysical(parent.File));
+                RpfFile.CreateFile(parent, e.Name, File.ReadAllBytes(e.TrashPath), true);
                 try { File.Delete(e.TrashPath); } catch { }
+                RescanIfArchive(e.Name);
                 break;
+            }
             case "rpfDir":
-                if (e.Parent == null) return;
-                MarkSelfWrite(SafePhysical(e.Parent.File));
-                var dir = RpfFile.CreateDirectory(e.Parent, e.Name);
+            {
+                var parent = Parent()!;
+                MarkSelfWrite(SafePhysical(parent.File));
+                var dir = RpfFile.CreateDirectory(parent, e.Name);
                 ImportDir(dir, e.TrashPath);
                 try { Directory.Delete(e.TrashPath, true); } catch { }
                 break;
+            }
             case "baseRpf":
                 // move the archive back; let the watcher re-scan it (no self-write mark)
                 if (File.Exists(e.TrashPath)) File.Move(e.TrashPath, e.OrigPath);
@@ -2224,7 +3009,7 @@ public sealed class Bridge
         int count = 0;
         try { count = Directory.EnumerateFileSystemEntries(path).Count(); } catch { }
         return new { id = Register(new DiskItem { Path = path, IsDir = true }), name = Path.GetFileName(path),
-            kind = "dir", container = true, expandable = true, type = "Folder", size = -1L, count, attrs = "" };
+            kind = "dir", container = true, expandable = true, type = "Folder", size = -1L, count, attrs = "", path };
     }
 
     private object DiskFileNode(string path)
@@ -2233,7 +3018,7 @@ public sealed class Bridge
         string name = Path.GetFileName(path);
         return new { id = Register(new DiskItem { Path = path, IsDir = false }), name,
             kind = "file", container = false, expandable = false, type = FriendlyType(name), size, attrs = "Loose",
-            viewer = FileTypes.Route(name).ToString().ToLowerInvariant() };
+            viewer = FileTypes.Route(name).ToString().ToLowerInvariant(), path };
     }
 
     private void AddDir(List<object> list, RpfDirectoryEntry? dir)
@@ -2245,19 +3030,21 @@ public sealed class Bridge
     }
 
     private object DirNode(RpfDirectoryEntry d) => new
-    { id = Register(d), name = d.Name, kind = "dir", container = true, expandable = true, type = "Folder", size = -1L, count = d.Directories.Count + d.Files.Count, attrs = "" };
+    { id = Register(d), name = d.Name, kind = "dir", container = true, expandable = true, type = "Folder", size = -1L, count = d.Directories.Count + d.Files.Count, attrs = "", path = d.Path };
 
     private object ArchiveNode(RpfFile rf) => new
     {
         id = Register(rf), name = rf.Name, kind = "archive", container = true, expandable = true,
         type = "Archive", size = rf.FileSize, count = ChildCount(rf.Root),
         attrs = rf.Encryption is RpfEncryption.NONE or RpfEncryption.OPEN ? "" : rf.Encryption.ToString(),
+        path = rf.Path,
     };
 
     private object ArchiveNode(RpfFileEntry fe) => new
     {
         id = Register(fe), name = fe.Name, kind = "archive", container = true, expandable = true,
         type = "Archive", size = SafeSize(fe), count = ChildCount(SafeChildRoot(fe)), attrs = Attrs(fe),
+        path = fe.Path,
     };
 
     private static int ChildCount(RpfDirectoryEntry? dir)
@@ -2273,6 +3060,7 @@ public sealed class Bridge
         id = Register(fe), name = fe.Name, kind = "file", container = false, expandable = false,
         type = FriendlyType(fe.Name), size = SafeSize(fe), attrs = Attrs(fe),
         viewer = FileTypes.Route(fe.Name).ToString().ToLowerInvariant(),
+        path = fe.Path,
     };
 
     private static string FriendlyType(string name) => ExtOf(name.ToLowerInvariant()) switch
@@ -2306,70 +3094,212 @@ public sealed class Bridge
         return id;
     }
 
-    private Dictionary<string, object?> BuildModelDto(ModelData m, DrawableBase d, RpfFileEntry? modelEntry, TextureDictionary? localDict = null)
+    private Dictionary<string, object?> BuildModelDto(ModelData m, DrawableBase d, RpfFileEntry? modelEntry,
+        TextureDictionary? localDict = null, List<TextureDictionary>? extraDicts = null)
     {
+        EnsureShaderNames();
         var shaders = d.ShaderGroup?.Shaders?.data_items;
 
-        // Pre-index external textures this model needs (those not embedded with data).
+        // Pre-index external textures this model needs (those not embedded with data) —
+        // ALL samplers (diffuse + normal + spec…), so lighting maps resolve too.
         // Only possible for archive entries (loose disk files resolve embedded only).
         if (shaders != null && _resolver != null && modelEntry != null)
         {
             var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var s in shaders)
-            {
-                var tb = GetDiffuseRef(s);
-                if (tb != null && !(tb is Texture tx && tx.Data?.FullData != null) && !string.IsNullOrEmpty(tb.Name))
-                    needed.Add(tb.Name);
-            }
+                foreach (var (_, tb) in SamplerRefs(s))
+                    if (tb != null && !(tb is Texture tx && tx.Data?.FullData != null) && !string.IsNullOrEmpty(tb.Name))
+                        needed.Add(tb.Name);
             if (needed.Count > 0) _resolver.IndexForModel(modelEntry, needed);
         }
 
-        var texCache = new Dictionary<object, string?>();
+        var texCache = new Dictionary<(Texture t, bool nrm), string?>();
         var mats = new List<object>();
         for (int i = 0; i < m.Materials.Count; i++)
         {
-            var md = m.Materials[i];
-            string? tex = null;
-            if (shaders != null && i < shaders.Length)
-            {
-                var t = ResolveTexture(GetDiffuseRef(shaders[i]), localDict);
-                if (t != null && !texCache.TryGetValue(t, out tex)) { tex = DecodeTexUrl(t); texCache[t] = tex; }
-            }
-            mats.Add(new { shader = md.ShaderName, diffuse = md.DiffuseTextureName, tex });
+            var s = (shaders != null && i < shaders.Length) ? shaders[i] : null;
+            mats.Add(MatDto(s, m.Materials[i], localDict, extraDicts, texCache));
         }
+        // "Additions": meshes living on extra_* bones (toggleable spawn parts on
+        // vehicles etc.) — rigid bone binding or, on skinned models, the geometry's
+        // dominant blend bone. Hidden by default; the UI lists them as checkboxes.
+        var boneNames = d.Skeleton?.Bones?.Items?.Select(b => b?.Name ?? "").ToArray();
+        var additions = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (boneNames != null)
+            foreach (var lod in m.Lods)
+                foreach (var mesh in lod.Meshes)
+                {
+                    int bIdx = mesh.HasSkin ? mesh.DominantBone : mesh.BoneIndex;
+                    if (bIdx > 0 && bIdx < boneNames.Length && boneNames[bIdx].StartsWith("extra_", StringComparison.OrdinalIgnoreCase))
+                        additions.Add(boneNames[bIdx]);
+                }
+
         return new Dictionary<string, object?>
         {
             ["name"] = m.Name,
             ["bmin"] = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z },
             ["bmax"] = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
             ["materials"] = mats,
+            ["skeleton"] = SkeletonDto(d),
+            ["additions"] = additions.Count > 0 ? additions.ToArray() : null,
             ["lods"] = m.Lods.Select(l => new { level = l.Level, meshes = l.Meshes.Select(MeshDto).ToArray() }).ToArray(),
         };
     }
 
-    private static TextureBase? GetDiffuseRef(ShaderFX s)
+    // Full material DTO: shader identity, every texture sampler (with its resolved
+    // image where found), and the editable value parameters. The renderer maps the
+    // diffuse/normal/spec roles to its lighting model; everything is shown in the UI.
+    private object MatDto(ShaderFX? s, MaterialData md, TextureDictionary? localDict,
+        List<TextureDictionary>? extras, Dictionary<(Texture t, bool nrm), string?> cache)
+    {
+        string shader = md.ShaderName;
+        string sps = "";
+        try { sps = s?.FileName.ToString() ?? ""; } catch { }
+        string shaderLower = shader.ToLowerInvariant() + " " + sps.ToLowerInvariant();
+
+        var texs = new List<object>();
+        string? diffuse = md.DiffuseTextureName, tex = null, nrmTex = null, spcTex = null, firstUrl = null;
+        if (s != null)
+        {
+            foreach (var (sampler, tb) in SamplerRefs(s))
+            {
+                var t = ResolveTexture(tb, localDict, extras);
+                string role = RoleFor(sampler);
+                bool asNormal = role == "normal";
+                string? url = null;
+                if (t != null && !cache.TryGetValue((t, asNormal), out url))
+                { url = DecodeTexUrl(t, asNormal); cache[(t, asNormal)] = url; }
+
+                texs.Add(new
+                {
+                    sampler, role,
+                    name = tb?.Name,
+                    found = url != null,
+                    w = t?.Width ?? 0, h = t?.Height ?? 0,
+                    fmt = t != null ? t.Format.ToString().Replace("D3DFMT_", "") : "",
+                    embedded = tb is Texture et && et.Data?.FullData != null,
+                });
+                firstUrl ??= url;
+                if (role == "diffuse" && tex == null) { tex = url; diffuse = tb?.Name ?? diffuse; }
+                else if (role == "normal" && nrmTex == null) nrmTex = url;
+                else if (role == "spec" && spcTex == null) spcTex = url;
+            }
+        }
+        tex ??= firstUrl;   // no diffuse-named sampler -> first resolved texture (old behaviour)
+
+        // Editable value parameters (Vector4 / first element of Vector4 arrays).
+        var prms = new List<object>();
+        var ps = s?.ParametersList?.Parameters;
+        var hs = s?.ParametersList?.Hashes;
+        float emissiveMult = 1f;
+        if (ps != null && hs != null)
+        {
+            for (int i = 0; i < ps.Length && i < hs.Length; i++)
+            {
+                float[]? vals = ps[i].Data switch
+                {
+                    SharpDX.Vector4 v => new[] { v.X, v.Y, v.Z, v.W },
+                    SharpDX.Vector4[] { Length: > 0 } arr => new[] { arr[0].X, arr[0].Y, arr[0].Z, arr[0].W },
+                    _ => null,
+                };
+                if (vals == null) continue;
+                string pname = ParamName(hs[i]);
+                int count = ps[i].Data is SharpDX.Vector4[] a ? a.Length : 1;
+                prms.Add(new { name = pname, values = vals, count });
+                if (pname.Equals("emissiveMultiple", StringComparison.OrdinalIgnoreCase)) emissiveMult = vals[0];
+            }
+        }
+
+        bool emissive = shaderLower.Contains("emissive") || shaderLower.Contains("glow");
+        return new
+        {
+            shader, sps,
+            bucket = (int)(s?.RenderBucket ?? 0),
+            diffuse, tex, nrmTex, spcTex,
+            emissive, emissiveMult,
+            texs,
+            @params = prms,
+        };
+    }
+
+    // Shader parameter names are ShaderParamNames-enum hashes (the same resolution
+    // CodeWalker's XML writer uses); fall back to the MetaName/Jenkins string.
+    private static string ParamName(MetaName h)
+    {
+        string s = ((ShaderParamNames)(uint)h).ToString();
+        if (s.Length > 0 && !char.IsDigit(s[0])) return s;
+        return h.ToString();
+    }
+
+    // All texture-sampler parameters of a shader, with their (resolved-or-not) refs.
+    private static IEnumerable<(string sampler, TextureBase? tb)> SamplerRefs(ShaderFX s)
+    {
+        ShaderParameter[]? ps = null; MetaName[]? hs = null;
+        try { ps = s.ParametersList?.Parameters; hs = s.ParametersList?.Hashes; } catch { }
+        if (ps == null) yield break;
+        for (int i = 0; i < ps.Length; i++)
+            if (ps[i]?.Data is TextureBase tb)
+                yield return ((hs != null && i < hs.Length) ? ParamName(hs[i]) : "Sampler" + i, tb);
+    }
+
+    // Classify a sampler name into a renderer role.
+    private static string RoleFor(string sampler)
+    {
+        string s = sampler.ToLowerInvariant();
+        if (s.Contains("bump") || s.Contains("normal")) return "normal";
+        if (s.Contains("spec")) return "spec";
+        if (s.Contains("detail")) return "detail";
+        if (s.Contains("tint") || s.Contains("palette")) return "tint";
+        if (s.Contains("diffuse") || s.Contains("texturesamp") || s.Contains("platebg")) return "diffuse";
+        return "other";
+    }
+
+    // Bone hierarchy for the details panel, 3D overlay, rigid-part placement, skinning
+    // and animation. World positions come from the skeleton's absolute transforms;
+    // local translation/rotation/scale rebuild the same hierarchy renderer-side.
+    private static object? SkeletonDto(DrawableBase? d)
     {
         try
         {
-            var ps = s.ParametersList?.Parameters;
-            var hs = s.ParametersList?.Hashes;
-            if (ps == null) return null;
-            if (hs != null)
-                for (int i = 0; i < ps.Length && i < hs.Length; i++)
-                    if (hs[i].ToString().ToLowerInvariant().Contains("diffuse") && ps[i].Data is TextureBase tb)
-                        return tb;
-            for (int i = 0; i < ps.Length; i++)
-                if (ps[i].Data is TextureBase tb2)
-                    return tb2;
+            var bones = d?.Skeleton?.Bones?.Items;
+            if (bones == null || bones.Length == 0) return null;
+            var list = new List<object>(bones.Length);
+            for (int i = 0; i < bones.Length; i++)
+            {
+                var b = bones[i];
+                if (b == null) continue;
+                var p = b.AbsTransform.TranslationVector;
+                var lt = b.Translation; var lr = b.Rotation; var ls = b.Scale;
+                list.Add(new
+                {
+                    i,
+                    name = string.IsNullOrEmpty(b.Name) ? "bone_" + i : b.Name,
+                    tag = (int)b.Tag,
+                    parent = (int)b.ParentIndex,
+                    pos = new[] { p.X, p.Y, p.Z },
+                    lp = new[] { lt.X, lt.Y, lt.Z },
+                    lr = new[] { lr.X, lr.Y, lr.Z, lr.W },
+                    ls = new[] { ls.X, ls.Y, ls.Z },
+                });
+            }
+            return list.Count > 0 ? list : null;
         }
-        catch { }
-        return null;
+        catch { return null; }
     }
 
-    private Texture? ResolveTexture(TextureBase? tb, TextureDictionary? localDict = null)
+    private Texture? ResolveTexture(TextureBase? tb, TextureDictionary? localDict = null, List<TextureDictionary>? extras = null)
     {
-        if (tb is Texture t && t.Data?.FullData != null) return t;   // embedded
         if (tb == null) return null;
+
+        // User-picked txds win (the user pointed at them explicitly).
+        if (extras != null)
+            foreach (var dict in extras)
+            {
+                var ut = LookupTex(dict, tb);
+                if (ut?.Data?.FullData != null) return ut;
+            }
+
+        if (tb is Texture t && t.Data?.FullData != null) return t;   // embedded
 
         // The file's own dictionary (e.g. a .ypt's particle texture dict).
         var lt = LookupTex(localDict, tb);
@@ -2394,14 +3324,100 @@ public sealed class Bridge
         return null;
     }
 
-    private static string? DecodeTexUrl(Texture t)
+    private static string? DecodeTexUrl(Texture t, bool normalMap = false)
     {
         try
         {
             var rgba = TextureCodec.DecodeTexture(t, out int w, out int h);
-            return rgba == null ? null : ImageUtil.DataUrlPng(ImageUtil.PngFromRgba(rgba, w, h));
+            if (rgba == null) return null;
+            if (normalMap) PrepareNormalMap(rgba, t.Format.ToString());
+            return ImageUtil.DataUrlPng(ImageUtil.PngFromRgba(rgba, w, h));
         }
         catch { return null; }
+    }
+
+    // RAGE BC5/ATI2 normal maps carry only X+Y; reconstruct Z so the renderer can use
+    // them as standard RGB normal maps (other formats already store full RGB normals).
+    private static void PrepareNormalMap(byte[] rgba, string format)
+    {
+        string f = format.ToUpperInvariant();
+        if (!f.Contains("ATI2") && !f.Contains("BC5")) return;
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            float x = rgba[i] / 255f * 2f - 1f;
+            float y = rgba[i + 1] / 255f * 2f - 1f;
+            float z = MathF.Sqrt(MathF.Max(0f, 1f - x * x - y * y));
+            rgba[i + 2] = (byte)Math.Clamp((int)MathF.Round((z * 0.5f + 0.5f) * 255f), 0, 255);
+            rgba[i + 3] = 255;
+        }
+    }
+
+    // Shader names live as Jenkins hashes; seed the index with the common RAGE shader
+    // names once so ShaderFX.Name/FileName resolve to readable strings (e.g.
+    // "ped_emissive" instead of 2401522793).
+    private static bool _shaderNamesSeeded;
+    private static void EnsureShaderNames()
+    {
+        if (_shaderNamesSeeded) return;
+        _shaderNamesSeeded = true;
+        string[] names =
+        {
+            "default", "default_detail", "default_spec", "default_terrain_cb", "default_tnt",
+            "normal", "normal_alpha", "normal_cutout", "normal_decal", "normal_detail", "normal_diffspec",
+            "normal_diffspec_detail", "normal_pxm", "normal_pxm_tnt", "normal_reflect", "normal_reflect_alpha",
+            "normal_reflect_decal", "normal_spec", "normal_spec_alpha", "normal_spec_cutout", "normal_spec_decal",
+            "normal_spec_decal_detail", "normal_spec_decal_pxm", "normal_spec_detail", "normal_spec_detail_dpm",
+            "normal_spec_detail_tnt", "normal_spec_dpm", "normal_spec_emissive", "normal_spec_pxm",
+            "normal_spec_reflect", "normal_spec_reflect_decal", "normal_spec_reflect_emissivenight",
+            "normal_spec_tnt", "normal_spec_um", "normal_spec_wrinkle", "normal_terrain_wet", "normal_tnt",
+            "normal_um", "normal_um_tnt", "spec", "spec_alpha", "spec_decal", "spec_reflect", "spec_reflect_alpha",
+            "spec_reflect_decal", "spec_tnt", "spec_twiddle_tnt", "alpha", "cutout_fence", "cutout_fence_normal",
+            "decal", "decal_amb_only", "decal_diff_only_um", "decal_dirt", "decal_emissive_only",
+            "decal_emissivenight_only", "decal_glue", "decal_normal_only", "decal_shadow_only", "decal_spec_only",
+            "decal_tnt", "custom_default", "cloth_default", "cloth_normal_spec", "cloth_normal_spec_alpha",
+            "cloth_normal_spec_cutout", "cloth_normal_spec_tnt", "cloth_spec_alpha", "cloth_spec_cutout",
+            "emissive", "emissive_additive_alpha", "emissive_additive_uv_alpha", "emissive_alpha",
+            "emissive_alpha_tnt", "emissive_clip", "emissive_speclum", "emissive_tnt", "emissivenight",
+            "emissivenight_alpha", "emissivenight_geomnightonly", "emissivestrong", "emissivestrong_alpha",
+            "glass", "glass_breakable", "glass_breakable_screendooralpha", "glass_displacement",
+            "glass_emissive", "glass_emissive_alpha", "glass_emissivenight", "glass_emissivenight_alpha",
+            "glass_env", "glass_normal_spec_reflect", "glass_pv", "glass_pv_env", "glass_reflect",
+            "glass_spec", "mirror_crack", "mirror_decal", "mirror_default",
+            "ped", "ped_alpha", "ped_cloth", "ped_cloth_enveff", "ped_decal", "ped_decal_decoration",
+            "ped_decal_expensive", "ped_decal_nodiff", "ped_default", "ped_default_cloth", "ped_default_enveff",
+            "ped_default_mp", "ped_default_palette", "ped_emissive", "ped_enveff", "ped_fur", "ped_hair_cutout_alpha",
+            "ped_hair_spiked", "ped_nopeddamagedecals", "ped_palette", "ped_wrinkle", "ped_wrinkle_cloth",
+            "ped_wrinkle_cloth_enveff", "ped_wrinkle_cs", "ped_wrinkle_enveff",
+            "vehicle_badges", "vehicle_basic", "vehicle_blurredrotor", "vehicle_blurredrotor_emissive",
+            "vehicle_cloth", "vehicle_cloth2", "vehicle_dash_emissive", "vehicle_dash_emissive_opaque",
+            "vehicle_decal", "vehicle_decal2", "vehicle_detail", "vehicle_detail2", "vehicle_emissive_alpha",
+            "vehicle_emissive_opaque", "vehicle_generic", "vehicle_interior", "vehicle_interior2",
+            "vehicle_licenseplate", "vehicle_lightsemissive", "vehicle_mesh", "vehicle_mesh2_enveff",
+            "vehicle_mesh_enveff", "vehicle_paint1", "vehicle_paint1_enveff", "vehicle_paint2",
+            "vehicle_paint2_enveff", "vehicle_paint3", "vehicle_paint3_enveff", "vehicle_paint3_lvr",
+            "vehicle_paint4", "vehicle_paint4_emissive", "vehicle_paint4_enveff", "vehicle_paint5_enveff",
+            "vehicle_paint6", "vehicle_paint6_enveff", "vehicle_paint7", "vehicle_paint7_enveff",
+            "vehicle_paint8", "vehicle_paint9", "vehicle_shuts", "vehicle_tire", "vehicle_tire_emissive",
+            "vehicle_track", "vehicle_track2", "vehicle_track2_emissive", "vehicle_track_ammo",
+            "vehicle_track_emissive", "vehicle_vehglass", "vehicle_vehglass_inner",
+            "weapon_emissivestrong_alpha", "weapon_emissive_tnt", "weapon_normal_spec_alpha",
+            "weapon_normal_spec_cutout_palette", "weapon_normal_spec_detail_palette",
+            "weapon_normal_spec_detail_tnt", "weapon_normal_spec_palette", "weapon_normal_spec_tnt",
+            "terrain_cb_4lyr", "terrain_cb_4lyr_2tex", "terrain_cb_4lyr_2tex_blend",
+            "terrain_cb_4lyr_2tex_blend_lod", "terrain_cb_4lyr_2tex_blend_pxm",
+            "terrain_cb_4lyr_2tex_blend_pxm_spm", "terrain_cb_4lyr_2tex_pxm", "terrain_cb_4lyr_cm",
+            "terrain_cb_4lyr_cm_pxm", "terrain_cb_4lyr_cm_pxm_tnt", "terrain_cb_4lyr_cm_tnt",
+            "terrain_cb_4lyr_lod", "terrain_cb_4lyr_pxm", "terrain_cb_4lyr_pxm_spm", "terrain_cb_4lyr_spec",
+            "terrain_cb_4lyr_spec_int", "terrain_cb_4lyr_spec_int_pxm", "terrain_cb_4lyr_spec_pxm",
+            "trees", "trees_lod", "trees_lod2", "trees_lod2d", "trees_lod_tnt", "trees_normal",
+            "trees_normal_diffspec", "trees_normal_diffspec_tnt", "trees_normal_spec", "trees_normal_spec_tnt",
+            "trees_shadow_proxy", "trees_tnt", "grass", "grass_batch", "grass_fur", "grass_fur_mask",
+            "water_terrainfoam", "minimap", "gta_radar", "radar", "ptfx_model", "sky_system",
+            "cable", "cpv_only", "clouds_altitude", "clouds_anim", "clouds_animsoft", "clouds_fast",
+            "clouds_fog", "clouds_soft", "parallax", "parallax_specmap", "reflect", "reflect_alpha",
+            "reflect_decal", "distance_map", "gta_default", "rope_default", "rope_normal",
+        };
+        foreach (var n in names) { JenkIndex.Ensure(n); JenkIndex.Ensure(n + ".sps"); }
     }
 
     private void CmdEncodeDds(Req r)
@@ -2449,7 +3465,12 @@ public sealed class Bridge
         nrm = m.Normals != null ? B64(m.Normals) : null,
         uv0 = m.TexCoords0 != null ? B64(m.TexCoords0) : null,
         col = m.Colors0 != null ? B64(m.Colors0) : null,
+        bw = m.HasSkin && m.BlendWeights != null ? B64(m.BlendWeights) : null,
+        bi = m.HasSkin && m.BlendIndices != null ? Convert.ToBase64String(m.BlendIndices) : null,
         idx = B64(m.Indices),
+        bone = m.BoneIndex,
+        skin = m.HasSkin,
+        domBone = m.DominantBone,
         bmin = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z },
         bmax = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
     };

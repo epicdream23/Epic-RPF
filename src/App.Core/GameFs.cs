@@ -97,8 +97,16 @@ public static class GameFs
                 return true;
             }
             string dp = DiskPath(gtaFolder, norm);
+            if (Directory.Exists(dp))
+            { error = $"target '{vpath}' is a folder — include the file name (e.g. {vpath.TrimEnd('/', '\\')}/yourfile.ext)"; return false; }
             var ddir = Path.GetDirectoryName(dp);
-            if (ddir != null && Directory.Exists(ddir)) { File.WriteAllBytes(dp, data); return true; }
+            if (ddir != null && Directory.Exists(ddir))
+            {
+                // store installs sometimes mark game files read-only; clear it so the overwrite works
+                try { if (File.Exists(dp)) File.SetAttributes(dp, File.GetAttributes(dp) & ~FileAttributes.ReadOnly); } catch { }
+                File.WriteAllBytes(dp, data);
+                return true;
+            }
             error = "no such target or parent folder: " + vpath;
             return false;
         }

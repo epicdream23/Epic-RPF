@@ -2,6 +2,33 @@ Epic RPF — Changelog
 ====================
 
 
+Version 3.0.0  (2026-06-14)
+---------------------------
+
+New:
+  * Animations — play GTA animations (.ycd) right in the model viewer. The new
+    Anims tab automatically finds the animation dictionaries that belong to a
+    model, lists every clip, and plays them with play/pause, a scrub bar, speed
+    control and a live skeleton overlay. You can also browse to any .ycd yourself.
+  * Show character — tick "Show character" on a weapon and a full freemode
+    character is loaded holding it, so movement / aim / reload / idle clips play
+    on a whole body instead of a floating gun. A live "Grip adjust" panel
+    (position + rotation sliders, remembered between sessions) lets you seat the
+    weapon exactly in the hand.
+  * Vehicle additions — toggle optional extra parts (bull-bars, roof racks and the
+    like) on and off from the Materials tab.
+  * Much better 3D rendering — corrected texture orientation, proper Phong shading
+    with normal / specular / emissive maps, and an editable shader-parameters
+    panel whose changes save straight back into the model.
+  * Skeleton tab — browse a model's bone hierarchy with a live overlay, and point
+    the viewer at your own .ytd files when you want different textures.
+
+Fixes:
+  * Exporting as XML no longer fails on loose resource files that are almost pure
+    skeleton (some .yft models); and when an export does fail it now reports the
+    real reason instead of a generic "export failed".
+
+
 Version 2.0.0  (2026-06-12)
 ---------------------------
 

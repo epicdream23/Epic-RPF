@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -64,7 +65,19 @@ internal static class WebHost
                     bridge.HandleDrag(ids);
                     return;
                 }
-                bridge.HandleMessage(json);
+                // postMessageWithAdditionalObjects: dropped File objects arrive here with
+                // their REAL disk paths — imports use the path (no giant base64 strings).
+                string[]? dropped = null;
+                try
+                {
+                    if (args.AdditionalObjects is { Count: > 0 } extra)
+                        dropped = extra.OfType<CoreWebView2File>()
+                                       .Select(f => f.Path)
+                                       .Where(p => !string.IsNullOrEmpty(p))
+                                       .ToArray();
+                }
+                catch { }
+                bridge.HandleMessage(json, dropped);
             }
             catch { /* a malformed message must never take the app down */ }
         };

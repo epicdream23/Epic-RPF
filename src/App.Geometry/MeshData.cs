@@ -23,10 +23,20 @@ public sealed class MeshData
     public float[]? Normals;                            // 3 * VertexCount, or null
     public float[]? TexCoords0;                         // 2 * VertexCount, or null
     public float[]? Colors0;                            // 4 * VertexCount (0..1), or null
+    public float[]? BlendWeights;                       // 4 * VertexCount (0..1), or null
+    public byte[]? BlendIndices;                        // 4 * VertexCount (skeleton bone indices), or null
     public uint[] Indices = Array.Empty<uint>();
     public int MaterialIndex;
     public Vec3 BoundsMin = Vec3.Zero;
     public Vec3 BoundsMax = Vec3.Zero;
+
+    // Skeleton binding of the OWNING DrawableModel: rigid models hang off BoneIndex
+    // (geometry is bone-local); skinned models (HasSkin) use BlendWeights/Indices.
+    public int BoneIndex;
+    public bool HasSkin;
+    // For skinned meshes: the bone that owns (almost) every vertex, or -1 when mixed.
+    // This is what identifies toggleable vehicle parts (extra_* regions).
+    public int DominantBone = -1;
 }
 
 /// <summary>Result of decoding a single geometry: either a mesh, or a logged skip reason.</summary>

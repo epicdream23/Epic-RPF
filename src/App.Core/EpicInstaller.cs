@@ -29,11 +29,13 @@ public static class EpicInstaller
         var lines = new List<string>();
         foreach (var op in pkg.Manifest.Operations)
         {
-            bool exists = GameFs.Exists(man, gtaFolder, op.Target);
+            string repTarget = op.Target;
+            if (op.Op == "replaceFile") { try { repTarget = ResolveReplaceTarget(man, gtaFolder, op); } catch { } }
+            bool exists = GameFs.Exists(man, gtaFolder, op.Op == "replaceFile" ? repTarget : op.Target);
             string note = string.IsNullOrEmpty(op.Note) ? "" : "  — " + op.Note;
             lines.Add(op.Op switch
             {
-                "replaceFile" => $"{(exists ? "replace" : "add")} file  {op.Target}  ({pkg.PayloadLength(op.Source)} bytes){note}",
+                "replaceFile" => $"{(exists ? "replace" : "add")} file  {repTarget}  ({pkg.PayloadLength(op.Source)} bytes){note}",
                 "deleteFile" => $"delete file  {op.Target}{(exists ? "" : "  (missing)")}{note}",
                 "xml" => $"xml {op.Action}  {op.Target}  [{op.Xpath}]{note}",
                 "text" => $"text {op.Action}  {op.Target}{note}",
@@ -84,8 +86,10 @@ public static class EpicInstaller
                     case "replaceFile":
                     {
                         var data = pkg.Payload(op.Source) ?? throw new Exception($"payload '{op.Source}' missing");
-                        if (!op.CreateIfMissing && !GameFs.Exists(man, gta, op.Target)) throw new Exception("target missing and createIfMissing=false");
-                        r.Ok = GameFs.WriteBytes(man, gta, op.Target, data, out var e1); r.Message = r.Ok ? $"{data.Length} bytes" : e1;
+                        string target = ResolveReplaceTarget(man, gta, op);
+                        r.Target = target;   // show the real destination in the results
+                        if (!op.CreateIfMissing && !GameFs.Exists(man, gta, target)) throw new Exception("target missing and createIfMissing=false");
+                        r.Ok = GameFs.WriteBytes(man, gta, target, data, out var e1); r.Message = r.Ok ? $"{data.Length} bytes" : e1;
                         break;
                     }
                     case "deleteFile":
@@ -105,6 +109,36 @@ public static class EpicInstaller
             results.Add(r);
         }
         return results;
+    }
+
+    /// <summary>
+    /// A replaceFile target may name a FOLDER (trailing slash, an archive directory, a
+    /// disk directory, or empty = the GTA root) — the payload then keeps its own file
+    /// name and lands inside that folder. A target whose last segment already equals
+    /// the payload's name is used as-is (e.g. target "update/update.rpf" + payload
+    /// update.rpf replaces the archive FILE, not a file inside it).
+    /// </summary>
+    private static string ResolveReplaceTarget(RpfManager man, string gta, EpicOp op)
+    {
+        string norm = GameFs.Norm(op.Target);
+        string name = Path.GetFileName(op.Source ?? "");
+        // payload names may carry the builder's dedupe prefix ("a1b2c3d4_name.ext")
+        if (name.Length > 9 && name[8] == '_' && name[..8].All(Uri.IsHexDigit)) name = name[9..];
+
+        if (norm.Length == 0)
+            return name.Length > 0 ? name : throw new Exception("empty target needs a payload filename");
+
+        bool explicitFolder = op.Target.EndsWith("/") || op.Target.EndsWith("\\");
+        string last = norm[(norm.LastIndexOf('\\') + 1)..];
+        if (!explicitFolder && string.Equals(last, name, StringComparison.OrdinalIgnoreCase))
+            return norm;   // already the full file path
+
+        bool folder = explicitFolder
+            || GameFs.Entry(man, norm) is RpfDirectoryEntry
+            || Directory.Exists(GameFs.DiskPath(gta, norm));
+        if (!folder) return norm;
+        if (name.Length == 0) throw new Exception($"target '{op.Target}' is a folder — the payload needs a filename");
+        return norm + "\\" + name;
     }
 
     private static bool ApplyXml(RpfManager man, string gta, EpicOp op, out string error)

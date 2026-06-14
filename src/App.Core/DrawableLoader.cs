@@ -20,52 +20,73 @@ public static class DrawableLoader
         public NamedDrawable(string name, DrawableBase drawable, uint hash = 0) { Name = name; Drawable = drawable; Hash = hash; }
     }
 
-    public static List<NamedDrawable> Load(RpfManager man, RpfFileEntry entry)
+    public static List<NamedDrawable> Load(RpfManager man, RpfFileEntry entry) => Load(man, entry, out _);
+
+    /// <summary>
+    /// Load drawables and also surface the typed game file that owns them
+    /// (YdrFile/YddFile/YftFile/YptFile) so callers can mutate + <c>Save()</c> it
+    /// (e.g. shader-parameter edits written back into the archive).
+    /// </summary>
+    public static List<NamedDrawable> Load(RpfManager man, RpfFileEntry entry, out object? ownerFile)
     {
         var result = new List<NamedDrawable>();
+        ownerFile = null;
         switch (FileTypes.Detect(entry.NameLower))
         {
             case RpfFileKind.Drawable:
                 var ydr = man.GetFile<YdrFile>(entry);
+                ownerFile = ydr;
                 if (ydr?.Drawable != null) result.Add(new NamedDrawable(entry.Name, ydr.Drawable));
                 break;
             case RpfFileKind.DrawableDictionary:
                 var ydd = man.GetFile<YddFile>(entry);
+                ownerFile = ydd;
                 AddDict(result, ydd?.DrawableDict?.Drawables?.data_items, ydd?.DrawableDict?.Hashes, entry.Name);
                 break;
             case RpfFileKind.Fragment:
                 var yft = man.GetFile<YftFile>(entry);
+                ownerFile = yft;
                 if (yft?.Fragment?.Drawable != null) result.Add(new NamedDrawable(entry.Name, yft.Fragment.Drawable));
                 break;
             case RpfFileKind.ParticleEffect:
-                AddYptDrawables(result, man.GetFile<YptFile>(entry));
+                var ypt = man.GetFile<YptFile>(entry);
+                ownerFile = ypt;
+                AddYptDrawables(result, ypt);
                 break;
         }
         return result;
     }
 
     /// <summary>Like <see cref="Load"/> but for a loose file on disk (raw RSC7 bytes).</summary>
-    public static List<NamedDrawable> LoadLoose(byte[] data, string name)
+    public static List<NamedDrawable> LoadLoose(byte[] data, string name) => LoadLoose(data, name, out _);
+
+    public static List<NamedDrawable> LoadLoose(byte[] data, string name, out object? ownerFile)
     {
         var result = new List<NamedDrawable>();
+        ownerFile = null;
         try
         {
             switch (FileTypes.Detect(name.ToLowerInvariant()))
             {
                 case RpfFileKind.Drawable:
                     var ydr = RpfFile.GetResourceFile<YdrFile>(data);
+                    ownerFile = ydr;
                     if (ydr?.Drawable != null) result.Add(new NamedDrawable(name, ydr.Drawable));
                     break;
                 case RpfFileKind.DrawableDictionary:
                     var ydd = RpfFile.GetResourceFile<YddFile>(data);
+                    ownerFile = ydd;
                     AddDict(result, ydd?.DrawableDict?.Drawables?.data_items, ydd?.DrawableDict?.Hashes, name);
                     break;
                 case RpfFileKind.Fragment:
                     var yft = RpfFile.GetResourceFile<YftFile>(data);
+                    ownerFile = yft;
                     if (yft?.Fragment?.Drawable != null) result.Add(new NamedDrawable(name, yft.Fragment.Drawable));
                     break;
                 case RpfFileKind.ParticleEffect:
-                    AddYptDrawables(result, RpfFile.GetResourceFile<YptFile>(data));
+                    var ypt = RpfFile.GetResourceFile<YptFile>(data);
+                    ownerFile = ypt;
+                    AddYptDrawables(result, ypt);
                     break;
             }
         }

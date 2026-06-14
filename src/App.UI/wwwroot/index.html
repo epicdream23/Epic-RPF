@@ -112,6 +112,7 @@
                     <button class="chip" id="tgBox">Bounds</button>
                     <button class="chip" id="tgGrid" data-on="1">Grid</button>
                     <button class="chip" id="tgLight" data-on="1">Light</button>
+                    <button class="chip" id="tgSkel" hidden>Skeleton</button>
                     <button class="chip" id="tgTex" hidden>Textures</button>
                     <button class="chip" id="btnFit">Fit</button>
                   </div>
@@ -123,6 +124,22 @@
                 <div class="vp-tex-row" id="vpTexRow"></div>
               </div>
             </div>
+            <!-- Details: materials (with editable shader params) + skeleton tree -->
+            <aside class="vp-details" id="vpDetails" hidden>
+              <div class="vp-mhead-bar">
+                <span class="vp-mhead" id="vpDetailsTitle">Details</span>
+                <button class="panel-toggle" id="vpDetailsToggle" title="Collapse panel">&#x27E9;</button>
+              </div>
+              <div class="vd-tabs" id="vdTabs">
+                <button class="vd-tab on" id="vdTabMats">Materials</button>
+                <button class="vd-tab" id="vdTabSkel" hidden>Skeleton</button>
+                <button class="vd-tab" id="vdTabAnims" hidden>Anims</button>
+              </div>
+              <div class="vd-body" id="vdBody"></div>
+              <div class="vd-foot">
+                <button class="btn ghost sm" id="btnAddYtd" title="Resolve textures from any .ytd you pick">+ Textures from .ytd…</button>
+              </div>
+            </aside>
             <!-- Fullscreen texture browser (hides the models + viewer) -->
             <div class="vp-texfull" id="vpTexFull" hidden>
               <div class="vp-texfull-head">
