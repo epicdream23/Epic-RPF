@@ -1177,7 +1177,7 @@ public sealed class Bridge
             if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
                 && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh) { fe = fresh; mc.Entry = fresh; }
 
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
             else if (!string.IsNullOrEmpty(mc.DiskPath)) { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
             else { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "no writable destination" }); return; }
 
@@ -1599,10 +1599,25 @@ public sealed class Bridge
             Texture? oldTex = list.FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
             if (oldTex == null && r.Index >= 0 && r.Index < list.Count) oldTex = list[r.Index];
 
-            // Build the replacement texture from the imported DDS (or encode RGBA first).
+            // Build the replacement texture. r.Content carries the raw imported file bytes:
+            // a .dds is used as-is; any image (PNG/JPG/…) is decoded SERVER-SIDE (straight
+            // alpha, preserving transparent-pixel colour — the browser canvas zeroed it,
+            // which is why a transparent PNG came in solid black) then encoded to DDS.
+            // r.Rgba is a legacy fallback (pre-decoded pixels from the old canvas path).
             byte[] ddsBytes;
             if (!string.IsNullOrEmpty(r.Content))
-                ddsBytes = Convert.FromBase64String(r.Content);
+            {
+                byte[] raw = Convert.FromBase64String(r.Content);
+                bool isDds = raw.Length > 4 && raw[0] == 0x44 && raw[1] == 0x44 && raw[2] == 0x53 && raw[3] == 0x20; // "DDS "
+                if (isDds) ddsBytes = raw;
+                else
+                {
+                    var rgba = ImageUtil.RgbaFromImage(raw, out int iw, out int ih)
+                               ?? throw new Exception("could not decode the imported image — use PNG/JPG/BMP or a .dds");
+                    string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
+                    ddsBytes = TextureCodec.EncodeDds(rgba, iw, ih, fmt, true);
+                }
+            }
             else
             {
                 byte[] rgba = Convert.FromBase64String(r.Rgba ?? "");
@@ -1626,7 +1641,7 @@ public sealed class Bridge
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             // Point the display cache at the new dict so thumbnails reflect the edit.
@@ -1681,7 +1696,7 @@ public sealed class Bridge
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             mc.LocalDict = dict;
@@ -2009,12 +2024,10 @@ public sealed class Bridge
         {
             if (r.Format == "meta")
             {
-                var doc = new XmlDocument();
-                doc.LoadXml(content);
-                var fmt = XmlMeta.GetXMLFormat((r.MetaName ?? fileName + ".xml").ToLowerInvariant(), out _);
+                string metaName = r.MetaName ?? fileName + ".xml";
                 string ddsDir = _xmlDdsDirs.TryGetValue(r.Node, out var dd) ? dd : "";
-                data = XmlMeta.GetData(doc, fmt, ddsDir);
-                if (data == null || data.Length == 0) throw new Exception("conversion produced no data");
+                data = MetaXmlConvert.Convert(content, metaName, ddsDir, out string? cerr)
+                       ?? throw new Exception(cerr ?? "conversion produced no data");
             }
             else data = new UTF8Encoding(false).GetBytes(content);
         }
@@ -2026,7 +2039,7 @@ public sealed class Bridge
 
         try
         {
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfFile.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
             else { MarkSelfWrite(di!.Path); File.WriteAllBytes(di.Path, data); }
             Send(new { type = "saved", reqId = r.Id, ok = true, target = "rpf", size = data.Length });
         }
@@ -2327,7 +2340,7 @@ public sealed class Bridge
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
                 MarkSelfWrite(SafePhysical(dir!.File));
-                RpfFile.CreateFile(dir!, name, data, true);
+                RpfSafeWrite.CreateFile(dir!, name, data, true);
             }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "ytd", name });
         }
@@ -2351,13 +2364,12 @@ public sealed class Bridge
             {
                 // trimlength recovers the original name: ".ydr.xml"->4 (name.ydr),
                 // ".pso.xml"->8 (a ymt exported as name.ymt.pso.xml -> name.ymt).
-                var fmt = XmlMeta.GetXMLFormat(name.ToLowerInvariant(), out int trim);
+                XmlMeta.GetXMLFormat(name.ToLowerInvariant(), out int trim);
                 outName = name.Length > trim ? name.Substring(0, name.Length - trim) : name;
-                var doc = new XmlDocument();
-                doc.LoadXml(r.Content ?? "");
-                data = XmlMeta.GetData(doc, fmt, "");
-                if (data == null || data.Length == 0)
-                    throw new Exception("XML conversion produced no data (embedded-texture resources also need their .dds folder)");
+                // Robust convert: tries the name's format, falls back to PSO/RBF when the
+                // name is ambiguous, and reports a clear error instead of a raw NRE.
+                data = MetaXmlConvert.Convert(r.Content ?? "", name, "", out string? cerr)
+                       ?? throw new Exception(cerr ?? "XML conversion produced no data (embedded-texture resources also need their .dds folder)");
             }
             else
             {
@@ -2371,7 +2383,7 @@ public sealed class Bridge
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
                 MarkSelfWrite(SafePhysical(dir!.File));
-                RpfFile.CreateFile(dir!, outName, data, true);
+                RpfSafeWrite.CreateFile(dir!, outName, data, true);
             }
             RescanIfArchive(outName);
             Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = data.Length });
@@ -2408,7 +2420,7 @@ public sealed class Bridge
                     throw new Exception($"{name} is {len / 1048576:N0} MB — too large for an archive entry. Import it into a normal folder instead.");
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
                 MarkSelfWrite(SafePhysical(dir!.File));
-                RpfFile.CreateFile(dir!, name, File.ReadAllBytes(src), true);
+                RpfSafeWrite.CreateFile(dir!, name, File.ReadAllBytes(src), true);
             }
             RescanIfArchive(name);
             Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len });
@@ -2762,7 +2774,7 @@ public sealed class Bridge
             {
                 var parent = Parent()!;
                 MarkSelfWrite(SafePhysical(parent.File));
-                RpfFile.CreateFile(parent, e.Name, File.ReadAllBytes(e.TrashPath), true);
+                RpfSafeWrite.CreateFile(parent, e.Name, File.ReadAllBytes(e.TrashPath), true);
                 try { File.Delete(e.TrashPath); } catch { }
                 RescanIfArchive(e.Name);
                 break;
@@ -2787,7 +2799,7 @@ public sealed class Bridge
     private static void ImportDir(RpfDirectoryEntry dir, string diskFolder)
     {
         foreach (var f in Directory.GetFiles(diskFolder))
-            try { RpfFile.CreateFile(dir, Path.GetFileName(f), File.ReadAllBytes(f), true); } catch { }
+            try { RpfSafeWrite.CreateFile(dir, Path.GetFileName(f), File.ReadAllBytes(f), true); } catch { }
         foreach (var d in Directory.GetDirectories(diskFolder))
             try { ImportDir(RpfFile.CreateDirectory(dir, Path.GetFileName(d)), d); } catch { }
     }
@@ -2923,7 +2935,7 @@ public sealed class Bridge
             using var ms = new MemoryStream();
             using (var w = XmlWriter.Create(ms, new XmlWriterSettings { Indent = true, Encoding = new UTF8Encoding(false) }))
                 doc.Save(w);
-            RpfFile.CreateFile(host.Root, cxEntry.Name, ms.ToArray(), true);
+            RpfSafeWrite.CreateFile(host.Root, cxEntry.Name, ms.ToArray(), true);
             return "added content override → " + cpath;
         }
         catch (Exception ex) { return "content override failed: " + ex.Message; }

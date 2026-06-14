@@ -78,7 +78,7 @@ public static class GameFs
             if (Entry(man, vpath) is RpfFileEntry fe)
             {
                 NgEncrypt.EnsureFor(fe.File);
-                var created = RpfFile.CreateFile(fe.Parent, fe.Name, data, true);
+                var created = RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true);
                 Register(man, created);   // CreateFile replaces the entry object; keep GetEntry in sync
                 return true;
             }
@@ -92,7 +92,7 @@ public static class GameFs
             if (dir != null)
             {
                 NgEncrypt.EnsureFor(dir.File);
-                var created = RpfFile.CreateFile(dir, leaf, data, true);
+                var created = RpfSafeWrite.CreateFile(dir, leaf, data, true);
                 Register(man, created);   // make the new entry visible to GetEntry within this session
                 return true;
             }

@@ -2,6 +2,27 @@ Epic RPF — Changelog
 ====================
 
 
+Version 3.1.0  (2026-06-14)
+---------------------------
+
+Fixes & safety:
+  * Write protection — every change written into a .rpf archive is now validated
+    first and refused, with a clear reason, if it would corrupt the archive or
+    crash the game. This catches writes that would push a file past the RPF
+    ~4.3 GB resource / ~8.6 GB offset limit (which silently truncates the file
+    table and wrecks the whole archive), and .ypt/.ytd resources carrying an
+    invalid / sRGB texture format. A bad edit can no longer silently break
+    update.rpf.
+  * Importing XML / meta is far more robust. Files whose name doesn't carry the
+    full format hint (e.g. a PSO meta saved plainly as .xml) now convert correctly
+    instead of failing with "Object reference not set to an instance of an
+    object", and a genuine type mismatch now reports a clear, actionable message.
+  * Importing a PNG (or other image) as a texture keeps its real colours. Images
+    are now decoded directly with straight alpha instead of through the browser
+    canvas, which was zeroing the colour of transparent pixels and could turn an
+    image solid black.
+
+
 Version 3.0.0  (2026-06-14)
 ---------------------------
 

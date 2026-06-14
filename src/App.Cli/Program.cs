@@ -293,16 +293,14 @@ int Put(string vpath, string? src)
             string xmlName;
             try { _ = MetaXml.GetXml(fe, current, out xmlName); }
             catch (Exception ex) { Console.Error.WriteLine("target has no XML mapping: " + ex.Message); return 3; }
-            var fmt = XmlMeta.GetXMLFormat(xmlName.ToLowerInvariant(), out _);
-            var doc = new XmlDocument();
-            doc.LoadXml(Encoding.UTF8.GetString(input));
-            data = XmlMeta.GetData(doc, fmt, ddsDir ?? "");
-            if (data == null || data.Length == 0) { Console.Error.WriteLine("XML conversion produced no data (resources with embedded textures need --dds)"); return 3; }
+            var conv = MetaXmlConvert.Convert(Encoding.UTF8.GetString(input), xmlName, ddsDir ?? "", out string? cerr);
+            if (conv == null || conv.Length == 0) { Console.Error.WriteLine(cerr ?? "XML conversion produced no data (resources with embedded textures need --dds)"); return 3; }
+            data = conv;
         }
         try
         {
             NgEncrypt.EnsureFor(fe.File, s => Console.Error.WriteLine(s));   // NG archives need encrypt tables
-            RpfFile.CreateFile(fe.Parent, fe.Name, data, true);
+            RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true);
             Console.WriteLine($"wrote {data.Length:N0} b -> {fe.Path}");
             return 0;
         }
@@ -322,7 +320,7 @@ int Put(string vpath, string? src)
         try
         {
             NgEncrypt.EnsureFor(dir.File, s => Console.Error.WriteLine(s));
-            RpfFile.CreateFile(dir, leaf, input, true);
+            RpfSafeWrite.CreateFile(dir, leaf, input, true);
             Console.WriteLine($"created {input.Length:N0} b -> {dir.Path}\\{leaf}");
             return 0;
         }

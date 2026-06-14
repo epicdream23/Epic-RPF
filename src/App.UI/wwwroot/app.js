@@ -844,15 +844,10 @@ function replaceTexturePrompt(node, index, name) {
     const f = inp.files && inp.files[0];
     if (!f) return;
     try {
+      // Send the raw file bytes; the host detects .dds vs image and decodes images
+      // server-side (preserves transparent-pixel colour — the canvas decode blacked it out).
       const buf = new Uint8Array(await f.arrayBuffer());
-      const isDds = /\.dds$/i.test(f.name) ||
-        (buf.length > 4 && buf[0] === 0x44 && buf[1] === 0x44 && buf[2] === 0x53 && buf[3] === 0x20); // "DDS "
-      let payload;
-      if (isDds) payload = { node, index, name, content: bytesToB64(buf) };
-      else {
-        const { rgba, w, h } = await imageFileToRgba(f);
-        payload = { node, index, name, rgba: bytesToB64(rgba), w, h };
-      }
+      const payload = { node, index, name, content: bytesToB64(buf) };
       setStatus(`Replacing ${name}…`);
       const res = await withProgress(call('replaceTexture', payload), 250);
       if (res.ok) { setStatus(`Replaced ${res.name} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
@@ -925,15 +920,9 @@ function dropTargetName() {
 async function importDroppedTexture(node, file) {
   const baseName = file.name.replace(/\.[^.]+$/, '').toLowerCase();
   try {
+    // Raw bytes; the host decodes images server-side (keeps transparent-pixel colour).
     const buf = new Uint8Array(await file.arrayBuffer());
-    const isDds = /\.dds$/i.test(file.name) ||
-      (buf.length > 4 && buf[0] === 0x44 && buf[1] === 0x44 && buf[2] === 0x53 && buf[3] === 0x20); // "DDS "
-    let payload;
-    if (isDds) payload = { node, name: baseName, index: -1, content: bytesToB64(buf) };
-    else {
-      const { rgba, w, h } = await imageFileToRgba(file);
-      payload = { node, name: baseName, index: -1, rgba: bytesToB64(rgba), w, h };
-    }
+    const payload = { node, name: baseName, index: -1, content: bytesToB64(buf) };
     setStatus(`Importing ${baseName}…`);
     const res = await withProgress(call('replaceTexture', payload), 250);
     if (res.ok) { setStatus(`Imported ${res.name} into ${dropTargetName()} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
