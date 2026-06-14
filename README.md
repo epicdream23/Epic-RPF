@@ -1,11 +1,33 @@
-Epic RPF is a Codewalker.Core.dll based program for viweing and editing .rpf7 Archieves. It brings new tools that are missing in Codewalker as well as OpenIV and combines some into one. It significantly imrpoves speed since the front end UI is build using HTML. 
+Epic RPF is a CodeWalker.Core.dll–based program for viewing and editing .rpf7 archives. It brings new tools that are missing in CodeWalker and OpenIV, and combines several of them into one. It's significantly faster because the front-end UI is built with HTML.
 
-
-There will be aded more in the future updates, please check ou tmy Discord:
+More will be added in future updates — please check out my Discord:
 
 https://discord.gg/FZw6ChbFbp
 
-There is a designated channel for bugs and new features you would like to see.
+There's a designated channel for bugs and new features you'd like to see.
+
+## 3D viewer, textures & animations
+
+Open a `.ydr` / `.ydd` / `.yft` / `.ypt` and it renders in a WebGL viewport — orbit
+camera, LOD switching, and per-part navigation.
+
+- **Materials** — Phong shading with normal / specular / emissive maps. The **Materials**
+  tab lists every shader with its parameters; edit them and the changes save straight back
+  into the model. You can also point the viewer at your own `.ytd` files for textures.
+- **Skeleton** — the **Skeleton** tab shows a model's bone hierarchy with a live overlay
+  that follows the current pose.
+- **Vehicle additions** — toggle a car's optional extra parts (bull-bars, roof racks and
+  the like) on and off from the Materials tab.
+- **Animations** — the **Anims** tab plays GTA animations (`.ycd`). It automatically finds
+  the animation dictionaries that belong to a model, lists every clip, and plays them with
+  play/pause, a scrub bar and speed control; or browse to any `.ycd` yourself. Tick
+  **Show character** on a weapon to load a full freemode character holding it, so movement /
+  aim / reload / idle clips play on a whole body — with a live **Grip adjust** panel
+  (position + rotation, remembered between sessions) to seat the weapon exactly in the hand.
+
+Textures (`.ytd` / `.ypt`) open in a grid you can preview, replace/import (images or DDS,
+drag-and-drop), and delete from. Metas and XML open in a built-in editor with binary↔XML
+round-trip, and Scaleform (`.gfx`) files have their own viewer.
 
 ## rpfcli — headless file access (for scripts & coding agents)
 
@@ -71,10 +93,11 @@ extensions are only added to the *Open with* list so the user's other tools aren
 You can also **delete an individual texture** from a `.ytd`/`.ypt` — right-click it in the
 texture grid → **Delete texture**; the dictionary is rebuilt and saved in place.
 
-TODO:
+## Roadmap
 
- Add ydr übergreifende files (auto mods optional auf einem auto anmachen)
- 
- 3d Viewer überarbeiten skeletons, materials
- 
- ydr anims mit ycd (animations) verknüfen
+Shipped in v3.0.0 (see `changelog.txt`):
+ - ✅ Toggleable vehicle additions (optional car mods you can switch on per car)
+ - ✅ Reworked 3D viewer — skeletons & materials
+ - ✅ Linked `.ydr`/weapon models to `.ycd` animations (playback)
+
+Got an idea? The Discord has a channel for feature requests.
