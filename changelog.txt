@@ -2,6 +2,22 @@ Epic RPF — Changelog
 ====================
 
 
+Version 3.1.2  (2026-06-16)
+---------------------------
+
+Fixes:
+  * You no longer get kicked back to the GTA V root when a file changes on disk
+    (e.g. dragging in a new .rpf, or any external change that triggers a reload).
+    The explorer now stays exactly in the folder you were in — re-finding it in
+    the freshly reloaded archives — instead of resetting to the top.
+  * Importing an exported XML that has embedded textures now works. Drawable /
+    resource XML (.ydr / .ydd / .yft / .ypt) reference their textures by name and
+    expect the .dds files alongside; the import now reads the XML straight from
+    disk and pulls those textures from the sibling folder (the way CodeWalker
+    does), so it no longer fails with "Object reference not set to an instance of
+    an object". Textureless metas still import as before.
+
+
 Version 3.1.0  (2026-06-14)
 ---------------------------
 

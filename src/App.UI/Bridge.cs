@@ -2405,6 +2405,27 @@ public sealed class Bridge
         string name = string.IsNullOrWhiteSpace(r.Name) ? Path.GetFileName(src) : r.Name.Trim();
         try
         {
+            // XML re-import: read from disk and convert to binary, resolving any embedded
+            // textures from the sidecar folder. CodeWalker exports a resource's .dds into a
+            // sibling "<name>/" folder (e.g. bridge.ydr.xml -> bridge/clear.dds); fall back to
+            // the XML's own folder. This is why importing a textured .ydr/.ydd/.yft/.ypt only
+            // works by PATH — the content-only path has no folder to find the .dds in.
+            if (r.As == "xml")
+            {
+                string xml = File.ReadAllText(src);
+                XmlMeta.GetXMLFormat(name.ToLowerInvariant(), out int trim);
+                string outName = name.Length > trim ? name[..^trim] : name;
+                string xmlDir = Path.GetDirectoryName(Path.GetFullPath(src)) ?? "";
+                string sub = Path.Combine(xmlDir, Path.GetFileNameWithoutExtension(outName));
+                string ddsDir = Directory.Exists(sub) ? sub : xmlDir;
+                byte[] xdata = MetaXmlConvert.Convert(xml, name, ddsDir, out string? cerr)
+                               ?? throw new Exception(cerr ?? "XML conversion produced no data");
+                if (disk != null) { string p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, xdata); }
+                else { if (PrepareArchiveWrite(dir!) is string we) throw new Exception(we); MarkSelfWrite(SafePhysical(dir!.File)); RpfSafeWrite.CreateFile(dir!, outName, xdata, true); }
+                RescanIfArchive(outName);
+                Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = xdata.Length });
+                return;
+            }
             long len = new FileInfo(src).Length;
             if (disk != null)
             {

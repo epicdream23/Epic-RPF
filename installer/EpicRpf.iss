@@ -11,7 +11,7 @@
 ;     "Install for all users" remains available via the privileges dialog.
 
 #define MyAppName "Epic RPF"
-#define MyAppVersion "3.1.0"
+#define MyAppVersion "3.1.2"
 #define MyAppPublisher "Epic RPF"
 #define MyAppExeName "EpicRpf.exe"
 

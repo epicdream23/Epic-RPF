@@ -1954,7 +1954,11 @@ async function handleDroppedFile(file, srcPath) {
     else await epicInstallFromBytes(new Uint8Array(await file.arrayBuffer()));
     return;
   }
-  if (XML_REIMPORT_RE.test(lower)) { await importDroppedFile(file, true); return; }      // XML export -> original binary (small, text)
+  if (XML_REIMPORT_RE.test(lower)) {                                                      // XML export -> original binary
+    if (srcPath) await importByPath(srcPath, file.name, true);                            // by PATH so sidecar .dds textures resolve (ydr/ydd/yft/ypt)
+    else await importDroppedFile(file, true);                                             // content fallback (textureless metas only)
+    return;
+  }
   const tnode = dropTargetNode();
   if (tnode != null && TEXTURE_RE.test(lower)) { await importDroppedTexture(tnode, file); return; }  // texture into ytd/ypt
   if (srcPath) { await importByPath(srcPath, file.name); return; }                        // raw file by PATH (any size)
@@ -1962,11 +1966,11 @@ async function handleDroppedFile(file, srcPath) {
 }
 
 // Path-based raw import — the host reads the source straight from disk.
-async function importByPath(srcPath, name) {
+async function importByPath(srcPath, name, asXml = false) {
   const folder = currentFolder();
   if (!folder) { setStatus('Mount a folder before importing files', true); return; }
   setStatus(`Importing ${name}…`);
-  const res = await withProgress(call('importPath', { node: folder.id, path: folder.path, name, srcPath }), 0);
+  const res = await withProgress(call('importPath', { node: folder.id, path: folder.path, name, srcPath, as: asXml ? 'xml' : undefined }), 0);
   if (res.ok) { setStatus(`Imported ${res.name} into ${folder.name} (${fmtSize(res.size)})${res.note ? ' — ' + res.note : ''}`); await refreshCurrent(); }
   else setStatus('Import failed: ' + (res.message || ''), true);
 }
@@ -2265,12 +2269,30 @@ function confirmDialog({ title, body, okLabel = 'OK' }) {
 }
 
 // ---- live file watching ----
+// A remount swaps the whole archive graph, so the node ids in our breadcrumb go stale.
+// Re-resolve the same path against the fresh tree (by stable path/name) so the user stays
+// exactly where they were instead of getting kicked back to the GTA V root.
+async function reResolveCrumbs(old) {
+  if (!old || !old.length) return [{ id: 0, name: rootName }];
+  const out = [old[0]];                                  // root: id 0 is stable
+  for (let i = 1; i < old.length; i++) {
+    const kids = await getChildren(out[out.length - 1].id);
+    const want = old[i];
+    const m = kids.find(k => k.container && (k.path === want.path || k.name === want.name));
+    if (!m) break;                                       // that folder/archive no longer exists — stop at the deepest still-valid one
+    out.push({ id: m.id, name: m.name, path: m.path });
+  }
+  return out;
+}
 async function onFsChange(m) {
   if (m.remount) {
     mountRoots = m.roots || mountRoots;
     childrenCache.clear();
     buildTree(mountRoots);
-    if (activeTab && activeTab.kind === 'explorer' && !searchActive) navigate([{ id: 0, name: rootName }]);
+    const target = await reResolveCrumbs(explorer.crumbs);
+    if (navPos >= 0 && navPos < navHist.length) navHist[navPos] = target;   // keep Back/Fwd ids valid
+    explorer.crumbs = target;                                               // valid even if the explorer isn't the active tab right now
+    if (activeTab && activeTab.kind === 'explorer' && !searchActive) await doNavigate(target);
     setStatus('Reloaded — an archive changed on disk');
   } else {
     refreshCurrent();
