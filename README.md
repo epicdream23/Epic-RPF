@@ -29,6 +29,15 @@ Textures (`.ytd` / `.ypt`) open in a grid you can preview, replace/import (image
 drag-and-drop), and delete from. Metas and XML open in a built-in editor with binary↔XML
 round-trip, and Scaleform (`.gfx`) files have their own viewer.
 
+## CodeWalker world editor
+
+New in **v4.0** — a **🗺 CodeWalker** button in the toolbar launches the full
+[CodeWalker](https://github.com/dexyfex/CodeWalker) world editor, **bundled and ready to
+go** (no separate download or build). Fly around the entire GTA V map — streamed live from
+your real game files — and select and export world objects and interiors (MLOs). A few
+extras are layered on top: one-click tools to gather and lay out every MLO side-by-side for
+inspection, and a performance dialog to tune how much RAM and how many CPU/GPU cores it uses.
+
 ## rpfcli — headless file access (for scripts & coding agents)
 
 `src/App.Cli` builds `rpfcli.exe`, a command-line tool that views and edits any file in
@@ -90,12 +99,20 @@ needed. After that:
 `.epic` files are set as the default for that extension (it's our own format); game
 extensions are only added to the *Open with* list so the user's other tools aren't hijacked.
 
-You can also **delete an individual texture** from a `.ytd`/`.ypt` — right-click it in the
-texture grid → **Delete texture**; the dictionary is rebuilt and saved in place.
+You can also **delete textures** from a `.ytd`/`.ypt` — select one or several in the grid
+(click, Ctrl-click, Shift-click) and press Delete, or right-click → **Delete texture**; the
+dictionary is rebuilt and saved in place. In-archive edits — even inside the ~2 GB
+`update.rpf` — are written reliably, the file list updates live as soon as a change lands,
+and a **⟳ Reload** button force-re-reads everything from disk if you ever want it.
 
 ## Roadmap
 
-Shipped in v3.0.0 (see `changelog.txt`):
+Shipped in v4.0.0 (see `changelog.txt`):
+ - ✅ Bundled CodeWalker world editor (fly the map, select/export objects & MLOs)
+ - ✅ Rock-solid in-archive texture editing — multi-select delete, live view updates
+ - ✅ Rename `.rpf` archives; much faster drag-in; `.rpf` file sizes shown in the list
+
+Earlier (v3.x):
  - ✅ Toggleable vehicle additions (optional car mods you can switch on per car)
  - ✅ Reworked 3D viewer — skeletons & materials
  - ✅ Linked `.ydr`/weapon models to `.ycd` animations (playback)
