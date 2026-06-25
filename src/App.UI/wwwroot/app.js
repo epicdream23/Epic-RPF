@@ -31,6 +31,8 @@ window.chrome.webview.addEventListener('message', ev => {
     r(m);
   } else if (m && m.type === 'fschange') {
     onFsChange(m);
+  } else if (m && m.type === 'fileUpdated') {
+    onFileUpdated(m);
   } else if (m && m.type === 'dragOutDone') {
     // Our own OLE drag finished; ignore drop events for a moment — a drop back onto
     // our own window arrives as a normal HTML drop and must NOT be re-imported.
@@ -172,10 +174,12 @@ browseBtn.onclick = async () => { const res = await call('pickFolder'); if (res.
 mountBtn.onclick = mount;
 folderInput.addEventListener('keydown', e => { if (e.key === 'Enter') mount(); });
 
-async function getChildren(id) {
+async function getChildren(id, path) {
   if (id === 0) return mountRoots;
   if (childrenCache.has(id)) return childrenCache.get(id);
-  const res = await call('expand', { node: id });
+  // Pass the stable path too: a background remount recycles node ids, so the host
+  // re-resolves a stale id by path instead of handing back an empty (dead) folder.
+  const res = await call('expand', { node: id, path });
   childrenCache.set(id, res.nodes || []);
   return childrenCache.get(id);
 }
@@ -219,7 +223,7 @@ async function toggleTree(el) {
   if (!n.expandable) return;
   if (!el.__loaded) {
     const kids = el.querySelector('.children');
-    for (const c of await getChildren(n.id)) if (c.container) kids.appendChild(makeTreeNode(c, el.__depth + 1));
+    for (const c of await getChildren(n.id, n.path)) if (c.container) kids.appendChild(makeTreeNode(c, el.__depth + 1));
     el.__loaded = true;
   }
   el.classList.toggle('open');
@@ -319,7 +323,7 @@ async function doNavigate(crumbs) {
   clearSelection();
   explorer.crumbs = crumbs;
   const last = crumbs[crumbs.length - 1];
-  explorer.items = await getChildren(last.id);
+  explorer.items = await getChildren(last.id, last.path);
   ensureExplorerTab();
   activate(explorerTab);
   updateNavButtons();
@@ -483,7 +487,8 @@ function makeRow(it) {
   const row = document.createElement('div');
   row.className = 'row-item'; row.__node = it;
   if (viewMode === 'details') {
-    const sizeText = it.container
+    // RPF archives show their file size (like a file); plain folders show their item count.
+    const sizeText = (it.container && it.kind !== 'archive')
       ? (it.count != null ? `${it.count} item${it.count === 1 ? '' : 's'}` : '')
       : (it.size >= 0 ? fmtSize(it.size) : '');
     const lc = isEpicNode(it) ? 'label epic-glow' : 'label';
@@ -514,13 +519,18 @@ function makeRow(it) {
 let dragRow = null;
 function beginRowDrag(it, e) {
   if (e.button !== 0) return;
-  dragRow = { it, x: e.clientX, y: e.clientY };
+  dragRow = { it, x: e.clientX, y: e.clientY, t: performance.now() };
 }
 window.addEventListener('pointermove', e => {
   if (!dragRow) return;
   if (!(e.buttons & 1)) { dragRow = null; return; }     // button released — not a drag
   // Generous threshold: a tiny wiggle while clicking must not start an OS drag.
   if (Math.abs(e.clientX - dragRow.x) + Math.abs(e.clientY - dragRow.y) < 14) return;
+  // Time gate: the first press of a double-click is brief, but a jittery one can cross
+  // the distance threshold. A real drag-out is a sustained press+move, so only arm once
+  // the button has been held a moment — this stops a double-click on a folder from
+  // launching a native OS drag that swallows the gesture (folder then "won't open").
+  if (performance.now() - dragRow.t < 120) return;
   const it = dragRow.it; dragRow = null;
   const set = (isSelected(it) && selection.length > 1) ? selection : [it];
   const ids = set.filter(n => n && n.id !== 0 &&
@@ -819,12 +829,12 @@ const texObserver = new IntersectionObserver(es => {
   for (const e of es) if (e.isIntersecting) { texObserver.unobserve(e.target); loadTexThumb(e.target); }
 }, { rootMargin: '150px' });
 async function loadTexThumb(ph) {
-  const res = await call('texImage', { node: ph.__node, index: ph.__index });
+  const res = await call('texImage', { node: ph.__node, index: ph.__index, hash: ph.__hash });
   if (res && res.img) { ph.style.backgroundImage = `url("${res.img}")`; ph.textContent = ''; ph.classList.remove('noimg'); ph.__img = res.img; }
   else { ph.classList.add('noimg'); ph.textContent = 'no preview'; }
 }
 function texThumb(t, node, cls) {
-  const ph = document.createElement('div'); ph.className = cls + ' checker'; ph.__node = node; ph.__index = t.index;
+  const ph = document.createElement('div'); ph.className = cls + ' checker'; ph.__node = node; ph.__index = t.index; ph.__hash = t.hash;
   texObserver.observe(ph);
   return ph;
 }
@@ -836,7 +846,7 @@ function openTexImageUrl(name, fmt, img) {
 // Pick an image or .dds; a .dds imports as-is, an image is re-encoded server-side to
 // the original texture's format. The replaced texture keeps its name so the model
 // keeps referencing it. The new bytes are written straight back into the archive.
-function replaceTexturePrompt(node, index, name) {
+function replaceTexturePrompt(node, index, name, hash) {
   const inp = document.createElement('input');
   inp.type = 'file';
   inp.accept = '.dds,image/png,image/jpeg,image/bmp,image/webp,image/*';
@@ -847,11 +857,11 @@ function replaceTexturePrompt(node, index, name) {
       // Send the raw file bytes; the host detects .dds vs image and decodes images
       // server-side (preserves transparent-pixel colour — the canvas decode blacked it out).
       const buf = new Uint8Array(await f.arrayBuffer());
-      const payload = { node, index, name, content: bytesToB64(buf) };
+      const payload = { node, index, name, hash, content: bytesToB64(buf) };
       setStatus(`Replacing ${name}…`);
       const res = await withProgress(call('replaceTexture', payload), 250);
       if (res.ok) { setStatus(`Replaced ${res.name} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
-      else setStatus('Replace failed: ' + (res.message || ''), true);
+      else { setStatus('Replace failed', true); infoDialog('Replace failed', res.message || 'Unknown error.'); }
     } catch (e) { setStatus('Replace failed: ' + e.message, true); }
   };
   inp.click();
@@ -888,17 +898,17 @@ function applyReplacedTextures(node, textures) {
 function texMenu(node, t, ev, ph, fmt) {
   ev.preventDefault(); ev.stopPropagation();
   showMenu([
-    { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name) },
-    { label: 'Delete texture', action: () => deleteTexture(node, t.index, t.name) },
+    { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name, t.hash) },
+    { label: 'Delete texture', action: () => deleteTexture(node, t.index, t.name, t.hash) },
     { sep: true },
     { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
   ], ev.clientX, ev.clientY);
 }
-async function deleteTexture(node, index, name) {
+async function deleteTexture(node, index, name, hash) {
   const yes = await confirmDialog({ title: 'Delete texture', body: `Remove “${name}” from this dictionary? This rewrites the file.`, okLabel: 'Delete' });
   if (!yes) return;
   setStatus(`Deleting ${name}…`);
-  const res = await call('deleteTexture', { node, index, name });
+  const res = await call('deleteTexture', { node, index, name, hash });
   if (res.ok) { setStatus(`Deleted ${name} (${res.count} left)`); applyReplacedTextures(res.node, res.textures); }
   else setStatus('Delete failed: ' + (res.message || ''), true);
 }
@@ -926,7 +936,7 @@ async function importDroppedTexture(node, file) {
     setStatus(`Importing ${baseName}…`);
     const res = await withProgress(call('replaceTexture', payload), 250);
     if (res.ok) { setStatus(`Imported ${res.name} into ${dropTargetName()} (${fmtSize(res.size)})`); applyReplacedTextures(res.node, res.textures); }
-    else setStatus('Import failed: ' + (res.message || ''), true);
+    else { setStatus('Import failed', true); infoDialog('Import failed', res.message || 'Unknown error.'); }
   } catch (e) { setStatus('Import failed: ' + e.message, true); }
 }
 
@@ -1456,20 +1466,63 @@ function renderHex(res) {
   }
   $('hexBody').textContent = lines.join('\n') + (res.total > res.shown ? `\n\n… ${(res.total - res.shown).toLocaleString()} more bytes (truncated)` : '');
 }
+// ---- .ytd texture grid with multi-select + batch delete ----
+let texSel = new Set();     // selected texture hashes in the active grid
+let texSelAnchor = -1;      // index anchor for shift-range
+let texGridData = null;     // { node, textures } currently shown
+
 function renderTextures(res) {
+  texGridData = res;
   const g = $('texGrid'); g.innerHTML = '';
+  // keep only selections that still exist (after an edit re-renders)
+  const have = new Set(res.textures.map(t => t.hash));
+  texSel = new Set([...texSel].filter(h => have.has(h)));
   if (!res.textures.length) { g.innerHTML = '<div class="muted" style="padding:14px">No textures.</div>'; return; }
-  for (const t of res.textures) {
+  res.textures.forEach((t, i) => {
     const fmt = (t.format || '').replace('D3DFMT_', '');
-    const c = document.createElement('div'); c.className = 'tex-card';
+    const c = document.createElement('div'); c.className = 'tex-card'; c.dataset.hash = t.hash;
+    if (texSel.has(t.hash)) c.classList.add('sel');
     const ph = texThumb(t, res.node, 'preview');
     const tn = document.createElement('div'); tn.className = 'tn'; tn.textContent = t.name;
     const td = document.createElement('div'); td.className = 'td'; td.textContent = `${t.width}×${t.height} · ${fmt} · ${t.levels} mip${t.levels === 1 ? '' : 's'}`;
     c.append(ph, tn, td);
-    c.onclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };
-    c.oncontextmenu = ev => texMenu(res.node, t, ev, ph, fmt);
+    c.onclick = ev => onTexCardClick(ev, res, t, i);                 // click selects (ctrl/shift = multi)
+    c.ondblclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };  // open preview
+    c.oncontextmenu = ev => texGridMenu(res.node, t, ev, ph, fmt);
     g.appendChild(c);
+  });
+}
+function onTexCardClick(ev, res, t, i) {
+  if (ev.ctrlKey || ev.metaKey) { texSel.has(t.hash) ? texSel.delete(t.hash) : texSel.add(t.hash); texSelAnchor = i; }
+  else if (ev.shiftKey && texSelAnchor >= 0) {
+    const [a, b] = texSelAnchor <= i ? [texSelAnchor, i] : [i, texSelAnchor];
+    for (let k = a; k <= b; k++) texSel.add(res.textures[k].hash);
   }
+  else { texSel = new Set([t.hash]); texSelAnchor = i; }
+  for (const c of $('texGrid').querySelectorAll('.tex-card')) c.classList.toggle('sel', texSel.has(c.dataset.hash));
+}
+function texGridMenu(node, t, ev, ph, fmt) {
+  ev.preventDefault(); ev.stopPropagation();
+  if (!texSel.has(t.hash)) { texSel = new Set([t.hash]); texSelAnchor = -1; for (const c of $('texGrid').querySelectorAll('.tex-card')) c.classList.toggle('sel', texSel.has(c.dataset.hash)); }
+  const n = texSel.size;
+  showMenu([
+    { label: n > 1 ? `Delete selected (${n})` : 'Delete texture', action: () => deleteSelectedTextures(node) },
+    { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name, t.hash) },
+    { sep: true },
+    { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
+  ], ev.clientX, ev.clientY);
+}
+// Delete every selected texture in one write (instant, persists to the file).
+async function deleteSelectedTextures(node) {
+  const hashes = [...texSel];
+  if (!hashes.length) return;
+  const n = hashes.length;
+  const yes = await confirmDialog({ title: n > 1 ? 'Delete textures' : 'Delete texture', body: `Remove ${n} texture${n > 1 ? 's' : ''} from this dictionary? This rewrites the file.`, okLabel: 'Delete' });
+  if (!yes) return;
+  setStatus(`Deleting ${n} texture${n > 1 ? 's' : ''}…`);
+  const res = await call('deleteTextures', { node, hashes });
+  if (res.ok) { texSel.clear(); setStatus(`Deleted ${res.removed} (${res.count} left)`); applyReplacedTextures(res.node, res.textures); }
+  else { setStatus('Delete failed', true); infoDialog('Delete failed', res.message || 'Unknown error.'); }
 }
 
 // ---------------------------------------------------------------- gfx (Scaleform/SWF) structure viewer
@@ -2201,9 +2254,25 @@ async function rename(node) {
   const r = await promptDialog({ title: 'Rename', label: 'New name', value: cur, okLabel: 'Rename', selectBasename: true });
   if (!r || r.name === cur) return;
   setStatus(`Renaming ${cur}…`);
-  const res = await call('rename', { node: node.id, path: node.path, name: r.name });
-  if (res.ok) { node.name = res.name; setStatus(`Renamed to “${res.name}”`); refreshCurrent(); }
-  else setStatus('Rename failed: ' + (res.message || ''), true);
+  let res = await call('rename', { node: node.id, path: node.path, name: r.name });
+  // NG/AES .rpf archives are keyed by their filename, so renaming as-is would break
+  // them. Offer to convert just that archive to OPEN (loads fine in-game) and rename.
+  if (res.needConvert) {
+    const yes = await confirmDialog({
+      title: 'Convert encryption to rename?',
+      body: `“${cur}” is ${res.encryption}-encrypted — GTA keys these archives by their filename, so renaming it as-is would stop it loading. ` +
+            `Convert it to OPEN encryption (the game loads OPEN archives normally and they aren’t tied to the name), then rename?`,
+      okLabel: 'Convert & rename',
+    });
+    if (!yes) { setStatus('Rename canceled'); return; }
+    setStatus(`Converting & renaming ${cur}…`);
+    res = await call('rename', { node: node.id, path: node.path, name: r.name, convert: true });
+  }
+  if (res.ok) {
+    node.name = res.name;
+    setStatus(res.converted ? `Converted to OPEN and renamed to “${res.name}”` : `Renamed to “${res.name}”`);
+    refreshCurrent();
+  } else setStatus('Rename failed: ' + (res.message || ''), true);
 }
 
 // Re-read the folder currently shown (and the tree roots if at the top level),
@@ -2213,7 +2282,7 @@ async function refreshCurrent() {
   if (last.id === 0) { const res = await call('expand', { node: 0 }); mountRoots = res.nodes || mountRoots; buildTree(mountRoots); }
   else childrenCache.delete(last.id);
   if (activeTab && activeTab.kind === 'explorer' && !searchActive) {
-    explorer.items = await getChildren(last.id);
+    explorer.items = await getChildren(last.id, last.path);
     renderList(explorer.items);
   }
 }
@@ -2268,6 +2337,22 @@ function confirmDialog({ title, body, okLabel = 'OK' }) {
   });
 }
 
+// One-button message dialog — used so import/texture errors are actually seen
+// (not just a small status-bar line that scrolls past).
+function infoDialog(title, body) {
+  return new Promise(resolve => {
+    const ov = document.createElement('div'); ov.className = 'modal';
+    ov.innerHTML = `<div class="modal-card"><h3>${esc(title)}</h3>
+      <p class="muted" style="white-space:normal">${esc(body)}</p>
+      <div class="modal-actions"><button class="btn primary dlg-ok">OK</button></div></div>`;
+    document.body.append(ov);
+    const done = () => { ov.remove(); resolve(); };
+    ov.querySelector('.dlg-ok').onclick = done;
+    ov.onkeydown = e => { if (e.key === 'Escape' || e.key === 'Enter') done(); };
+    ov.querySelector('.dlg-ok').focus();
+  });
+}
+
 // ---- live file watching ----
 // A remount swaps the whole archive graph, so the node ids in our breadcrumb go stale.
 // Re-resolve the same path against the fresh tree (by stable path/name) so the user stays
@@ -2284,15 +2369,47 @@ async function reResolveCrumbs(old) {
   }
   return out;
 }
+// A single file changed (e.g. a texture edit rewrote a .ytd). Recalculate just THAT
+// row's size in place — instant, no folder re-list, no remount. (New files get added by
+// their command's own refresh, so a no-match here is expected and harmless.)
+function onFileUpdated(m) {
+  if (!m || !m.path) return;
+  const p = m.path.toLowerCase();
+  for (const it of explorer.items) if (it.path && it.path.toLowerCase() === p) it.size = m.size;
+  for (const row of document.querySelectorAll('.row-item')) {
+    const it = row.__node;
+    if (it && it.path && it.path.toLowerCase() === p) {
+      it.size = m.size;
+      const sc = row.querySelector('.c-size');
+      if (sc) sc.textContent = (it.container && it.kind !== 'archive')
+        ? (it.count != null ? `${it.count} item${it.count === 1 ? '' : 's'}` : '')
+        : (it.size >= 0 ? fmtSize(it.size) : '');
+      break;
+    }
+  }
+}
+
 async function onFsChange(m) {
   if (m.remount) {
+    // A remount rebuilds the mount and drops the backend model/texture/gfx caches, so any
+    // open texture/model/gfx tab now points at a dead cache key (its content would come up
+    // empty). Close those tabs so the user reopens them fresh against the new mount.
+    for (const t of [...tabs]) if (t.kind === 'texture' || t.kind === 'model' || t.kind === 'gfx') closeTab(t);
     mountRoots = m.roots || mountRoots;
     childrenCache.clear();
     buildTree(mountRoots);
     const target = await reResolveCrumbs(explorer.crumbs);
     if (navPos >= 0 && navPos < navHist.length) navHist[navPos] = target;   // keep Back/Fwd ids valid
-    explorer.crumbs = target;                                               // valid even if the explorer isn't the active tab right now
-    if (activeTab && activeTab.kind === 'explorer' && !searchActive) await doNavigate(target);
+    explorer.crumbs = target;
+    // ALWAYS re-fetch the explorer rows with fresh node ids — the remount cleared the whole
+    // node registry, so if we only refresh the active tab, the explorer's old rows keep dead
+    // node ids and clicking any file later gives "invalid node". Render now if it's visible.
+    if (!searchActive) {
+      const last = target[target.length - 1] || { id: 0, path: '' };
+      childrenCache.delete(last.id);
+      explorer.items = await getChildren(last.id, last.path);
+      if (activeTab && activeTab.kind === 'explorer') renderList(explorer.items);
+    }
     setStatus('Reloaded — an archive changed on disk');
   } else {
     refreshCurrent();
@@ -2303,6 +2420,7 @@ async function onFsChange(m) {
 window.addEventListener('keydown', e => {
   if (activeTab && activeTab.kind === 'edit') return; // don't steal keys from Monaco
   if (e.key === 'Delete' && !e.ctrlKey && !e.altKey) {
+    if (activeTab && activeTab.kind === 'texture' && texSel.size && texGridData) { e.preventDefault(); deleteSelectedTextures(texGridData.node); return; }
     if (selection.length) { e.preventDefault(); deleteNodes(selection); }
     else if (selectedRow && selectedRow.__node) { e.preventDefault(); deleteNode(selectedRow.__node); }
     return;
@@ -2331,6 +2449,19 @@ function fmtSize(b) {
 }
 
 // ---------------------------------------------------------------- window controls
+// Reload everything from disk (brute-force refresh).
+const reloadBtnEl = $('reloadBtn');
+if (reloadBtnEl) reloadBtnEl.onclick = async () => { setStatus('Reloading from disk…'); await withProgress(call('reload')); };
+
+// Launch the bundled CodeWalker world editor (separate tool).
+const cwBtnEl = $('cwBtn');
+if (cwBtnEl) cwBtnEl.onclick = async () => {
+  setStatus('Launching CodeWalker…');
+  const res = await call('launchCodeWalker');
+  if (res && res.ok) setStatus(res.built ? 'CodeWalker launched.' : 'Building + launching CodeWalker (first run can take a moment)…');
+  else setStatus('CodeWalker launch failed: ' + ((res && res.message) || 'unknown'), true);
+};
+
 $('winMin').onclick = () => post('winMin');
 $('winMax').onclick = () => post('winMax');
 $('winClose').onclick = () => post('winClose');

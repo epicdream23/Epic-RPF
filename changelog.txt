@@ -2,6 +2,43 @@ Epic RPF — Changelog
 ====================
 
 
+Version 4.0.0  (2026-06-25)
+---------------------------
+
+New:
+  * CodeWalker world editor — a new "🗺 CodeWalker" button in the toolbar opens
+    the full CodeWalker map editor: fly around the GTA V world, and select and
+    export world objects and interiors (MLOs), all loaded from your real game
+    files. It ships as a companion tool alongside Epic RPF.
+  * Reload — a new "⟳ Reload" button force-re-reads every archive from disk, so
+    you can refresh the whole view on demand if something looks out of date.
+  * Multi-select textures — in a .ytd you can now click / Ctrl-click / Shift-click
+    several textures and delete them all at once (or just press Delete). Textures
+    are tracked by identity, so the right ones are always removed.
+  * Live updates — when you edit a file inside an archive, its size in the file
+    list now updates instantly, with no manual refresh.
+  * Archive sizes — .rpf archives show their real file size in the list (e.g. your
+    update.rpf shows ~2 GB) instead of a plain item count.
+
+Fixes:
+  * Editing textures inside archives is now reliable. Adding, replacing or
+    deleting a texture in a .ytd — including inside the large update.rpf — no
+    longer intermittently corrupts the file or shows it as raw hex afterwards.
+    The cause was the live file-watcher reloading the archive in the middle of a
+    write and invalidating the view; writes are now fully isolated, every file is
+    re-read from its live location on open, and a reload no longer leaves stale
+    file tabs behind. Editing the same .ytd several times in a row is solid.
+  * Renaming a .rpf archive now works (it used to be refused outright). Encrypted
+    (NG/AES) archives are converted to an editable form first, behind a clear
+    confirmation.
+  * Dragging a file into an archive is much faster — only the affected archive is
+    re-read, instead of remounting everything.
+  * The XML / meta editor (e.g. content.xml) no longer opens with a broken,
+    unscrollable view.
+  * Double-clicking a data folder immediately after mounting no longer
+    occasionally fails to open it.
+
+
 Version 3.1.2  (2026-06-16)
 ---------------------------
 

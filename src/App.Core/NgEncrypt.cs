@@ -91,8 +91,18 @@ public static class NgEncrypt
     }
 
     /// <summary>Ensure encryption material for writing into this archive, if needed.</summary>
+    /// <remarks>
+    /// <c>RpfFile.WriteHeader</c> NG-encrypts the table-of-contents for <see cref="RpfEncryption.NG"/>
+    /// AND for any non-standard encryption value (its <c>switch</c> <c>default:</c> branch). Only
+    /// NONE / OPEN / AES skip NG entirely. We mirror that exactly here so a header write
+    /// (create / rename / delete / import) can never trip CodeWalker's
+    /// "Unable to encrypt - tables not loaded" when the tables happen to be needed.
+    /// </remarks>
     public static void EnsureFor(RpfFile? archive, Action<string>? status = null)
     {
-        if (archive != null && archive.Encryption == RpfEncryption.NG) Ensure(status);
+        if (archive == null) return;
+        var enc = archive.Encryption;
+        bool ngOnWrite = enc != RpfEncryption.NONE && enc != RpfEncryption.OPEN && enc != RpfEncryption.AES;
+        if (ngOnWrite) Ensure(status);
     }
 }

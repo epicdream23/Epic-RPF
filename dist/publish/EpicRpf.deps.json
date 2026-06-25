@@ -7,7 +7,7 @@
   "targets": {
     ".NETCoreApp,Version=v10.0": {},
     ".NETCoreApp,Version=v10.0/win-x64": {
-      "EpicRpf/1.0.0": {
+      "EpicRpf/4.0.0": {
         "dependencies": {
           "App.Core": "1.0.0",
           "App.Geometry": "1.0.0",
@@ -1075,7 +1075,7 @@
     }
   },
   "libraries": {
-    "EpicRpf/1.0.0": {
+    "EpicRpf/4.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

@@ -150,6 +150,7 @@ public sealed class Bridge
         public int H { get; set; }
         public string? Name { get; set; }     // filename for encodeDds / create commands
         public bool Override { get; set; }     // create content override when making an rpf
+        public bool Convert { get; set; }       // rename: confirmed to convert an NG/AES .rpf to OPEN first
         public string? Query { get; set; }     // search text
         public bool Ext { get; set; }          // search by extension instead of name
         public string? Scope { get; set; }     // "none" | "archive" | "folder"
@@ -162,6 +163,7 @@ public sealed class Bridge
         public int Index { get; set; }           // modelPart / texImage index
         public string? File { get; set; }        // custom-name LUT key (file name)
         public string? Hash { get; set; }        // custom-name LUT key (drawable hash hex)
+        public string[]? Hashes { get; set; }     // multi-select texture delete (NameHash hex list)
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
         public int[]? Nodes { get; set; }         // multi-select (extract many)
@@ -215,6 +217,36 @@ public sealed class Bridge
     private static volatile bool _watchRpfChanged;
     private static Action<object>? _broadcast;                 // notify the UI of fs changes
     private static readonly Dictionary<string, long> _selfWrites = new(StringComparer.OrdinalIgnoreCase);
+    private static int _writeInProgress;                        // >0 while WE are writing an archive
+
+    // Re-resolve a (possibly stale, post-write) file entry to its current LIVE version.
+    // After CreateFile overwrite, the parent dir's Files list holds the new entry but this
+    // object — and the manager's path index — still hold the old one (stale offset/size, so
+    // reading it parses garbage: "Offset and length were out of bounds" / hex). The parent
+    // dir object IS updated by CreateFile, so resolve through it; fall back to the path index.
+    private static RpfFileEntry ResolveLiveEntry(RpfFileEntry fe)
+    {
+        var live = fe.Parent?.Files?.FirstOrDefault(f => string.Equals(f.NameLower, fe.NameLower, StringComparison.Ordinal));
+        if (live == null && !string.IsNullOrEmpty(fe.Path) && _ws?.Manager.GetEntry(fe.Path) is RpfFileEntry byPath) live = byPath;
+        return live ?? fe;
+    }
+
+    // Write a file into an archive while fully suppressing the file-watcher remount for the
+    // WHOLE duration of the write (the old 4-second self-write window expired mid-write on a
+    // 2 GB update.rpf, so the watcher remounted on top of the in-progress write and corrupted
+    // it). CodeWalker/OpenIV don't re-read the archive while writing — neither do we now.
+    private static void WriteToArchive(RpfDirectoryEntry parent, string name, byte[] data, string? physical, string? vpath)
+    {
+        Interlocked.Increment(ref _writeInProgress);
+        MarkSelfWrite(physical);
+        try { RpfSafeWrite.CreateFile(parent, name, data, true); }
+        finally { MarkSelfWrite(physical); Interlocked.Decrement(ref _writeInProgress); }
+        // Live, TARGETED UI update: tell the front-end exactly which file changed + its new
+        // size, so it recalculates just that one row instantly (no folder re-list, no
+        // remount). New files (create/import) are still picked up by their own refresh.
+        if (!string.IsNullOrEmpty(vpath))
+            _broadcast?.Invoke(new { type = "fileUpdated", path = vpath, size = data.Length });
+    }
 
     // trash (delete moves here; permanent removal only when over the limit)
     private static string TrashDir => Path.Combine(
@@ -343,6 +375,9 @@ public sealed class Bridge
             case "texImage": CmdTexImage(r); break;
             case "replaceTexture": CmdReplaceTexture(r); break;
             case "deleteTexture": CmdDeleteTexture(r); break;
+            case "deleteTextures": CmdDeleteTexture(r); break;   // multi-select (r.Hashes)
+            case "launchCodeWalker": CmdLaunchCodeWalker(r); break;
+            case "reload": CmdReload(r); break;
             case "openPath": CmdOpenPath(r); break;
             case "renameModel": CmdRenameModel(r); break;
             case "winMin": _windowAction?.Invoke("min"); break;
@@ -458,6 +493,9 @@ public sealed class Bridge
 
     private void OnFsEvent(string path)
     {
+        // While we're writing an archive, ignore every fs event (and keep re-arming the
+        // self-write window) so no remount can ever land on top of an in-progress write.
+        if (Volatile.Read(ref _writeInProgress) > 0) { MarkSelfWrite(path); return; }
         if (IsSelfWrite(path)) return;                       // ignore our own writes
         if (path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) _watchRpfChanged = true;
         _watchDebounce?.Change(250, Timeout.Infinite);       // coalesce a burst into one refresh
@@ -489,6 +527,31 @@ public sealed class Bridge
         _broadcast?.Invoke(new { type = "fschange", remount = true, roots });
     }
 
+    // Manual "Reload" button: re-mount everything from disk (brute-force refresh) and
+    // hand the UI fresh roots, keeping the user's current location via crumb re-resolution.
+    // Runs inside the command gate already, so it doesn't re-acquire it.
+    private void CmdReload(Req r)
+    {
+        object[]? roots = null;
+        try
+        {
+            _ws = RpfWorkspace.Mount(_gtaFolder, _ws?.Gen9 ?? false);
+            _resolver = new TextureResolver(_ws.Manager);
+            _nodes.Clear(); _nextNodeId = 1;
+            // The old model/texture/gfx caches reference entries from the previous mount —
+            // drop them so reopened files re-read fresh from the new mount (a stale cache
+            // would show empty/wrong content after a reload).
+            _modelCache.Clear(); _modelCacheOrder.Clear();
+            _gfxCache.Clear(); _gfxCacheOrder.Clear();
+            IndexBaseArchives();
+            _diskRoot = new DiskItem { Path = _gtaFolder, IsDir = true };
+            roots = EnumerateChildren(_diskRoot);
+        }
+        catch (Exception ex) { Send(new { type = "error", reqId = r.Id, message = ex.Message }); return; }
+        _broadcast?.Invoke(new { type = "fschange", remount = true, roots });
+        Send(new { type = "reloaded", reqId = r.Id, ok = true });
+    }
+
     private static void MarkSelfWrite(string? path)
     {
         if (string.IsNullOrEmpty(path)) return;
@@ -511,7 +574,7 @@ public sealed class Bridge
         {
             if (_selfWrites.TryGetValue(path, out var t))
             {
-                if ((DateTime.UtcNow.Ticks - t) < TimeSpan.FromSeconds(4).Ticks) return true;
+                if ((DateTime.UtcNow.Ticks - t) < TimeSpan.FromSeconds(10).Ticks) return true;
                 _selfWrites.Remove(path);
             }
         }
@@ -525,7 +588,12 @@ public sealed class Bridge
             Send(new { type = "children", reqId = r.Id, node = 0, nodes = _diskRoot != null ? EnumerateChildren(_diskRoot) : Array.Empty<object>() });
             return;
         }
-        if (!_nodes.TryGetValue(r.Node, out var obj))
+        // Stale-id resilience: a background remount (live file watch) clears the node
+        // registry and recycles ids, so a folder the user double-clicks may carry an id
+        // that no longer exists. Fall back to the stable path (same mechanism the write
+        // commands use) instead of returning an empty folder that looks like a dead click.
+        var obj = ResolveNode(r.Node, r.Path);
+        if (obj == null)
         {
             Send(new { type = "children", reqId = r.Id, node = r.Node, nodes = Array.Empty<object>() });
             return;
@@ -543,6 +611,15 @@ public sealed class Bridge
 
         if (obj is RpfFileEntry fe)
         {
+            // Re-resolve to the LIVE entry before reading. An in-place write (CreateFile
+            // overwrite) replaces the entry with a new one at a new offset/size; this node
+            // still points at the OLD entry, so reading it seeks to stale bytes and shows
+            // hex. The parent dir's Files list IS updated by CreateFile (the manager's path
+            // index is NOT), so resolve through the parent; fall back to the path index.
+            var liveOpen = fe.Parent?.Files?.FirstOrDefault(f => string.Equals(f.NameLower, fe.NameLower, StringComparison.Ordinal));
+            if (liveOpen == null && !string.IsNullOrEmpty(fe.Path) && _ws?.Manager.GetEntry(fe.Path) is RpfFileEntry byPath) liveOpen = byPath;
+            if (liveOpen != null && !ReferenceEquals(liveOpen, fe)) { fe = liveOpen; _nodes[r.Node] = fe; }
+
             // Optional "Edit as XML" path (right-click): for the visual resource types
             // (ydr/ydd/yft/ytd/ypt) the default is their viewer, but the CodeWalker XML
             // round-trip is still available on demand.
@@ -1174,10 +1251,9 @@ public sealed class Bridge
 
             // Re-resolve the entry against the live mount (same guard as texture replace).
             var fe = mc.Entry;
-            if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
-                && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh) { fe = fresh; mc.Entry = fresh; }
+            if (fe != null) { fe = ResolveLiveEntry(fe); mc.Entry = fe; }
 
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); WriteToArchive(fe.Parent, fe.Name, data, SafePhysical(fe.File), fe.Path); }
             else if (!string.IsNullOrEmpty(mc.DiskPath)) { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
             else { Send(new { type = "shaderParams", reqId = r.Id, ok = false, message = "no writable destination" }); return; }
 
@@ -1539,9 +1615,17 @@ public sealed class Bridge
     private void CmdTexImage(Req r)
     {
         var texs = (_modelCache.TryGetValue(r.Node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
-        if (texs == null || r.Index < 0 || r.Index >= texs.Length || texs[r.Index] == null)
-        { Send(new { type = "texImage", reqId = r.Id, index = r.Index, img = (string?)null }); return; }
-        Send(new { type = "texImage", reqId = r.Id, index = r.Index, img = DecodeTexUrl(texs[r.Index]) });
+        Texture? tex = null;
+        if (texs != null)
+        {
+            // Prefer the stable hash so a thumbnail request in flight during an edit (which
+            // re-sorts the dict) can't load the wrong texture into the wrong cell.
+            if (!string.IsNullOrEmpty(r.Hash)
+                && uint.TryParse(r.Hash, System.Globalization.NumberStyles.HexNumber, null, out var h))
+                tex = texs.FirstOrDefault(t => t != null && (uint)t.NameHash == h);
+            if (tex == null && r.Index >= 0 && r.Index < texs.Length) tex = texs[r.Index];
+        }
+        Send(new { type = "texImage", reqId = r.Id, index = r.Index, hash = r.Hash, img = tex == null ? (string?)null : DecodeTexUrl(tex) });
     }
 
     // Replace (or add) a texture inside an open .ytd / .ypt and write the resource
@@ -1549,6 +1633,34 @@ public sealed class Bridge
     // name + usage so the model keeps referencing it; only the pixels/format change.
     // Import source is either a .dds (Content, base64) or raw RGBA (Rgba/W/H) that we
     // encode to the original texture's format.
+    // Find a texture in the dictionary by its STABLE NameHash (the dict's actual key) so
+    // delete/replace never hit the wrong one. Index drifts because BuildFromTextureList
+    // re-sorts by hash on every edit, and names can be blank/duplicated/hash-strings; the
+    // hash is unique and stable. Falls back to name then index for older callers.
+    private static Texture? FindTex(List<Texture> list, Req r)
+    {
+        if (!string.IsNullOrEmpty(r.Hash)
+            && uint.TryParse(r.Hash, System.Globalization.NumberStyles.HexNumber, null, out var h))
+        {
+            var byHash = list.FirstOrDefault(t => (uint)t.NameHash == h);
+            if (byHash != null) return byHash;
+        }
+        if (!string.IsNullOrEmpty(r.Name))
+        {
+            var byName = list.FirstOrDefault(t => string.Equals(t.Name, r.Name, StringComparison.OrdinalIgnoreCase));
+            if (byName != null) return byName;
+        }
+        if (r.Index >= 0 && r.Index < list.Count) return list[r.Index];
+        return null;
+    }
+
+    private static bool IsBcTextureFormat(TextureFormat f) => f switch
+    {
+        TextureFormat.D3DFMT_DXT1 or TextureFormat.D3DFMT_DXT3 or TextureFormat.D3DFMT_DXT5
+            or TextureFormat.D3DFMT_ATI1 or TextureFormat.D3DFMT_ATI2 or TextureFormat.D3DFMT_BC7 => true,
+        _ => false,
+    };
+
     private void CmdReplaceTexture(Req r)
     {
         if (!_modelCache.TryGetValue(r.Node, out var mc))
@@ -1559,12 +1671,7 @@ public sealed class Bridge
         // pointing at a stale archive with stale offsets — reading/writing through it would
         // corrupt the file. GetEntry rebuilds it from the live graph by its stable path.
         var fe = mc.Entry;
-        if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
-            && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh)
-        {
-            fe = fresh;
-            mc.Entry = fresh;
-        }
+        if (fe != null) { fe = ResolveLiveEntry(fe); mc.Entry = fe; }
         string fileLower = (fe?.NameLower ?? Path.GetFileName(mc.DiskPath)).ToLowerInvariant();
         bool isYpt = fileLower.EndsWith(".ypt", StringComparison.Ordinal);
         bool isYtd = fileLower.EndsWith(".ytd", StringComparison.Ordinal);
@@ -1594,10 +1701,10 @@ public sealed class Bridge
 
             var list = (dict.Textures?.data_items ?? Array.Empty<Texture>()).Where(t => t != null).ToList();
 
-            // Find the texture being replaced (by name first, index as fallback).
+            // Find the texture being replaced by its stable hash (then name/index). A null
+            // result means "import new" (no matching texture) -> the new one is added.
             string targetName = r.Name ?? "";
-            Texture? oldTex = list.FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
-            if (oldTex == null && r.Index >= 0 && r.Index < list.Count) oldTex = list[r.Index];
+            Texture? oldTex = FindTex(list, r);
 
             // Build the replacement texture. r.Content carries the raw imported file bytes:
             // a .dds is used as-is; any image (PNG/JPG/…) is decoded SERVER-SIDE (straight
@@ -1626,22 +1733,28 @@ public sealed class Bridge
                 ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt, true);
             }
             // TextureFromDds normalizes sRGB DX10 formats and rejects anything that maps to
-            // format 0, so a bad import fails cleanly instead of writing a file that crashes
-            // the game and can no longer be opened.
+            // format 0. Then guard the ONE thing that genuinely produces a broken texture:
+            // a block-compressed (DXT/BC) image whose dimensions aren't divisible by 4. This
+            // covers both image imports and drag-in .dds files, with a clear message.
             var newTex = TextureCodec.TextureFromDds(ddsBytes);
+            if (IsBcTextureFormat(newTex.Format) && (newTex.Width % 4 != 0 || newTex.Height % 4 != 0))
+                throw new Exception($"texture is {newTex.Width}×{newTex.Height}; DXT/BC textures need width & height divisible by 4 (use a power-of-two size like 256/512/1024). Resize it and re-import.");
 
             string keepName = !string.IsNullOrEmpty(oldTex?.Name) ? oldTex!.Name
                             : (!string.IsNullOrEmpty(targetName) ? targetName : "texture");
             newTex.Name = keepName;
             newTex.NameHash = JenkHash.GenHash(keepName.ToLowerInvariant());
+            // Carry over usage flags from the replaced texture, or a sibling in the dict, so
+            // an added texture has proper metadata (game treats missing flags as defaults).
             if (oldTex != null) { newTex.Usage = oldTex.Usage; newTex.UsageFlags = oldTex.UsageFlags; }
+            else { var sib = list.FirstOrDefault(t => t != null && t != newTex); if (sib != null) { newTex.Usage = sib.Usage; newTex.UsageFlags = sib.UsageFlags; } }
 
             if (oldTex != null) list[list.IndexOf(oldTex)] = newTex;
             else list.Add(newTex);                          // "import new" -> add a texture
             dict.BuildFromTextureList(list);
 
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); WriteToArchive(fe.Parent, fe.Name, data, SafePhysical(fe.File), fe.Path); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             // Point the display cache at the new dict so thumbnails reflect the edit.
@@ -1661,8 +1774,7 @@ public sealed class Bridge
         { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "texture source not open" }); return; }
 
         var fe = mc.Entry;
-        if (fe != null && _ws != null && !string.IsNullOrEmpty(mc.EntryPath)
-            && _ws.Manager.GetEntry(mc.EntryPath) is RpfFileEntry fresh) { fe = fresh; mc.Entry = fresh; }
+        if (fe != null) { fe = ResolveLiveEntry(fe); mc.Entry = fe; }
 
         string fileLower = (fe?.NameLower ?? Path.GetFileName(mc.DiskPath)).ToLowerInvariant();
         bool isYpt = fileLower.EndsWith(".ypt", StringComparison.Ordinal);
@@ -1687,22 +1799,99 @@ public sealed class Bridge
             if (dict == null) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "no texture dictionary in file" }); return; }
 
             var list = (dict.Textures?.data_items ?? Array.Empty<Texture>()).Where(t => t != null).ToList();
-            string targetName = r.Name ?? "";
-            Texture? tex = list.FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
-            if (tex == null && r.Index >= 0 && r.Index < list.Count) tex = list[r.Index];
-            if (tex == null) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "texture not found" }); return; }
 
-            list.Remove(tex);
+            // Collect the textures to remove. Multi-select sends a Hashes[] list; a single
+            // delete sends Hash/Name/Index. Matching by NameHash (the dictionary's own key)
+            // is stable even after earlier edits re-sorted the dictionary.
+            var toRemove = new List<Texture>();
+            if (r.Hashes != null && r.Hashes.Length > 0)
+            {
+                var want = new HashSet<uint>();
+                foreach (var hs in r.Hashes)
+                    if (!string.IsNullOrEmpty(hs) && uint.TryParse(hs, System.Globalization.NumberStyles.HexNumber, null, out var hv)) want.Add(hv);
+                toRemove.AddRange(list.Where(t => want.Contains((uint)t.NameHash)));
+            }
+            else
+            {
+                var one = FindTex(list, r);
+                if (one != null) toRemove.Add(one);
+            }
+            if (toRemove.Count == 0) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = "texture(s) not found" }); return; }
+
+            foreach (var t in toRemove) list.Remove(t);
             dict.BuildFromTextureList(list);
 
+            // Removing existing (already-valid) textures can't corrupt the rest, so write
+            // straight away — no validation gate that could ever block a delete.
             byte[] data = isYtd ? ytd!.Save() : ypt!.Save();
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); WriteToArchive(fe.Parent, fe.Name, data, SafePhysical(fe.File), fe.Path); }
             else { MarkSelfWrite(mc.DiskPath); File.WriteAllBytes(mc.DiskPath, data); }
 
             mc.LocalDict = dict;
-            Send(new { type = "texDeleted", reqId = r.Id, ok = true, node = r.Node, name = targetName, count = list.Count, size = data.Length, textures = TextureMeta(dict) });
+            Send(new { type = "texDeleted", reqId = r.Id, ok = true, node = r.Node, removed = toRemove.Count, name = toRemove[0].Name, count = list.Count, size = data.Length, textures = TextureMeta(dict) });
         }
         catch (Exception ex) { Send(new { type = "texDeleted", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Launch the bundled CodeWalker world editor. Prefers the built exe (clean, no console);
+    // falls back to "Run CodeWalker.bat" (which builds it first) if the exe isn't there yet.
+    private void CmdLaunchCodeWalker(Req r)
+    {
+        try
+        {
+            var dir = FindCodeWalkerDir(out var exe, out var bat);
+            if (dir == null)
+            { Send(new { type = "cwLaunched", reqId = r.Id, ok = false, message = "CodeWalker folder not found — expected a \"CodeWalker\" folder next to Epic RPF (with Run CodeWalker.bat)." }); return; }
+
+            if (exe != null)
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                { FileName = exe, WorkingDirectory = Path.GetDirectoryName(exe)!, UseShellExecute = true });
+            else
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                { FileName = bat!, WorkingDirectory = dir, UseShellExecute = true });
+
+            Send(new { type = "cwLaunched", reqId = r.Id, ok = true, built = exe != null });
+        }
+        catch (Exception ex) { Send(new { type = "cwLaunched", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Find the cloned CodeWalker tool: walk up from the app dir (works when run from the
+    // source tree) then check a couple of common spots (works for an installed build).
+    private static string? FindCodeWalkerDir(out string? exe, out string? bat)
+    {
+        exe = null; bat = null;
+        var cands = new List<string>();
+        var dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 9 && !string.IsNullOrEmpty(dir); i++)
+        {
+            cands.Add(Path.Combine(dir, "CodeWalker"));
+            dir = Path.GetDirectoryName(dir!.TrimEnd('\\', '/'));
+        }
+        try
+        {
+            var dt = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            cands.Add(Path.Combine(dt, "Epic RPF", "CodeWalker"));
+            cands.Add(Path.Combine(dt, "CodeWalker"));
+        }
+        catch { }
+
+        foreach (var c in cands)
+        {
+            // Installed/staged layout (the installer ships the whole build flat here):
+            //   <app>\CodeWalker\CodeWalker.exe
+            // Source-tree layout (built in place):
+            //   <repo>\CodeWalker\CodeWalker\bin\Release\net48\CodeWalker.exe
+            var eFlat = Path.Combine(c, "CodeWalker.exe");
+            var eSrc = Path.Combine(c, "CodeWalker", "bin", "Release", "net48", "CodeWalker.exe");
+            var b = Path.Combine(c, "Run CodeWalker.bat");
+            if (File.Exists(eFlat) || File.Exists(eSrc) || File.Exists(b))
+            {
+                exe = File.Exists(eFlat) ? eFlat : (File.Exists(eSrc) ? eSrc : null);
+                bat = File.Exists(b) ? b : null;
+                return c;
+            }
+        }
+        return null;
     }
 
     // Map a RAGE texture format to an encoder format string (for image imports —
@@ -1779,7 +1968,7 @@ public sealed class Bridge
             for (int i = 0; i < texs.Length; i++)
             {
                 var t = texs[i]; if (t == null) continue;
-                list.Add(new { index = i, name = t.Name, width = (int)t.Width, height = (int)t.Height, format = t.Format.ToString(), levels = (int)t.Levels });
+                list.Add(new { index = i, name = t.Name, hash = ((uint)t.NameHash).ToString("X8"), width = (int)t.Width, height = (int)t.Height, format = t.Format.ToString(), levels = (int)t.Levels });
             }
         return list;
     }
@@ -2039,7 +2228,7 @@ public sealed class Bridge
 
         try
         {
-            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); MarkSelfWrite(SafePhysical(fe.File)); RpfSafeWrite.CreateFile(fe.Parent, fe.Name, data, true); }
+            if (fe != null) { if (PrepareArchiveWrite(fe.File) is string werr2) throw new Exception(werr2); WriteToArchive(fe.Parent, fe.Name, data, SafePhysical(fe.File), fe.Path); }
             else { MarkSelfWrite(di!.Path); File.WriteAllBytes(di.Path, data); }
             Send(new { type = "saved", reqId = r.Id, ok = true, target = "rpf", size = data.Length });
         }
@@ -2253,7 +2442,16 @@ public sealed class Bridge
     {
         var err = WriteLockError(archive);
         if (err != null) return err;
-        NgEncrypt.EnsureFor(archive);
+        // Computing the NG encrypt tables (first run on a machine) can take a while; the
+        // mount kicks off a background warm-up so this is usually instant. If it can't be
+        // made ready (e.g. the key material never loaded) report it as a clear, actionable
+        // reason rather than letting CodeWalker throw the opaque "tables not loaded".
+        try { NgEncrypt.EnsureFor(archive); }
+        catch (Exception ex)
+        {
+            return "Couldn't prepare encryption for this archive (" + ex.Message + "). "
+                 + "Re-mount the GTA folder, then try again.";
+        }
         return null;
     }
     private static string? PrepareArchiveWrite(RpfDirectoryEntry dir) => PrepareArchiveWrite(dir.File);
@@ -2378,14 +2576,16 @@ public sealed class Bridge
                 if (data.Length == 0) throw new Exception("empty file");
             }
 
-            if (disk != null) { var p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, data); }
+            string? diskDest = null;
+            if (disk != null) { var p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, data); diskDest = p; }
             else
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
                 MarkSelfWrite(SafePhysical(dir!.File));
                 RpfSafeWrite.CreateFile(dir!, outName, data, true);
             }
-            RescanIfArchive(outName);
+            if (diskDest != null && TryMountDroppedArchive(diskDest)) { }
+            else RescanIfArchive(outName);
             Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = data.Length });
         }
         catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
@@ -2427,6 +2627,7 @@ public sealed class Bridge
                 return;
             }
             long len = new FileInfo(src).Length;
+            string? diskDest = null;
             if (disk != null)
             {
                 string p = Path.Combine(disk, name);
@@ -2434,6 +2635,7 @@ public sealed class Bridge
                 { Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len, note = "already here" }); return; }
                 MarkSelfWrite(p);
                 File.Copy(src, p, true);   // streamed by the OS — any size
+                diskDest = p;
             }
             else
             {
@@ -2443,7 +2645,10 @@ public sealed class Bridge
                 MarkSelfWrite(SafePhysical(dir!.File));
                 RpfSafeWrite.CreateFile(dir!, name, File.ReadAllBytes(src), true);
             }
-            RescanIfArchive(name);
+            // A .rpf dropped onto a disk folder is mounted on its own (fast) so it opens
+            // immediately; everything else (or an archive target) takes the normal re-scan.
+            if (diskDest != null && TryMountDroppedArchive(diskDest)) { }
+            else RescanIfArchive(name);
             Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len });
         }
         catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
@@ -2555,6 +2760,88 @@ public sealed class Bridge
         try { _baseRpfByPath[rpf.GetPhysicalFilePath()] = rpf; } catch { }
     }
 
+    // Mount a single .rpf that was just placed on disk WITHOUT re-scanning every archive
+    // (a full remount of a real install takes seconds — that delay is what made a freshly
+    // dropped archive feel slow to open). Scans just this file + its nested children and
+    // splices them into the manager so it's browsable the instant the import returns.
+    // Returns the archive on success, or null when it couldn't be read (caller then falls
+    // back to a full re-scan).
+    private RpfFile? MountSingleDiskArchive(string fullPath)
+    {
+        if (_ws == null) return null;
+        try
+        {
+            string root = _gtaFolder ?? "";
+            string rel = (root.Length > 0 && fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                ? fullPath.Substring(root.Length).TrimStart('\\', '/')
+                : Path.GetFileName(fullPath);
+
+            var rpf = new RpfFile(fullPath, rel);
+            rpf.ScanStructure(_ => { }, _ => { });
+            if (rpf.AllEntries == null || rpf.LastException != null) return null;   // unreadable → caller falls back
+
+            // Replace any previous mount of the same physical file (re-drop / overwrite).
+            try
+            {
+                var prev = _ws.AllRpfs.FirstOrDefault(x =>
+                    x.Parent == null && string.Equals(SafePhysical(x), fullPath, StringComparison.OrdinalIgnoreCase));
+                if (prev != null && !ReferenceEquals(prev, rpf)) RemoveRpfTreeFromManager(prev);
+            }
+            catch { }
+
+            AddRpfTreeToManager(rpf);
+            return rpf;
+        }
+        catch { return null; }
+    }
+
+    // Add a base archive AND its nested children to the manager's lookup structures
+    // (AllRpfs + EntryDict + the disk index) — mirrors RpfManager.AddRpfFile so navigation,
+    // path-resolution and search all see the new archive without a full re-scan.
+    private void AddRpfTreeToManager(RpfFile rpf)
+    {
+        var man = _ws?.Manager;
+        if (man == null) return;
+        void Add(RpfFile f)
+        {
+            if (f.AllEntries != null)
+            {
+                if (!man.AllRpfs.Contains(f)) man.AllRpfs.Add(f);
+                foreach (var e in f.AllEntries)
+                    if (!string.IsNullOrEmpty(e.Name)) man.EntryDict[e.Path] = e;
+            }
+            if (f.Children != null) foreach (var c in f.Children) Add(c);
+        }
+        Add(rpf);
+        try { _baseRpfByPath[rpf.GetPhysicalFilePath()] = rpf; } catch { }
+    }
+
+    private void RemoveRpfTreeFromManager(RpfFile rpf)
+    {
+        var man = _ws?.Manager;
+        if (man == null) return;
+        void Remove(RpfFile f)
+        {
+            try { man.AllRpfs.Remove(f); } catch { }
+            if (f.AllEntries != null)
+                foreach (var e in f.AllEntries)
+                    if (!string.IsNullOrEmpty(e.Name) && man.EntryDict.TryGetValue(e.Path, out var cur) && ReferenceEquals(cur, e))
+                        man.EntryDict.Remove(e.Path);
+            if (f.Children != null) foreach (var c in f.Children) Remove(c);
+        }
+        Remove(rpf);
+        try { _baseRpfByPath.Remove(SafePhysical(rpf) ?? ""); } catch { }
+    }
+
+    // A .rpf landed on disk: mount just it (fast) so it opens immediately. Returns true
+    // when handled incrementally; false means the caller should fall back to a re-scan
+    // (not a .rpf, or it couldn't be read as one).
+    private bool TryMountDroppedArchive(string fullPath)
+    {
+        if (!fullPath.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) return false;
+        return MountSingleDiskArchive(fullPath) != null;
+    }
+
     private static string? SafePhysical(RpfFile? f) { try { return f?.GetPhysicalFilePath(); } catch { return null; } }
 
     // ---- delete / trash --------------------------------------------------
@@ -2612,9 +2899,11 @@ public sealed class Bridge
         catch (Exception ex) { Send(new { type = "deleted", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
-    // Rename a disk file/folder or an entry inside an archive. We refuse to rename
-    // .rpf archives themselves: NG-encrypted archives are keyed by their filename, so
-    // renaming one breaks mounting (documented gotcha) — entries inside are fine.
+    // Rename a disk file/folder or an entry inside an archive. Renaming an .rpf archive
+    // is allowed: NG/AES archives are keyed by their own filename (the table-of-contents
+    // is encrypted with the name), so renaming as-is would break them — we convert just
+    // that archive's header to OPEN (name-independent, loads fine in-game) first, gated
+    // behind a UI confirm (r.Convert). OPEN/NONE archives rename directly.
     private void CmdRename(Req r)
     {
         var obj = ResolveNode(r.Node, r.Path);
@@ -2630,10 +2919,16 @@ public sealed class Bridge
         {
             switch (obj)
             {
+                // .rpf archives get the encryption-aware path (these return their own reply).
+                case DiskItem di when !di.IsDir && di.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase):
+                    RenameDiskRpf(r, di.Path, name, null); return;
+                case RpfFile rf:
+                    RenameDiskRpf(r, SafePhysical(rf) ?? "", name, rf); return;
+                case RpfFileEntry feRpf when feRpf.NameLower.EndsWith(".rpf", StringComparison.Ordinal):
+                    RenameRpfEntry(r, feRpf, name); return;
+
                 case DiskItem di:
                 {
-                    if (!di.IsDir && di.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
-                        throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
                     string dir = Path.GetDirectoryName(di.Path) ?? "";
                     string dest = Path.Combine(dir, name);
                     if (string.Equals(dest, di.Path, StringComparison.Ordinal)) break;   // no change
@@ -2643,10 +2938,6 @@ public sealed class Bridge
                     di.Path = dest;
                     break;
                 }
-                case RpfFile:
-                    throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
-                case RpfFileEntry fe when fe.NameLower.EndsWith(".rpf", StringComparison.Ordinal):
-                    throw new Exception("Renaming an .rpf archive can break it (archives are keyed by filename).");
                 case RpfFileEntry fe:
                     if (PrepareArchiveWrite(fe.File) is string we1) throw new Exception(we1);
                     MarkSelfWrite(SafePhysical(fe.File));
@@ -2663,6 +2954,72 @@ public sealed class Bridge
             Send(new { type = "renamed", reqId = r.Id, ok = true, name });
         }
         catch (Exception ex) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Whether renaming this archive would break it as-is (its TOC is name-keyed).
+    private static bool RpfRenameNeedsConvert(RpfFile? rpf)
+        => rpf != null && rpf.Encryption != RpfEncryption.OPEN && rpf.Encryption != RpfEncryption.NONE;
+
+    // Rename a base on-disk .rpf. For NG/AES archives we first convert just this
+    // archive's header to OPEN (so its TOC no longer depends on the filename), then
+    // move the file and re-mount it under the new name. The conversion is confirmed
+    // by the UI (needConvert -> r.Convert).
+    private void RenameDiskRpf(Req r, string oldPath, string newName, RpfFile? known)
+    {
+        if (string.IsNullOrEmpty(oldPath) || !File.Exists(oldPath))
+        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "archive file not found" }); return; }
+        if (!newName.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) newName += ".rpf";
+        string dir = Path.GetDirectoryName(oldPath) ?? "";
+        string newPath = Path.Combine(dir, newName);
+        if (string.Equals(Path.GetFileName(newPath), Path.GetFileName(oldPath), StringComparison.Ordinal))
+        { Send(new { type = "renamed", reqId = r.Id, ok = true, name = newName }); return; }   // no change
+        if (File.Exists(newPath) || Directory.Exists(newPath))
+        { Send(new { type = "renamed", reqId = r.Id, ok = false, message = "a file or folder with that name already exists here" }); return; }
+
+        // We need the live RpfFile to read its encryption / rewrite the header. If it
+        // wasn't mounted yet, mount it now (also primes the manager for re-mount later).
+        var rpf = known ?? (_baseRpfByPath.TryGetValue(oldPath, out var br) ? br : null) ?? MountSingleDiskArchive(oldPath);
+        if (WriteLockError(rpf) is string lockErr) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = lockErr }); return; }
+
+        bool converted = false;
+        if (RpfRenameNeedsConvert(rpf))
+        {
+            if (!r.Convert)
+            { Send(new { type = "renamed", reqId = r.Id, ok = false, needConvert = true, encryption = rpf!.Encryption.ToString(), name = newName }); return; }
+            MarkSelfWrite(oldPath);
+            RpfFile.SetEncryptionType(rpf!, RpfEncryption.OPEN);
+            converted = true;
+        }
+
+        MarkSelfWrite(oldPath); MarkSelfWrite(newPath);
+        File.Move(oldPath, newPath);
+        if (rpf != null) RemoveRpfTreeFromManager(rpf);   // drop the old-name mount
+        MountSingleDiskArchive(newPath);                  // re-mount under the new name (browsable immediately)
+        Send(new { type = "renamed", reqId = r.Id, ok = true, name = newName, converted });
+    }
+
+    // Rename a nested .rpf entry. NG/AES child archives are keyed by their own name, so
+    // we convert just the child's header to OPEN before renaming its parent-side entry;
+    // a base/parent that's still NG reads an OPEN child fine (mixed encryption is normal).
+    private void RenameRpfEntry(Req r, RpfFileEntry fe, string newName)
+    {
+        if (!newName.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) newName += ".rpf";
+        if (PrepareArchiveWrite(fe.File) is string werr) { Send(new { type = "renamed", reqId = r.Id, ok = false, message = werr }); return; }
+
+        RpfFile? child = null;
+        try { child = fe.File?.FindChildArchive(fe); } catch { }
+        bool converted = false;
+        if (RpfRenameNeedsConvert(child))
+        {
+            if (!r.Convert)
+            { Send(new { type = "renamed", reqId = r.Id, ok = false, needConvert = true, encryption = child!.Encryption.ToString(), name = newName }); return; }
+            MarkSelfWrite(SafePhysical(fe.File));
+            RpfFile.SetEncryptionType(child!, RpfEncryption.OPEN);
+            converted = true;
+        }
+        MarkSelfWrite(SafePhysical(fe.File));
+        RpfFile.RenameEntry(fe, newName);
+        Send(new { type = "renamed", reqId = r.Id, ok = true, name = newName, converted });
     }
 
     // Convert an .rpf archive (plus all nested child archives, and any encrypted

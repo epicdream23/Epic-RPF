@@ -5,8 +5,10 @@
 let editor = null;
 let monaco = null;
 let readyP = null;
+let hostEl = null;
 
 export function initEditor(container) {
+  hostEl = container;
   readyP = (async () => {
     monaco = await window.monacoReady;
     // Colour even very large files. Monaco disables tokenization past ~20 MB /
@@ -45,7 +47,24 @@ export async function showTab(tab, onChange) {
     tab.model.onDidChangeContent(() => onChange && onChange(tab));
   }
   editor.setModel(tab.model);
-  setTimeout(() => editor && editor.layout(), 0);
+  relayout();
+}
+
+// Force Monaco to match its container exactly. The editor is created once inside a
+// hidden pane (0 height); automaticLayout can carry a stale height to the first show,
+// which leaves the scrollbar thinking there's nothing to scroll while the last lines
+// sit clipped below the viewport ("can't scroll down, but there's more"). Measuring the
+// container after layout has settled (two rAFs) and laying out with explicit dimensions
+// makes the visible height authoritative, so the whole file is reachable.
+export function relayout() {
+  if (!editor) return;
+  const apply = () => {
+    if (!editor) return;
+    const el = hostEl;
+    if (el && el.clientHeight > 0 && el.clientWidth > 0) editor.layout({ width: el.clientWidth, height: el.clientHeight });
+    else editor.layout();
+  };
+  requestAnimationFrame(() => requestAnimationFrame(apply));
 }
 
 export function value(tab) {
@@ -60,4 +79,4 @@ export function markSaved(tab) {
 export function disposeTab(tab) {
   if (tab.model) { tab.model.dispose(); tab.model = null; }
 }
-export function layout() { if (editor) editor.layout(); }
+export function layout() { relayout(); }

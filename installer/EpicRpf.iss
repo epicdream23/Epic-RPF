@@ -11,7 +11,7 @@
 ;     "Install for all users" remains available via the privileges dialog.
 
 #define MyAppName "Epic RPF"
-#define MyAppVersion "3.1.2"
+#define MyAppVersion "4.0.0"
 #define MyAppPublisher "Epic RPF"
 #define MyAppExeName "EpicRpf.exe"
 
@@ -49,6 +49,10 @@ Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescri
 [Files]
 Source: "..\dist\publish\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "..\changelog.txt"; DestDir: "{app}"; Flags: ignoreversion
+; CodeWalker companion world editor — its COMPLETE build output (CodeWalker.exe +
+; SharpDX/Direct3D DLLs + Shaders\ + icons\ + config), so the "🗺 CodeWalker" button
+; works on a fresh install. .NET Framework 4.8 (net48) ships with Windows 10/11.
+Source: "..\CodeWalker\CodeWalker\bin\Release\net48\*"; DestDir: "{app}\CodeWalker"; Excludes: "*.pdb"; Flags: recursesubdirs ignoreversion
 ; WebView2 Evergreen bootstrapper — only executed when the runtime is missing (see [Run]).
 Source: "redist\MicrosoftEdgeWebView2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 

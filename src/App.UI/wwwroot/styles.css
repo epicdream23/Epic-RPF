@@ -571,8 +571,9 @@ body.resizing #gl { pointer-events: none; }
 
 /* texture grid */
 .tex-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; padding: 14px; }
-.tex-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+.tex-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; cursor: pointer; user-select: none; }
 .tex-card:hover { border-color: var(--accent); }
+.tex-card.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--panel)); box-shadow: 0 0 0 1px var(--accent) inset; }
 .tex-card .tn { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tex-card .td { color: var(--muted); font-size: 11px; margin-top: 4px; font-family: "Cascadia Mono", monospace; }
 .checker { background: repeating-conic-gradient(#1a1d24 0% 25%, #14161d 0% 50%) 50% / 20px 20px; }
