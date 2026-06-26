@@ -184,7 +184,24 @@
               <label class="fmt-lbl">DDS format
                 <select id="ddsFmt">
                   <option>DXT5</option><option>DXT1</option><option>DXT3</option>
-                  <option>BC7</option><option>BC4</option><option>BC5</option><option>RGBA</option>
+                  <option>BC7</option><option>BC4</option><option>BC5</option>
+                  <option value="RGBA">RGBA (uncompressed)</option>
+                </select>
+              </label>
+              <label class="fmt-lbl">Mips
+                <select id="ddsMips" title="How many mipmap levels to generate">
+                  <option value="0">All</option>
+                  <option value="1">None (1)</option>
+                  <option value="2">2</option><option value="3">3</option>
+                  <option value="4">4</option><option value="5">5</option>
+                  <option value="6">6</option><option value="8">8</option>
+                </select>
+              </label>
+              <label class="fmt-lbl">Quality
+                <select id="ddsQual" title="Compression quality — higher is sharper but slower">
+                  <option value="best">Best</option>
+                  <option value="balanced" selected>Balanced</option>
+                  <option value="fast">Fast</option>
                 </select>
               </label>
               <button class="btn primary sm" id="btnSaveDds">Save as DDS</button>

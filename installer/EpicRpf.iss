@@ -11,7 +11,11 @@
 ;     "Install for all users" remains available via the privileges dialog.
 
 #define MyAppName "Epic RPF"
-#define MyAppVersion "4.0.0"
+; VERSIONING RULE: unless a specific version is requested, every new build bumps the
+; MINOR by one tenth (4.1.0 -> 4.2.0 -> 4.3.0 -> ...). Only roll to a new MAJOR (e.g.
+; 5.0.0) when explicitly told ("now that's v5"). Keep this in sync with <Version> in
+; src\App.UI\App.UI.csproj.
+#define MyAppVersion "4.1.0"
 #define MyAppPublisher "Epic RPF"
 #define MyAppExeName "EpicRpf.exe"
 

@@ -65,6 +65,12 @@ internal static class WebHost
                     bridge.HandleDrag(ids);
                     return;
                 }
+                // Same inline-on-UI-thread path for dragging textures out of a .ytd grid.
+                if (json.Contains("\"dragOutTex\"") && TryGetTexDrag(json, out int texNode, out string[] texHashes))
+                {
+                    bridge.HandleDragTex(texNode, texHashes);
+                    return;
+                }
                 // postMessageWithAdditionalObjects: dropped File objects arrive here with
                 // their REAL disk paths — imports use the path (no giant base64 strings).
                 string[]? dropped = null;
@@ -148,6 +154,27 @@ internal static class WebHost
             foreach (var n in ns.EnumerateArray()) if (n.TryGetInt32(out int v)) list.Add(v);
             ids = list.ToArray();
             return ids.Length > 0;
+        }
+        catch { return false; }
+    }
+
+    // Parse {cmd:"dragOutTex", node:<cacheKey>, hashes:["AABBCCDD",…]} -> node + hash list.
+    private static bool TryGetTexDrag(string json, out int node, out string[] hashes)
+    {
+        node = 0; hashes = Array.Empty<string>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("cmd", out var c) || c.GetString() != "dragOutTex") return false;
+            if (root.TryGetProperty("node", out var n) && n.TryGetInt32(out int nv)) node = nv;
+            if (root.TryGetProperty("hashes", out var hs) && hs.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<string>();
+                foreach (var h in hs.EnumerateArray()) { var s = h.GetString(); if (!string.IsNullOrEmpty(s)) list.Add(s); }
+                hashes = list.ToArray();
+            }
+            return hashes.Length > 0;
         }
         catch { return false; }
     }

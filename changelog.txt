@@ -2,6 +2,22 @@ Epic RPF — Changelog
 ====================
 
 
+Version 4.1.0  (2026-06-26)
+---------------------------
+
+New:
+  * Export textures straight out of a .ytd / .ypt. Drag any texture from the
+    texture grid to Explorer, the desktop or another app and it's saved as a raw
+    .dds — the texture's own data, untouched (original format + mipmaps kept).
+    Select several (click / Ctrl-click / Shift-click) and drag them all out at once.
+  * Right-click a texture (or a multi-selection) → Export as → PNG, JPEG, or
+    Raw DDS. One texture opens a Save dialog; several ask for a destination folder
+    and write each into it.
+  * Saving a texture as DDS now lets you pick the mipmap levels (All, none, or an
+    exact count) and the compression quality (Best / Balanced / Fast). The RGBA
+    format is clearly labelled "uncompressed" for a lossless export.
+
+
 Version 4.0.0  (2026-06-25)
 ---------------------------
 
