@@ -88,9 +88,9 @@ public sealed class Bridge
         Send(new { type = "dragOutDone" });
     }
 
-    public string[] PrepareDragPaths(int[] ids)
+    // Fresh temp dir for a native OS drag-out (cleared each time so stale files never leak).
+    private static string CleanDragDir()
     {
-        if (ids == null || ids.Length == 0) return Array.Empty<string>();
         string dir = Path.Combine(Path.GetTempPath(), "EpicRpf_drag");
         try
         {
@@ -102,6 +102,13 @@ public sealed class Bridge
             Directory.CreateDirectory(dir);
         }
         catch { }
+        return dir;
+    }
+
+    public string[] PrepareDragPaths(int[] ids)
+    {
+        if (ids == null || ids.Length == 0) return Array.Empty<string>();
+        string dir = CleanDragDir();
 
         var paths = new List<string>();
         foreach (var id in ids)
@@ -134,6 +141,81 @@ public sealed class Bridge
         return paths.ToArray();
     }
 
+    // Native OS drag-out of one or more textures from an open .ytd/.ypt grid. Each texture
+    // is extracted RAW (its existing DDS, no re-encode) to a temp .dds, then handed to the
+    // host's OLE drag loop. Reads the cached dict only (no mutation) — runs off the gate,
+    // like the explorer drag-out.
+    public void HandleDragTex(int node, string[] hashes)
+    {
+        if (_startDrag == null) return;
+        var paths = PrepareTexDragPaths(node, hashes);
+        if (paths.Length > 0) _startDrag(paths);   // modal: returns after the drop/cancel
+        Send(new { type = "dragOutDone" });
+    }
+
+    public string[] PrepareTexDragPaths(int node, string[] hashes)
+    {
+        var dict = (_modelCache.TryGetValue(node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
+        if (dict == null) return Array.Empty<string>();
+        var sel = SelectTextures(dict, hashes, null, -1);
+        if (sel.Count == 0) return Array.Empty<string>();
+
+        string dir = CleanDragDir();
+        var paths = new List<string>();
+        foreach (var t in sel)
+        {
+            try
+            {
+                string p = UniquePath(Path.Combine(dir, TexFileName(t, "dds")));
+                File.WriteAllBytes(p, DDSIO.GetDDSFile(t));   // raw DDS — keeps original format + mips
+                paths.Add(p);
+            }
+            catch { }
+        }
+        return paths.ToArray();
+    }
+
+    // Pick textures out of a dictionary by NameHash list, else a single hash, else an index.
+    private static List<Texture> SelectTextures(Texture[] list, string[]? hashes, string? hash, int index)
+    {
+        var res = new List<Texture>();
+        if (hashes != null && hashes.Length > 0)
+        {
+            var set = new HashSet<uint>();
+            foreach (var hs in hashes)
+                if (uint.TryParse(hs, System.Globalization.NumberStyles.HexNumber, null, out var hv)) set.Add(hv);
+            foreach (var t in list) if (t != null && set.Contains((uint)t.NameHash)) res.Add(t);
+            return res;
+        }
+        if (!string.IsNullOrEmpty(hash)
+            && uint.TryParse(hash, System.Globalization.NumberStyles.HexNumber, null, out var h))
+        {
+            var one = list.FirstOrDefault(t => t != null && (uint)t.NameHash == h);
+            if (one != null) { res.Add(one); return res; }
+        }
+        if (index >= 0 && index < list.Length && list[index] != null) res.Add(list[index]);
+        return res;
+    }
+
+    // A safe export filename for a texture (its name, or its hash if unnamed) + extension.
+    private static string TexFileName(Texture t, string ext)
+    {
+        string baseName = string.IsNullOrWhiteSpace(t.Name) ? ((uint)t.NameHash).ToString("X8") : t.Name;
+        return SafeName(baseName) + "." + ext.TrimStart('.');
+    }
+
+    // Append " (2)", " (3)", … if the path already exists, so same-named textures don't clobber.
+    private static string UniquePath(string path)
+    {
+        if (!File.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path) ?? "", name = Path.GetFileNameWithoutExtension(path), ext = Path.GetExtension(path);
+        for (int i = 2; ; i++)
+        {
+            string p = Path.Combine(dir, $"{name} ({i}){ext}");
+            if (!File.Exists(p)) return p;
+        }
+    }
+
     private sealed class Req
     {
         public int Id { get; set; }
@@ -148,6 +230,8 @@ public sealed class Bridge
         public string? Rgba { get; set; }     // base64 RGBA8 for encodeDds
         public int W { get; set; }
         public int H { get; set; }
+        public int Mips { get; set; }          // encodeDds: mip levels (0/neg = full chain, 1 = none, N = N levels)
+        public string? Quality { get; set; }   // encodeDds: "fast" | "balanced" | "best"
         public string? Name { get; set; }     // filename for encodeDds / create commands
         public bool Override { get; set; }     // create content override when making an rpf
         public bool Convert { get; set; }       // rename: confirmed to convert an NG/AES .rpf to OPEN first
@@ -165,6 +249,7 @@ public sealed class Bridge
         public string? Hash { get; set; }        // custom-name LUT key (drawable hash hex)
         public string[]? Hashes { get; set; }     // multi-select texture delete (NameHash hex list)
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
+        public int Radius { get; set; }          // winCorners: OS-window corner radius (logical px; 0 = square)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
         public int[]? Nodes { get; set; }         // multi-select (extract many)
         public string[]? Paths { get; set; }       // stable paths paired with Nodes (stale/loose fallback)
@@ -376,6 +461,7 @@ public sealed class Bridge
             case "replaceTexture": CmdReplaceTexture(r); break;
             case "deleteTexture": CmdDeleteTexture(r); break;
             case "deleteTextures": CmdDeleteTexture(r); break;   // multi-select (r.Hashes)
+            case "exportTextures": CmdExportTextures(r); break;  // save textures as png/jpg/raw-dds
             case "launchCodeWalker": CmdLaunchCodeWalker(r); break;
             case "reload": CmdReload(r); break;
             case "openPath": CmdOpenPath(r); break;
@@ -384,6 +470,7 @@ public sealed class Bridge
             case "winMax": _windowAction?.Invoke("max"); break;
             case "winClose": _windowAction?.Invoke("close"); break;
             case "winResize": _windowAction?.Invoke("resize:" + (r.Edge ?? "")); break;
+            case "winCorners": _windowAction?.Invoke("corners:" + r.Radius.ToString(System.Globalization.CultureInfo.InvariantCulture)); break;
             case "popout": CmdPopout(r); break;
             case "popoutData": CmdPopoutData(r); break;
             default: Send(new { type = "error", reqId = r.Id, message = $"unknown cmd '{r.Cmd}'" }); break;
@@ -1722,7 +1809,7 @@ public sealed class Bridge
                     var rgba = ImageUtil.RgbaFromImage(raw, out int iw, out int ih)
                                ?? throw new Exception("could not decode the imported image — use PNG/JPG/BMP or a .dds");
                     string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
-                    ddsBytes = TextureCodec.EncodeDds(rgba, iw, ih, fmt, true);
+                    ddsBytes = TextureCodec.EncodeDds(rgba, iw, ih, fmt);   // full mip chain, balanced (game texture)
                 }
             }
             else
@@ -1730,7 +1817,7 @@ public sealed class Bridge
                 byte[] rgba = Convert.FromBase64String(r.Rgba ?? "");
                 if (r.W <= 0 || r.H <= 0 || rgba.Length < (long)r.W * r.H * 4) throw new Exception("bad image data");
                 string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
-                ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt, true);
+                ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt);     // full mip chain, balanced (game texture)
             }
             // TextureFromDds normalizes sRGB DX10 formats and rejects anything that maps to
             // format 0. Then guard the ONE thing that genuinely produces a broken texture:
@@ -3818,7 +3905,7 @@ public sealed class Bridge
             if (r.W <= 0 || r.H <= 0 || rgba.Length < (long)r.W * r.H * 4)
             { Send(new { type = "encoded", reqId = r.Id, ok = false, message = "bad image data" }); return; }
 
-            byte[] dds = TextureCodec.EncodeDds(rgba, r.W, r.H, r.Format ?? "DXT5", true);
+            byte[] dds = TextureCodec.EncodeDds(rgba, r.W, r.H, r.Format ?? "DXT5", r.Mips, r.Quality ?? "balanced");
             string suggested = r.Name ?? "texture.dds";
             if (!suggested.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) suggested += ".dds";
             string? path = _pickSavePath(suggested);
@@ -3828,6 +3915,54 @@ public sealed class Bridge
             Send(new { type = "encoded", reqId = r.Id, ok = true, path, size = dds.Length, format = r.Format ?? "DXT5" });
         }
         catch (Exception ex) { Send(new { type = "encoded", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Export one or more textures from an open .ytd/.ypt grid to disk. Format "dds" exports
+    // the RAW texture (its existing DDS, no re-encode — lossless); "png"/"jpg"/… decode the
+    // texture to RGBA and re-encode. A single texture → Save dialog; several → a folder pick.
+    private void CmdExportTextures(Req r)
+    {
+        try
+        {
+            var dict = (_modelCache.TryGetValue(r.Node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
+            if (dict == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = "texture source not open" }); return; }
+
+            var sel = SelectTextures(dict, r.Hashes, r.Hash, r.Index);
+            if (sel.Count == 0) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = "no texture selected" }); return; }
+
+            string fmt = (r.Format ?? "png").TrimStart('.').ToLowerInvariant();
+            bool rawDds = fmt is "dds" or "dds-raw";
+            string ext = rawDds ? "dds" : fmt;
+
+            byte[] Encode(Texture t)
+            {
+                if (rawDds) return DDSIO.GetDDSFile(t);
+                var rgba = TextureCodec.DecodeTexture(t, out int w, out int h)
+                           ?? throw new Exception($"could not decode '{t.Name}'");
+                return ImageUtil.EncodeRgba(rgba, w, h, ext);
+            }
+
+            if (sel.Count == 1)
+            {
+                string? path = _pickSavePath(TexFileName(sel[0], ext));
+                if (path == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, canceled = true }); return; }
+                if (!path.EndsWith("." + ext, StringComparison.OrdinalIgnoreCase)) path += "." + ext;
+                File.WriteAllBytes(path, Encode(sel[0]));
+                Send(new { type = "texExported", reqId = r.Id, ok = true, count = 1, path });
+            }
+            else
+            {
+                string? outDir = _pickFolder();
+                if (outDir == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, canceled = true }); return; }
+                int n = 0;
+                foreach (var t in sel)
+                {
+                    try { File.WriteAllBytes(UniquePath(Path.Combine(outDir, TexFileName(t, ext))), Encode(t)); n++; } catch { }
+                }
+                Send(new { type = "texExported", reqId = r.Id, ok = true, count = n, path = outDir });
+            }
+        }
+        catch (Exception ex) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     private void CmdDecodeDds(Req r)

@@ -1,0 +1,36 @@
+# Line-ending policy. We deliberately do NOT force "* text=auto" (it would renormalize
+# every already-committed text file at once — a huge noisy diff). Instead we only pin the
+# files where endings actually matter, and mark binaries so git never converts/diffs them.
+
+# Windows-only scripts keep CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.sln   text eol=crlf
+*.slnx  text eol=crlf
+
+# Unix scripts keep LF
+*.sh    text eol=lf
+
+# Binary — do not convert or diff as text
+*.dll   binary
+*.exe   binary
+*.pdb   binary
+*.cso   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.bmp   binary
+*.ttf   binary
+*.woff  binary
+*.woff2 binary
+*.dds   binary
+*.ytd   binary
+*.ydr   binary
+*.ydd   binary
+*.yft   binary
+*.ypt   binary
+*.rpf   binary
+*.epic  binary

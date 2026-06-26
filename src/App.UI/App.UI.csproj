@@ -7,7 +7,9 @@
     <RootNamespace>App.UI</RootNamespace>
     <AssemblyName>EpicRpf</AssemblyName>
     <ApplicationIcon>icon.ico</ApplicationIcon>
-    <Version>4.0.0</Version>
+    <!-- Default bump = minor +0.1 each release (4.1.0 -> 4.2.0 …); major only on request.
+         Keep in sync with MyAppVersion in installer\EpicRpf.iss. -->
+    <Version>4.2.2</Version>
     <!-- WindowsDesktop 10 is the only desktop runtime installed; target it directly. -->
   </PropertyGroup>
 

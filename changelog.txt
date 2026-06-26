@@ -2,6 +2,76 @@ Epic RPF — Changelog
 ====================
 
 
+Version 4.2.2  (2026-06-26)
+---------------------------
+
+Fixes:
+  * The window's Minimize / Maximize / Close buttons are always visible now. With
+    the extra toolbar buttons they could be pushed off the right edge at the
+    default window size; the toolbar now adapts (the path box shrinks first and the
+    buttons never wrap), the window controls are pinned, and the default window is
+    a little larger.
+
+
+Version 4.2.1  (2026-06-26)
+---------------------------
+
+Fixes:
+  * Desktop icons — more file types now show their own icon (added .ynv, .yed,
+    .yfd, .ypdb, .mrf, .yld and .gxt2), and the Windows icon cache is refreshed on
+    update so a type that was stuck on the old shared icon (e.g. .ytd) now shows
+    its correct one. Generic types (.txt/.xml/.ini/.lua/.cfg) are deliberately left
+    alone.
+  * Installer language — the language you pick on the installer's first page is now
+    applied to the tool itself, so installing in (say) German starts Epic RPF in
+    German. You can still change it any time in Settings. The installer now also
+    offers French, Spanish, Italian, Dutch, Russian, Japanese and Portuguese.
+  * Uninstall — uninstalling now removes everything Epic RPF created: all file
+    associations and icons, saved settings, custom names, the trash, and the
+    WebView2 cache. Nothing is left behind.
+
+
+Version 4.2.0  (2026-06-26)
+---------------------------
+
+New:
+  * Settings — a new "⚙ Settings" button in the toolbar opens a settings panel:
+      - Themes: pick from Epic (the default), Dark, Light, Ultra dark, and
+        Night (OLED) — a pure-black theme for OLED screens. Click a preview tile
+        to switch instantly.
+      - Accent colour: choose from preset swatches or pick any custom colour;
+        buttons, highlights and the loading bar follow it.
+      - Language: the interface is now translatable — English, Spanish, French,
+        German, Portuguese, Italian, Dutch, Russian, Chinese and Japanese. It
+        switches live, no restart needed.
+      - Round edges: Sharp, Rounded or Extra rounded — this now also rounds the
+        ACTUAL window corners, not just the controls.
+      - Window outline: turn on a customizable outline around the whole window and
+        set its colour and thickness; it follows the rounded corners.
+    Every setting is saved and re-applied the next time you open the app.
+  * Per-file-type desktop icons — each GTA file type (.ydr, .ytd, .ypt, .meta,
+    .ymap, .ycd, …) now shows its OWN icon on the desktop and in Explorer — the
+    same icon it has inside the tool — instead of every type sharing one app icon.
+    The icons are high-resolution (crisp at every size, up to 256px) and Epic RPF
+    is set as their default handler so the icons appear automatically.
+
+
+Version 4.1.0  (2026-06-26)
+---------------------------
+
+New:
+  * Export textures straight out of a .ytd / .ypt. Drag any texture from the
+    texture grid to Explorer, the desktop or another app and it's saved as a raw
+    .dds — the texture's own data, untouched (original format + mipmaps kept).
+    Select several (click / Ctrl-click / Shift-click) and drag them all out at once.
+  * Right-click a texture (or a multi-selection) → Export as → PNG, JPEG, or
+    Raw DDS. One texture opens a Save dialog; several ask for a destination folder
+    and write each into it.
+  * Saving a texture as DDS now lets you pick the mipmap levels (All, none, or an
+    exact count) and the compression quality (Best / Balanced / Fast). The RGBA
+    format is clearly labelled "uncompressed" for a lossless export.
+
+
 Version 4.0.0  (2026-06-25)
 ---------------------------
 

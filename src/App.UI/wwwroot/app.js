@@ -1489,6 +1489,8 @@ function renderTextures(res) {
     c.onclick = ev => onTexCardClick(ev, res, t, i);                 // click selects (ctrl/shift = multi)
     c.ondblclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };  // open preview
     c.oncontextmenu = ev => texGridMenu(res.node, t, ev, ph, fmt);
+    c.addEventListener('pointerdown', ev => beginTexDrag(res.node, t, ev));  // drag out -> raw .dds
+    c.addEventListener('dragstart', ev => ev.preventDefault());      // suppress HTML5 drag; we do native OS drag
     g.appendChild(c);
   });
 }
@@ -1508,6 +1510,11 @@ function texGridMenu(node, t, ev, ph, fmt) {
   showMenu([
     { label: n > 1 ? `Delete selected (${n})` : 'Delete texture', action: () => deleteSelectedTextures(node) },
     { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name, t.hash) },
+    { label: n > 1 ? `Export ${n} as` : 'Export as', submenu: [
+      { label: 'PNG…', action: () => exportTextures(node, 'png') },
+      { label: 'JPEG…', action: () => exportTextures(node, 'jpg') },
+      { label: 'Raw DDS…', action: () => exportTextures(node, 'dds') },
+    ] },
     { sep: true },
     { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
   ], ev.clientX, ev.clientY);
@@ -1524,6 +1531,41 @@ async function deleteSelectedTextures(node) {
   if (res.ok) { texSel.clear(); setStatus(`Deleted ${res.removed} (${res.count} left)`); applyReplacedTextures(res.node, res.textures); }
   else { setStatus('Delete failed', true); infoDialog('Delete failed', res.message || 'Unknown error.'); }
 }
+
+// Export the selected textures to disk: 'dds' = raw (the texture's own DDS, lossless),
+// 'png'/'jpg' = decoded + re-encoded. One texture → Save dialog; several → a folder pick.
+async function exportTextures(node, format) {
+  const hashes = [...texSel];
+  if (!hashes.length) return;
+  const n = hashes.length, fl = format === 'dds' ? 'raw DDS' : format.toUpperCase();
+  setStatus(`Exporting ${n} texture${n > 1 ? 's' : ''} as ${fl}…`);
+  const res = await call('exportTextures', { node, hashes, format });
+  if (res.canceled) { setStatus('Export canceled'); return; }
+  if (res.ok) setStatus(`Exported ${res.count} texture${res.count === 1 ? '' : 's'} → ${res.path}`);
+  else { setStatus('Export failed', true); infoDialog('Export failed', res.message || 'Unknown error.'); }
+}
+
+// ---- native drag-out of textures from the grid (raw .dds, single or multi-select) ----
+// Mirrors the explorer row drag-out: detect a sustained press+move, then the C# host runs
+// the OLE drag with real .dds files extracted from the dictionary.
+let texDrag = null;
+function beginTexDrag(node, t, e) {
+  if (e.button !== 0) return;
+  texDrag = { node, hash: t.hash, x: e.clientX, y: e.clientY, t: performance.now() };
+}
+window.addEventListener('pointermove', e => {
+  if (!texDrag) return;
+  if (!(e.buttons & 1)) { texDrag = null; return; }                          // button released
+  if (Math.abs(e.clientX - texDrag.x) + Math.abs(e.clientY - texDrag.y) < 14) return;
+  if (performance.now() - texDrag.t < 120) return;                           // not a brief double-click
+  const d = texDrag; texDrag = null;
+  // drag the whole selection if the grabbed card is part of it, else just this one
+  const hashes = (texSel.has(d.hash) && texSel.size > 1) ? [...texSel] : [d.hash];
+  setStatus(hashes.length === 1 ? 'Dragging texture…' : `Dragging ${hashes.length} textures…`);
+  dragOutUntil = Infinity;                  // suppress drops until the bridge says the drag ended
+  post('dragOutTex', { node: d.node, hashes });
+});
+window.addEventListener('pointerup', () => { texDrag = null; });
 
 // ---------------------------------------------------------------- gfx (Scaleform/SWF) structure viewer
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -1952,8 +1994,11 @@ async function saveDds(name) {
   try { data = cv.getContext('2d').getImageData(0, 0, w, h).data; }
   catch (e) { setStatus('Cannot read image pixels: ' + e.message, true); return; }
   const fmt = $('ddsFmt').value;
-  setStatus(`Encoding ${fmt} DDS…`);
-  const res = await call('encodeDds', { rgba: bytesToB64(new Uint8Array(data.buffer)), w, h, format: fmt, name });
+  const mips = parseInt($('ddsMips').value, 10) || 0;
+  const quality = $('ddsQual').value;
+  const mipTxt = mips === 0 ? 'all mips' : mips === 1 ? 'no mips' : `${mips} mips`;
+  setStatus(`Encoding ${fmt} DDS (${quality}, ${mipTxt})…`);
+  const res = await call('encodeDds', { rgba: bytesToB64(new Uint8Array(data.buffer)), w, h, format: fmt, name, mips, quality });
   if (res.canceled) { setStatus('Save canceled'); return; }
   if (res.ok) setStatus(`Saved ${fmt} DDS → ${res.path} (${fmtSize(res.size)})`);
   else setStatus('DDS encode failed: ' + (res.message || ''), true);
@@ -2466,6 +2511,102 @@ $('winMin').onclick = () => post('winMin');
 $('winMax').onclick = () => post('winMax');
 $('winClose').onclick = () => post('winClose');
 
+// ---------------------------------------------------------------- settings
+// Theme / accent / language / shape / outline. All live-apply + persist through
+// window.Appearance (appearance.js); chrome strings come from window.I18N (i18n.js).
+function st(k) { return window.I18N ? window.I18N.t(k) : k; }
+
+// Tell the host to round (or square) the real OS window to match the saved corner setting.
+function applyWindowCorners() {
+  try { if (window.Appearance) post('winCorners', { radius: window.Appearance.windowRadius(window.Appearance.get().corners) }); } catch { }
+}
+
+function openSettings() {
+  const A = window.Appearance, I = window.I18N;
+  if (!A) return;
+  let s = A.get();
+  const m = modalShell(st('set.title'));
+  m.ov.querySelector('.modal-card').classList.add('set-card');
+  const body = m.body; body.classList.add('set-body'); body.innerHTML = '';
+
+  const group = (title) => { const g = document.createElement('div'); g.className = 'set-group';
+    const h = document.createElement('h4'); h.textContent = title; g.append(h); return g; };
+  const row = (label, ...ctls) => { const r = document.createElement('div'); r.className = 'set-row';
+    const l = document.createElement('div'); l.className = 'set-lbl'; l.textContent = label;
+    const c = document.createElement('div'); c.className = 'set-ctl'; c.append(...ctls);
+    r.append(l, c); return r; };
+
+  // ---- Appearance ----
+  const ap = group(st('set.appearance'));
+
+  // theme tiles
+  const themeLbl = document.createElement('div'); themeLbl.className = 'set-lbl'; themeLbl.textContent = st('set.theme');
+  const themesWrap = document.createElement('div'); themesWrap.className = 'set-themes';
+  A.THEMES.forEach(th => {
+    const tile = document.createElement('div'); tile.className = 'set-theme' + (s.theme === th.id ? ' sel' : '');
+    tile.innerHTML = `<div class="sw">${th.sw.map(c => `<i style="background:${c}"></i>`).join('')}</div>` +
+                     `<span class="nm">${esc(st('theme.' + th.id))}</span>`;
+    tile.onclick = () => { s = A.set({ theme: th.id });
+      themesWrap.querySelectorAll('.set-theme').forEach(x => x.classList.remove('sel')); tile.classList.add('sel'); };
+    themesWrap.append(tile);
+  });
+  ap.append(themeLbl, themesWrap);
+
+  // accent: preset swatches + custom picker
+  const accWrap = document.createElement('div'); accWrap.className = 'set-swatches';
+  const custom = document.createElement('input'); custom.type = 'color'; custom.className = 'set-color'; custom.value = s.accent;
+  A.ACCENTS.forEach(c => {
+    const sw = document.createElement('div'); sw.className = 'set-sw' + (s.accent.toLowerCase() === c.toLowerCase() ? ' sel' : '');
+    sw.style.background = c; sw.title = c;
+    sw.onclick = () => { s = A.set({ accent: c });
+      accWrap.querySelectorAll('.set-sw').forEach(x => x.classList.remove('sel')); sw.classList.add('sel'); custom.value = c; };
+    accWrap.append(sw);
+  });
+  custom.oninput = () => { s = A.set({ accent: custom.value });
+    accWrap.querySelectorAll('.set-sw').forEach(x => x.classList.remove('sel')); };
+  accWrap.append(custom);
+  ap.append(row(st('set.accent'), accWrap));
+
+  // corners (round edges)
+  const cornSel = document.createElement('select'); cornSel.className = 'set-sel';
+  [['sharp', 'set.corners.sharp'], ['rounded', 'set.corners.rounded'], ['extra', 'set.corners.extra']].forEach(([v, k]) => {
+    const o = document.createElement('option'); o.value = v; o.textContent = st(k); if (s.corners === v) o.selected = true; cornSel.append(o);
+  });
+  cornSel.onchange = () => { s = A.set({ corners: cornSel.value }); applyWindowCorners(); };
+  ap.append(row(st('set.corners'), cornSel));
+
+  // outline (enable + colour + width)
+  const oChk = document.createElement('input'); oChk.type = 'checkbox'; oChk.className = 'set-check'; oChk.checked = !!s.outline;
+  const oColor = document.createElement('input'); oColor.type = 'color'; oColor.className = 'set-color'; oColor.value = s.outlineColor;
+  const oRange = document.createElement('input'); oRange.type = 'range'; oRange.className = 'set-range';
+  oRange.min = 1; oRange.max = 6; oRange.step = 1; oRange.value = s.outlineWidth;
+  const oNum = document.createElement('span'); oNum.className = 'set-num'; oNum.textContent = s.outlineWidth + ' px';
+  const syncO = () => { s = A.set({ outline: oChk.checked, outlineColor: oColor.value, outlineWidth: +oRange.value });
+    oNum.textContent = oRange.value + ' px'; oColor.disabled = !oChk.checked; oRange.disabled = !oChk.checked; };
+  oChk.onchange = syncO; oColor.oninput = syncO; oRange.oninput = syncO;
+  oColor.disabled = !s.outline; oRange.disabled = !s.outline;
+  ap.append(row(st('set.outline'), oChk, oColor, oRange, oNum));
+  body.append(ap);
+
+  // ---- Language ----
+  const lg = group(st('set.language'));
+  const langSel = document.createElement('select'); langSel.className = 'set-sel';
+  (I ? I.LANGS : [{ code: 'en', name: 'English' }]).forEach(L => {
+    const o = document.createElement('option'); o.value = L.code; o.textContent = L.name; if (s.lang === L.code) o.selected = true; langSel.append(o);
+  });
+  langSel.onchange = () => { A.set({ lang: langSel.value }); m.close(); openSettings(); };   // rebuild in the new language
+  lg.append(row(st('set.langPick'), langSel));
+  const note = document.createElement('div'); note.className = 'set-hint'; note.textContent = st('set.langNote');
+  lg.append(note);
+  body.append(lg);
+
+  addBtn(m.actions, st('set.reset'), 'ghost', () => {
+    A.reset(); if (I) I.applyI18n(A.get().lang); applyWindowCorners(); m.close(); openSettings();
+  });
+  addBtn(m.actions, st('common.close'), 'primary', m.close);
+}
+$('settingsBtn').onclick = openSettings;
+
 // ---- frameless window resize -------------------------------------------------
 // The OS title bar is gone, so the user couldn't resize the window (WindowChrome's
 // resize border is covered by the WebView2 HWND). Detect a drag within 6px of any
@@ -2701,6 +2842,13 @@ function opRow(op, idx, onRemove) {
 }
 
 // ---------------------------------------------------------------- boot
+// Translate the chrome to the saved language (appearance/theme were already applied
+// in <head> before paint by appearance.js).
+try { if (window.I18N && window.Appearance) window.I18N.applyI18n(window.Appearance.get().lang); } catch { }
+// Round the actual OS window to match the saved "Round edges" choice (CSS can't clip the
+// WebView's own HWND, so the host sets a rounded window region — see WindowRounding.cs).
+applyWindowCorners();
+
 viewport.init($('gl'));
 editor.initEditor($('editor'));
 setStatus('Ready');
