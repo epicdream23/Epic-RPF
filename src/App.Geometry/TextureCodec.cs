@@ -106,19 +106,34 @@ public static class TextureCodec
         catch { return null; }
     }
 
-    /// <summary>RGBA8 → .dds bytes in the requested format (with mipmaps).</summary>
-    public static byte[] EncodeDds(byte[] rgba, int w, int h, string format, bool mips = true)
+    /// <summary>
+    /// RGBA8 → .dds bytes in the requested format.
+    /// <paramref name="mipLevels"/>: 0 or negative = full mip chain (down to 1×1);
+    /// 1 = base level only (no mips); N = at most N levels.
+    /// <paramref name="quality"/>: "fast" | "balanced" | "best" — BCn block-search effort.
+    /// Higher quality is slower but gives sharper compressed output; the "RGBA" format
+    /// skips block compression entirely (lossless, larger file).
+    /// </summary>
+    public static byte[] EncodeDds(byte[] rgba, int w, int h, string format, int mipLevels = 0, string quality = "balanced")
     {
         var enc = new BcEncoder();
         enc.OutputOptions.Format = MapFormat(format);
-        enc.OutputOptions.Quality = CompressionQuality.Balanced;
-        enc.OutputOptions.GenerateMipMaps = mips;
+        enc.OutputOptions.Quality = MapQuality(quality);
+        enc.OutputOptions.GenerateMipMaps = mipLevels != 1;             // 1 level requested -> base only
+        enc.OutputOptions.MaxMipMapLevel = mipLevels <= 0 ? -1 : mipLevels;  // -1 = full chain
         enc.OutputOptions.FileFormat = OutputFileFormat.Dds;
         var dds = enc.EncodeToDds(rgba.AsSpan(), w, h, PixelFormat.Rgba32);
         using var ms = new MemoryStream();
         dds.Write(ms);
         return ms.ToArray();
     }
+
+    private static CompressionQuality MapQuality(string? q) => q?.ToLowerInvariant() switch
+    {
+        "fast" => CompressionQuality.Fast,
+        "best" or "bestquality" or "max" or "high" => CompressionQuality.BestQuality,
+        _ => CompressionQuality.Balanced,
+    };
 
     private static CompressionFormat MapFormat(string f) => f.ToUpperInvariant() switch
     {

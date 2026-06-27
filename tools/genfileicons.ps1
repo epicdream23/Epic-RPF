@@ -1,15 +1,49 @@
 # Real, distinctive per-extension file icons grouped by family (matching colour +
 # related glyph). Output -> wwwroot/icons. Run after genicons.ps1 (folders).
+# Renders the vector glyphs at 256px (crisp on hi-DPI + desktop "extra large" icons)
+# and also emits a multi-res <name>.ico (16..256) used for the Windows shell file
+# associations so each extension shows its own icon on the desktop.
 Add-Type -AssemblyName System.Drawing
 $dir = "c:\Users\Joshua\Desktop\Epic RPF\src\App.UI\wwwroot\icons"
-$S = 128
+$S = 256   # all glyph coordinates below are authored in 128-space; NewG scales them up
 function C([string]$h) { [System.Drawing.ColorTranslator]::FromHtml($h) }
 $White = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(242,255,255,255))
 function WPen([single]$w) { $p = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(242,255,255,255)), $w; $p.StartCap=2;$p.EndCap=2;$p.LineJoin=2; $p }
 function APen($hex,[single]$w) { $p = New-Object System.Drawing.Pen ((C $hex)), $w; $p.StartCap=2;$p.EndCap=2;$p.LineJoin=2; $p }
 function PF([single]$x,[single]$y) { New-Object System.Drawing.PointF $x,$y }
 function Pts($a) { [System.Drawing.PointF[]]$a }
-function NewG { $b = New-Object System.Drawing.Bitmap $S,$S; $g=[System.Drawing.Graphics]::FromImage($b); $g.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; $g.TextRenderingHint=[System.Drawing.Text.TextRenderingHint]::AntiAlias; $g.Clear([System.Drawing.Color]::Transparent); @($b,$g) }
+function NewG { $b = New-Object System.Drawing.Bitmap $S,$S; $g=[System.Drawing.Graphics]::FromImage($b); $g.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; $g.TextRenderingHint=[System.Drawing.Text.TextRenderingHint]::AntiAlias; $g.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g.Clear([System.Drawing.Color]::Transparent); $g.ScaleTransform([single]($S/128.0),[single]($S/128.0)); @($b,$g) }
+
+# Assemble a multi-resolution .ico from a high-res source bitmap. Entries are PNG-
+# compressed (Vista+), scaled down with high-quality bicubic from the 256px master.
+function ToIco($src, $path) {
+  $sizes = 16,24,32,48,64,128,256
+  $pngs = @()
+  foreach ($s in $sizes) {
+    $bm = New-Object System.Drawing.Bitmap $s,$s,([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $gg = [System.Drawing.Graphics]::FromImage($bm)
+    $gg.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $gg.PixelOffsetMode=[System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $gg.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+    $gg.Clear([System.Drawing.Color]::Transparent)
+    $gg.DrawImage($src,(New-Object System.Drawing.Rectangle 0,0,$s,$s))
+    $gg.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $bm.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png)
+    $pngs += ,($ms.ToArray()); $bm.Dispose()
+  }
+  $fs = [System.IO.File]::Create($path); $bw = New-Object System.IO.BinaryWriter($fs)
+  $bw.Write([UInt16]0); $bw.Write([UInt16]1); $bw.Write([UInt16]$sizes.Count)   # ICONDIR
+  $offset = 6 + 16*$sizes.Count
+  for ($i=0; $i -lt $sizes.Count; $i++) {
+    $s=$sizes[$i]; $bytes=$pngs[$i]
+    $bw.Write([Byte]($(if ($s -ge 256){0}else{$s}))); $bw.Write([Byte]($(if ($s -ge 256){0}else{$s})))
+    $bw.Write([Byte]0); $bw.Write([Byte]0); $bw.Write([UInt16]1); $bw.Write([UInt16]32)
+    $bw.Write([UInt32]$bytes.Length); $bw.Write([UInt32]$offset); $offset += $bytes.Length
+  }
+  for ($i=0; $i -lt $sizes.Count; $i++) { $bw.Write($pngs[$i]) }
+  $bw.Flush(); $bw.Close(); $fs.Close()
+}
 function RR([single]$x,[single]$y,[single]$w,[single]$h,[single]$r) { $p=New-Object System.Drawing.Drawing2D.GraphicsPath; $d=$r*2; $p.AddArc($x,$y,$d,$d,180,90); $p.AddArc($x+$w-$d,$y,$d,$d,270,90); $p.AddArc($x+$w-$d,$y+$h-$d,$d,$d,0,90); $p.AddArc($x,$y+$h-$d,$d,$d,90,90); $p.CloseFigure(); $p }
 function Tile($g,$top,$bot) { $gr=New-Object System.Drawing.Drawing2D.LinearGradientBrush (New-Object System.Drawing.Point 0,6),(New-Object System.Drawing.Point 0,122),(C $top),(C $bot); $t=RR 8 8 112 112 24; $g.FillPath($gr,$t); $t.Dispose(); $gr.Dispose() }
 
@@ -91,6 +125,7 @@ foreach ($ic in $icons) {
   }
   $ab.Dispose()
   $b.Save((Join-Path $dir ($ic[0]+'.png')),[System.Drawing.Imaging.ImageFormat]::Png)
+  ToIco $b (Join-Path $dir ($ic[0]+'.ico'))   # multi-res .ico for shell file associations
   $g.Dispose(); $b.Dispose()
 }
-Write-Output "generated $($icons.Count) file icons"
+Write-Output "generated $($icons.Count) file icons (.png @256 + multi-res .ico)"

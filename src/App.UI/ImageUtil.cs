@@ -8,7 +8,13 @@ namespace App.UI;
 /// <summary>RGBA8 → PNG (via WPF imaging, so no extra image dependency).</summary>
 public static class ImageUtil
 {
-    public static byte[] PngFromRgba(byte[] rgba, int w, int h)
+    public static byte[] PngFromRgba(byte[] rgba, int w, int h) => EncodeRgba(rgba, w, h, "png");
+
+    /// <summary>
+    /// RGBA8 → encoded image bytes for the given extension: png (default), jpg/jpeg, bmp,
+    /// tif/tiff, gif. JPEG is high-quality (95) and has no alpha; PNG/BMP/TIFF keep alpha.
+    /// </summary>
+    public static byte[] EncodeRgba(byte[] rgba, int w, int h, string ext)
     {
         if (w <= 0 || h <= 0 || rgba.Length < (long)w * h * 4) return Array.Empty<byte>();
         // WPF wants BGRA; swap R/B from our RGBA.
@@ -22,7 +28,14 @@ public static class ImageUtil
         }
         var bmp = BitmapSource.Create(w, h, 96, 96, PixelFormats.Bgra32, null, bgra, w * 4);
         bmp.Freeze();
-        var enc = new PngBitmapEncoder();
+        BitmapEncoder enc = (ext ?? "png").TrimStart('.').ToLowerInvariant() switch
+        {
+            "jpg" or "jpeg" => new JpegBitmapEncoder { QualityLevel = 95 },
+            "bmp" => new BmpBitmapEncoder(),
+            "tif" or "tiff" => new TiffBitmapEncoder(),
+            "gif" => new GifBitmapEncoder(),
+            _ => new PngBitmapEncoder(),
+        };
         enc.Frames.Add(BitmapFrame.Create(bmp));
         using var ms = new MemoryStream();
         enc.Save(ms);
