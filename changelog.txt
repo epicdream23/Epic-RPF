@@ -2,6 +2,127 @@ Epic RPF — Changelog
 ====================
 
 
+Version 4.2.6  (2026-06-27)
+---------------------------
+
+New:
+  * .rpf archives now have their own desktop icon — a distinct gold "archive box"
+    — just like the other GTA file types, instead of a generic file icon.
+  * Double-clicking a .rpf opens Epic RPF and mounts its folder, so you can browse
+    the archive straight away (an .rpf is far too large to open as a single raw
+    file, so it's mounted and shown in the tree instead).
+  * File-type icons are now applied right after installation — you no longer have
+    to launch the app once for them to appear — and they're removed again when you
+    uninstall, with the Windows icon cache refreshed both times so the change shows
+    immediately (no logoff or Explorer restart needed).
+
+
+Version 4.2.5  (2026-06-27)
+---------------------------
+
+Fixes:
+  * Uninstall now fully removes the program folder even when Epic RPF is still
+    running. The uninstaller force-closes the app (and the background WebView2
+    processes it spawns) first, so its .exe and DLLs are no longer locked and left
+    behind with a "could not delete all files" message.
+
+
+Version 4.2.4  (2026-06-27)
+---------------------------
+
+New:
+  * Uninstall now deletes the ENTIRE Epic RPF folder, including the files the app
+    and the bundled CodeWalker create while running (caches, configs, logs) that a
+    normal uninstall would leave behind. Your GTA mod backups are untouched — they
+    live in the GTA folder, not the install folder.
+
+
+Version 4.2.3  (2026-06-27)
+---------------------------
+
+New:
+  * Full keyboard control of the file list. Use the Up / Down arrows to move the
+    selection (it wraps around from the bottom back to the top, and vice-versa),
+    Enter to open, Backspace to go up a folder, Home / End and Page Up / Page Down
+    to jump, and just start typing a name to jump to it. Shift+arrows extend the
+    selection and Ctrl+A selects everything. The mouse's Back / Forward side
+    buttons navigate history. The explorer is now fully drivable without a mouse.
+  * Windows-standard cut / copy / paste. Ctrl+C, Ctrl+X and Ctrl+V (and the
+    right-click menu) copy or move files and folders — even across archives. Cut
+    items are dimmed until you paste; a paste that would clash is auto-renamed
+    ("name - Copy") so nothing is ever overwritten, and a cut is undoable.
+
+
+Version 4.2.2  (2026-06-26)
+---------------------------
+
+Fixes:
+  * The window's Minimize / Maximize / Close buttons are always visible now. With
+    the extra toolbar buttons they could be pushed off the right edge at the
+    default window size; the toolbar now adapts (the path box shrinks first and the
+    buttons never wrap), the window controls are pinned, and the default window is
+    a little larger.
+
+
+Version 4.2.1  (2026-06-26)
+---------------------------
+
+Fixes:
+  * Desktop icons — more file types now show their own icon (added .ynv, .yed,
+    .yfd, .ypdb, .mrf, .yld and .gxt2), and the Windows icon cache is refreshed on
+    update so a type that was stuck on the old shared icon (e.g. .ytd) now shows
+    its correct one. Generic types (.txt/.xml/.ini/.lua/.cfg) are deliberately left
+    alone.
+  * Installer language — the language you pick on the installer's first page is now
+    applied to the tool itself, so installing in (say) German starts Epic RPF in
+    German. You can still change it any time in Settings. The installer now also
+    offers French, Spanish, Italian, Dutch, Russian, Japanese and Portuguese.
+  * Uninstall — uninstalling now removes everything Epic RPF created: all file
+    associations and icons, saved settings, custom names, the trash, and the
+    WebView2 cache. Nothing is left behind.
+
+
+Version 4.2.0  (2026-06-26)
+---------------------------
+
+New:
+  * Settings — a new "⚙ Settings" button in the toolbar opens a settings panel:
+      - Themes: pick from Epic (the default), Dark, Light, Ultra dark, and
+        Night (OLED) — a pure-black theme for OLED screens. Click a preview tile
+        to switch instantly.
+      - Accent colour: choose from preset swatches or pick any custom colour;
+        buttons, highlights and the loading bar follow it.
+      - Language: the interface is now translatable — English, Spanish, French,
+        German, Portuguese, Italian, Dutch, Russian, Chinese and Japanese. It
+        switches live, no restart needed.
+      - Round edges: Sharp, Rounded or Extra rounded — this now also rounds the
+        ACTUAL window corners, not just the controls.
+      - Window outline: turn on a customizable outline around the whole window and
+        set its colour and thickness; it follows the rounded corners.
+    Every setting is saved and re-applied the next time you open the app.
+  * Per-file-type desktop icons — each GTA file type (.ydr, .ytd, .ypt, .meta,
+    .ymap, .ycd, …) now shows its OWN icon on the desktop and in Explorer — the
+    same icon it has inside the tool — instead of every type sharing one app icon.
+    The icons are high-resolution (crisp at every size, up to 256px) and Epic RPF
+    is set as their default handler so the icons appear automatically.
+
+
+Version 4.1.0  (2026-06-26)
+---------------------------
+
+New:
+  * Export textures straight out of a .ytd / .ypt. Drag any texture from the
+    texture grid to Explorer, the desktop or another app and it's saved as a raw
+    .dds — the texture's own data, untouched (original format + mipmaps kept).
+    Select several (click / Ctrl-click / Shift-click) and drag them all out at once.
+  * Right-click a texture (or a multi-selection) → Export as → PNG, JPEG, or
+    Raw DDS. One texture opens a Save dialog; several ask for a destination folder
+    and write each into it.
+  * Saving a texture as DDS now lets you pick the mipmap levels (All, none, or an
+    exact count) and the compression quality (Best / Balanced / Fast). The RGBA
+    format is clearly labelled "uncompressed" for a lossless export.
+
+
 Version 4.0.0  (2026-06-25)
 ---------------------------
 

@@ -82,11 +82,27 @@ inside `.rpf` archives):
 Headless equivalents in `rpfcli`: `epic create <manifest.json> <out.epic>`,
 `epic inspect <pkg.epic>`, `epic install <pkg.epic>`.
 
+## Explorer — keyboard, mouse & clipboard
+
+The file browser works like Windows Explorer, and it's fully drivable without a mouse:
+
+- **Arrow keys** move the selection — Up/Down **wrap around** (past the bottom jumps back to
+  the top, and vice-versa). **Enter** opens the item, **Backspace** goes up a folder,
+  **Home/End** and **Page Up/Page Down** jump, and **type-ahead** (just start typing a name)
+  skips to it. **Shift+arrows** extend the selection; **Ctrl+A** selects everything.
+- **Cut / copy / paste**, the Windows way — **Ctrl+X / Ctrl+C / Ctrl+V** (or the right-click
+  menu) move or copy files and folders, even **across archives** and between an archive and a
+  loose disk folder. Cut items dim until you paste; a paste that would clash is auto-renamed
+  (`name - Copy`) so nothing is ever overwritten, and a cut is **undoable** (Ctrl+Z).
+- The mouse's **Back / Forward** side buttons navigate folder history (as do **Alt+← / Alt+→**
+  and the toolbar arrows), and you can **rubber-band-select** by dragging a box over empty space.
+
 ## Open files by double-clicking (file associations)
 
-Epic RPF registers the file types it understands (`.ytd`, `.ydr`, `.ydd`, `.yft`, `.ypt`,
-`.ymap`, `.ytyp`, metas, `.gfx`, `.epic`, …) under the current user on first run — no admin
-needed. After that:
+Epic RPF registers the file types it understands (`.rpf`, `.ytd`, `.ydr`, `.ydd`, `.yft`,
+`.ypt`, `.ymap`, `.ytyp`, metas, `.gfx`, `.epic`, …) under the current user — no admin needed.
+Each type gets its **own icon** on the desktop and in Explorer (the same glyph it has inside
+the tool), and Epic RPF is set as its default handler so those icons appear. After that:
 
 - **Double-click a supported file while the app is open** → it opens in a **new tab**, just
   like any file from inside an archive, and the window jumps to the front. (A second launch
@@ -95,9 +111,14 @@ needed. After that:
   renderer for that file (3D viewer, texture grid, GFX, text/XML, hex) fills the window — no
   sidebar, tabs or mount bar. The file is still fully **editable** (replace/delete textures,
   edit text/XML) and saves straight back to the file on disk.
+- **`.rpf` archives** get a distinct gold archive icon, and double-clicking one opens the full
+  app and **mounts its folder** so you can browse the archive right away (an `.rpf` is far too
+  large to open as a single file).
 
-`.epic` files are set as the default for that extension (it's our own format); game
-extensions are only added to the *Open with* list so the user's other tools aren't hijacked.
+The icons are applied **right after installation** (no need to launch the app first) and
+removed again on **uninstall**, refreshing the Windows icon cache both times. `.epic` is set
+as the default for its extension (it's our own format); the GTA game extensions get their icon
+and open in Epic RPF by default, while leaving generic types (`.xml`/`.txt`/`.ini`/…) alone.
 
 You can also **delete textures** from a `.ytd`/`.ypt` — select one or several in the grid
 (click, Ctrl-click, Shift-click) and press Delete, or right-click → **Delete texture**; the
@@ -107,7 +128,13 @@ and a **⟳ Reload** button force-re-reads everything from disk if you ever want
 
 ## Roadmap
 
-Shipped in v4.0.0 (see `changelog.txt`):
+Shipped in v4.2.x (see `changelog.txt`):
+ - ✅ Full keyboard control of the file list + Windows cut/copy/paste (across archives)
+ - ✅ Per-type desktop icons (incl. a `.rpf` archive icon), applied on install & removed on uninstall
+ - ✅ Settings: themes, accent colour, 10-language UI, rounded corners & window outline
+ - ✅ Uninstall fully removes the program folder (force-closes the app first)
+
+Shipped in v4.0.0:
  - ✅ Bundled CodeWalker world editor (fly the map, select/export objects & MLOs)
  - ✅ Rock-solid in-archive texture editing — multi-select delete, live view updates
  - ✅ Rename `.rpf` archives; much faster drag-in; `.rpf` file sizes shown in the list
