@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
@@ -50,6 +51,24 @@ public partial class MainWindow : Window
         }
         if (EpicApp.ViewerMode && EpicApp.PendingFile != null)
             sb.Append("window.__VIEWFILE=" + JsonSerializer.Serialize(EpicApp.PendingFile) + ";");
+        // A double-clicked .rpf isn't a single-file viewer case — hand its path to the full
+        // UI so it mounts the archive's folder and shows it in the tree, ready to browse.
+        else if (EpicApp.PendingFile != null && EpicApp.PendingFile.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
+            sb.Append("window.__OPENRPF=" + JsonSerializer.Serialize(EpicApp.PendingFile) + ";");
+        // The installer writes the language chosen on its first page to {app}\install.lang
+        // (e.g. "de"); surface it so the UI adopts it as the default (appearance.js seeds it
+        // once per install). Absent in dev builds — harmless.
+        try
+        {
+            string langFile = Path.Combine(AppContext.BaseDirectory, "install.lang");
+            if (File.Exists(langFile))
+            {
+                string code = File.ReadAllText(langFile).Trim();
+                if (!string.IsNullOrEmpty(code))
+                    sb.Append("window.__INSTALL_LANG=" + JsonSerializer.Serialize(code) + ";");
+            }
+        }
+        catch { }
         return sb.Length > 0 ? sb.ToString() : null;
     }
 }
