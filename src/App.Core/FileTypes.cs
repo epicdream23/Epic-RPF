@@ -53,7 +53,7 @@ public static class FileTypes
         // .ypt carries both drawables and textures — it opens in the model viewer
         // (which also surfaces its embedded texture dictionary).
         RpfFileKind.Drawable or RpfFileKind.DrawableDictionary or RpfFileKind.Fragment
-            or RpfFileKind.ParticleEffect => ViewerKind.Model,
+            or RpfFileKind.ParticleEffect or RpfFileKind.Bounds => ViewerKind.Model,
         RpfFileKind.TextureDictionary => ViewerKind.Texture,
         RpfFileKind.Gfx => ViewerKind.Gfx,
         RpfFileKind.Xml or RpfFileKind.Meta or RpfFileKind.Text => ViewerKind.Text,

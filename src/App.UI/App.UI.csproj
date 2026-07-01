@@ -7,7 +7,16 @@
     <RootNamespace>App.UI</RootNamespace>
     <AssemblyName>EpicRpf</AssemblyName>
     <ApplicationIcon>icon.ico</ApplicationIcon>
-    <Version>4.0.0</Version>
+    <!-- Default bump = minor +0.1 each release (4.1.0 -> 4.2.0 …); major only on request.
+         Keep in sync with MyAppVersion in installer\EpicRpf.iss. -->
+    <Version>5.0.0</Version>
+    <!-- Rich file metadata (Details tab of the .exe). Sparse/blank metadata is itself a
+         heuristic red flag for AV engines, so fill in real publisher/product info. -->
+    <Company>Epic RPF</Company>
+    <Product>Epic RPF</Product>
+    <Authors>Epic RPF</Authors>
+    <Description>Viewer and editor for GTA V .rpf archives.</Description>
+    <Copyright>Copyright © 2026 Epic RPF</Copyright>
     <!-- WindowsDesktop 10 is the only desktop runtime installed; target it directly. -->
   </PropertyGroup>
 

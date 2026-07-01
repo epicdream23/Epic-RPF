@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\App.Core\App.Core.csproj" />
+    <ProjectReference Include="..\App.Geometry\App.Geometry.csproj" />
   </ItemGroup>
 
 </Project>

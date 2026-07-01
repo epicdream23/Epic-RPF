@@ -33,6 +33,8 @@ window.chrome.webview.addEventListener('message', ev => {
     onFsChange(m);
   } else if (m && m.type === 'fileUpdated') {
     onFileUpdated(m);
+  } else if (m && m.type === 'archiveFix') {
+    setStatus(m.message || 'Archive fix', m.error === true);
   } else if (m && m.type === 'dragOutDone') {
     // Our own OLE drag finished; ignore drop events for a moment — a drop back onto
     // our own window arrives as a normal HTML drop and must NOT be re-imported.
@@ -159,15 +161,68 @@ async function mount() {
   const res = await withProgress(call('mount', { folder, gen9: gen9Chk.checked }));   // ~2-3s: show at once
   mountBtn.disabled = false;
   if (!res.ok) { setStatus('Mount failed: ' + (res.error || 'unknown'), true); mountInfo.textContent = ''; return; }
+  mountedFolder = res.folder || '';
   mountInfo.innerHTML =
     `<b>${res.archives.toLocaleString()}</b> archives · <b>${res.files.toLocaleString()}</b> files · ${res.gen9 ? 'Gen9' : 'Gen8'}`;
-  setStatus(`Mounted ${res.folder}` + (res.mountErrors ? ` (${res.mountErrors} archive errors)` : ''));
+  renderMountErrors(res.mountErrorList);
+  setStatus(`Mounted ${res.folder}` + (res.mountErrors ? ` (${res.mountErrors} archive errors — see the mount bar)` : ''));
   childrenCache.clear();
   rootName = res.rootName || 'GTA V';
   mountRoots = res.roots;
   buildTree(mountRoots);
   ensureExplorerTab();
   navigate([{ id: 0, name: rootName }]);
+  maybeRestoreArchiveFix();   // re-enable auto-fix-on-change for the freshly-mounted install if it's on
+}
+
+// Expandable list of archives that failed to mount — each name links to its file in the explorer.
+let mountedFolder = '';
+function renderMountErrors(list) {
+  if (!list || !list.length) return;
+  const wrap = document.createElement('span'); wrap.className = 'mount-errs';
+  const n = list.length;
+  const toggle = document.createElement('a');
+  toggle.href = '#'; toggle.style.cssText = 'margin-left:10px;color:var(--danger);text-decoration:none';
+  const setLabel = open => toggle.textContent = `⚠ ${n} archive error${n === 1 ? '' : 's'} ${open ? '▾' : '▸'}`;
+  setLabel(false);
+  const panel = document.createElement('div');
+  panel.style.cssText = 'display:none;max-height:180px;overflow:auto;margin-top:4px;padding:4px 6px;border:1px solid var(--border,#333);border-radius:4px;background:rgba(0,0,0,.25)';
+  for (const e of list) {
+    const line = document.createElement('div'); line.style.cssText = 'white-space:nowrap;font-size:11px;line-height:1.6';
+    const a = document.createElement('a');
+    a.href = '#'; a.textContent = e.name || e.path; a.title = (e.path || '') + (e.message ? '\n' + e.message : '');
+    a.style.cssText = 'color:var(--accent);text-decoration:none';
+    a.onclick = ev => { ev.preventDefault(); revealPath(e.path); };
+    line.append(a);
+    if (e.message) { const m = document.createElement('span'); m.className = 'muted'; m.style.marginLeft = '8px'; m.textContent = e.message.length > 90 ? e.message.slice(0, 90) + '…' : e.message; line.append(m); }
+    panel.append(line);
+  }
+  toggle.onclick = ev => { ev.preventDefault(); const open = panel.style.display === 'none'; panel.style.display = open ? 'block' : 'none'; setLabel(open); };
+  wrap.append(toggle, panel);
+  mountInfo.append(wrap);
+}
+
+// Navigate the explorer to a file by its full/relative path and highlight it (best-effort).
+async function revealPath(p) {
+  if (!p) return;
+  let rel = p;
+  if (mountedFolder && p.toLowerCase().startsWith(mountedFolder.toLowerCase())) rel = p.slice(mountedFolder.length);
+  rel = rel.replace(/^[\\/]+/, '');
+  const segs = rel.split(/[\\/]+/).filter(Boolean);
+  if (!segs.length) return;
+  const crumbs = [{ id: 0, name: rootName }];
+  for (let i = 0; i < segs.length - 1; i++) {
+    const cur = crumbs[crumbs.length - 1];
+    const kids = await getChildren(cur.id, cur.path);
+    const node = (kids || []).find(k => (k.name || '').toLowerCase() === segs[i].toLowerCase());
+    if (!node) break;
+    crumbs.push({ id: node.id, name: node.name, path: node.path });
+  }
+  await navigate(crumbs);
+  const last = segs[segs.length - 1].toLowerCase();
+  const idx = explorer.ordered.findIndex(o => (o.node.name || '').toLowerCase() === last);
+  if (idx >= 0) focusRow(idx);
+  else setStatus(`Opened ${crumbs[crumbs.length - 1].name}; "${segs[segs.length - 1]}" isn't shown here.`);
 }
 
 browseBtn.onclick = async () => { const res = await call('pickFolder'); if (res.path) folderInput.value = res.path; };
@@ -327,6 +382,9 @@ async function doNavigate(crumbs) {
   ensureExplorerTab();
   activate(explorerTab);
   updateNavButtons();
+  // Move keyboard focus to the list so arrows/Enter work right away (no click needed),
+  // unless the user is mid-type in the search/mount box.
+  if (!inEditableField()) try { listBody.focus({ preventScroll: true }); } catch {}
 }
 function navBack() { if (navPos > 0) { navPos--; doNavigate(navHist[navPos]); } }
 function navFwd() { if (navPos < navHist.length - 1) { navPos++; doNavigate(navHist[navPos]); } }
@@ -344,6 +402,12 @@ window.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') { e.preventDefault(); navBack(); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navFwd(); }
   else if (e.key === 'ArrowUp') { e.preventDefault(); navUp(); }
+});
+// Mouse side buttons: Back (button 3) / Forward (button 4), like any file browser.
+window.addEventListener('mousedown', e => { if (e.button === 3 || e.button === 4) e.preventDefault(); });
+window.addEventListener('mouseup', e => {
+  if (e.button === 3) { e.preventDefault(); navBack(); }
+  else if (e.button === 4) { e.preventDefault(); navFwd(); }
 });
 updateNavButtons();   // start with the global arrows in their correct enabled state
 
@@ -421,8 +485,10 @@ let viewMode = 'details'; // details | list | icons
 // ---- multi-selection (Windows-style: click / Ctrl+click / Shift+click) ----
 let selection = [];     // selected node objects
 let selAnchor = -1;     // index into explorer.ordered for shift-range
+let focusIdx = -1;      // keyboard cursor: index into explorer.ordered
+let clipboard = { nodes: [], cut: false };   // Ctrl+C / Ctrl+X stash
 function isSelected(node) { return selection.some(s => s.id === node.id); }
-function clearSelection() { selection = []; selAnchor = -1; selectedRow = null; }
+function clearSelection() { selection = []; selAnchor = -1; focusIdx = -1; selectedRow = null; }
 function setSelection(nodes) { selection = nodes.slice(); applySelectionStyles(); }
 function toggleSelection(node) {
   if (isSelected(node)) selection = selection.filter(s => s.id !== node.id);
@@ -442,8 +508,170 @@ function onRowClick(node, row, e) {
   } else {
     setSelection([node]); selAnchor = idx;
   }
+  focusIdx = idx;
   selectedRow = row;
   showInspectorForSelection(node);
+}
+
+// ---- keyboard navigation in the file list (Windows Explorer–style) ----------
+// Arrow keys move the selection cursor, Enter opens, Backspace goes up a folder,
+// Home/End/PageUp/PageDown jump, Shift extends the range. Works without a prior
+// click — the whole explorer is drivable from the keyboard alone.
+function focusRow(idx, e) {
+  const list = explorer.ordered;
+  if (!list.length) return;
+  idx = Math.max(0, Math.min(list.length - 1, idx));
+  const o = list[idx];
+  if (e && e.shiftKey && selAnchor >= 0) {
+    const a = Math.min(selAnchor, idx), b = Math.max(selAnchor, idx);
+    setSelection(list.slice(a, b + 1).map(x => x.node));
+  } else {
+    setSelection([o.node]); selAnchor = idx;
+  }
+  focusIdx = idx; selectedRow = o.row;
+  o.row.scrollIntoView({ block: 'nearest' });
+  showInspectorForSelection(o.node);
+}
+function pageStep() {
+  const first = explorer.ordered[0];
+  const h = (first && first.row.offsetHeight) || 22;
+  return Math.max(1, Math.floor(listBody.clientHeight / h) - 1);
+}
+function selectAll() {
+  if (!explorer.ordered.length) return;
+  setSelection(explorer.ordered.map(o => o.node));
+  selAnchor = 0; focusIdx = explorer.ordered.length - 1;
+  selectedRow = explorer.ordered[focusIdx].row;
+  showInspectorForSelection(explorer.ordered[focusIdx].node);
+}
+// Type-ahead: jump to the next item whose name starts with the typed letters.
+let typeAhead = '', typeAheadAt = 0;
+function typeAheadJump(ch) {
+  const now = performance.now();
+  typeAhead = (now - typeAheadAt > 700 ? '' : typeAhead) + ch.toLowerCase();
+  typeAheadAt = now;
+  const list = explorer.ordered;
+  if (!list.length) return;
+  const from = focusIdx < 0 ? 0 : focusIdx;
+  for (let k = 0; k < list.length; k++) {
+    const i = (from + (typeAhead.length === 1 ? k + 1 : k)) % list.length;   // 1 char: skip to next match
+    if ((list[i].node.name || '').toLowerCase().startsWith(typeAhead)) { focusRow(i, null); return; }
+  }
+}
+function inEditableField() {
+  const a = document.activeElement;
+  if (!a) return false;
+  const t = (a.tagName || '').toLowerCase();
+  return t === 'input' || t === 'textarea' || t === 'select' || a.isContentEditable;
+}
+// The explorer list owns the keyboard only when it's the active view and nothing modal
+// (dialog / inline editor) is in front.
+function explorerListActive() {
+  // NB: #modal is always in the DOM (just [hidden]); only a *visible* modal should block.
+  return (!activeTab || activeTab.kind === 'explorer') && !searchActive && !document.querySelector('.modal:not([hidden])');
+}
+window.addEventListener('keydown', e => {
+  if (!explorerListActive() || inEditableField()) return;
+  if (e.altKey || e.ctrlKey || e.metaKey) return;   // Alt/Ctrl combos are handled elsewhere
+  const list = explorer.ordered;
+  const cur = focusIdx;
+  switch (e.key) {
+    case 'ArrowDown': {
+      e.preventDefault();
+      const n = list.length; if (!n) break;
+      // plain Down wraps past the bottom back to the top; Shift+range stays clamped
+      focusRow(e.shiftKey ? cur + 1 : (cur < 0 ? 0 : (cur + 1) % n), e);
+      break;
+    }
+    case 'ArrowUp': {
+      e.preventDefault();
+      const n = list.length; if (!n) break;
+      // plain Up wraps past the top back to the bottom
+      focusRow(e.shiftKey ? cur - 1 : (cur < 0 ? n - 1 : (cur - 1 + n) % n), e);
+      break;
+    }
+    case 'Home':      e.preventDefault(); focusRow(0, e); break;
+    case 'End':       e.preventDefault(); focusRow(list.length - 1, e); break;
+    case 'PageDown':  e.preventDefault(); focusRow((cur < 0 ? 0 : cur) + pageStep(), e); break;
+    case 'PageUp':    e.preventDefault(); focusRow((cur < 0 ? 0 : cur) - pageStep(), e); break;
+    case 'Enter': {
+      e.preventDefault();
+      const o = list[cur] || (selection.length === 1 && list.find(x => x.node.id === selection[0].id));
+      if (o) onItemDbl(o.node);
+      break;
+    }
+    case 'Backspace': e.preventDefault(); navUp(); break;
+    case 'Escape':
+      if (clipboard.cut) { clipboard = { nodes: [], cut: false }; markCutRows(); }   // abandon a pending cut
+      break;
+    default:
+      if (e.key.length === 1 && /\S/.test(e.key)) typeAheadJump(e.key);   // type-ahead
+  }
+});
+
+// While any dialog is open, Enter is ALWAYS the primary ("bright") button and Escape is
+// Cancel — and the keystroke never leaks through to the explorer (which would otherwise open
+// the focused file). Runs in the capture phase so it pre-empts the list's own handler, and
+// stops propagation so a button click that removes the modal can't let the same Enter bubble
+// up and open a file. Typing (any other key) passes straight through to the focused field.
+window.addEventListener('keydown', e => {
+  const modal = document.querySelector('.modal:not([hidden])');
+  if (!modal) return;
+  if (e.key === 'Enter') {
+    if (e.target && e.target.tagName === 'TEXTAREA') return;   // multiline: Enter = newline
+    e.preventDefault(); e.stopPropagation();
+    const ok = modal.querySelector('.btn.primary:not([disabled]), .dlg-ok:not([disabled])');
+    if (ok) ok.click();
+  } else if (e.key === 'Escape') {
+    e.preventDefault(); e.stopPropagation();
+    const cancel = modal.querySelector('.dlg-cancel, .btn.ghost');
+    if (cancel) cancel.click(); else modal.remove();
+  }
+}, true);
+
+// ---- clipboard: cut / copy / paste ------------------------------------------
+function markCutRows() {
+  const cutIds = clipboard.cut ? new Set(clipboard.nodes.map(n => n.id)) : new Set();
+  for (const o of explorer.ordered) o.row.classList.toggle('cut', cutIds.has(o.node.id));
+}
+function clipboardCopy(cut) {
+  const nodes = selection.filter(n => n && n.id !== 0);
+  if (!nodes.length) { setStatus('Nothing selected to ' + (cut ? 'cut' : 'copy'), true); return; }
+  clipboard = { nodes: nodes.slice(), cut };
+  markCutRows();
+  setStatus(`${cut ? 'Cut' : 'Copied'} ${nodes.length} item${nodes.length === 1 ? '' : 's'} — Ctrl+V to paste`);
+}
+function parentPath(p) {
+  if (!p) return '';
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return i >= 0 ? p.slice(0, i) : '';
+}
+async function clipboardPaste() {
+  if (!clipboard.nodes.length) { setStatus('Clipboard is empty', true); return; }
+  const target = currentFolder();
+  if (!target) { setStatus('Open a folder to paste into', true); return; }
+  let src = clipboard.nodes;
+  if (clipboard.cut) {   // a cut into the same folder is a no-op — drop those so we don't duplicate then delete
+    const tp = (target.path || '').toLowerCase();
+    src = src.filter(n => parentPath(n.path || '').toLowerCase() !== tp);
+    if (!src.length) { setStatus('Those items are already here'); return; }
+  }
+  setStatus(`Pasting ${src.length} item${src.length === 1 ? '' : 's'} into ${target.name}…`);
+  const res = await withProgress(call('pasteNodes', {
+    node: target.id, path: target.path,
+    nodes: src.map(n => n.id), paths: src.map(n => n.path || ''),
+    move: clipboard.cut,
+  }), 250);
+  if (!res.ok) { setStatus('Paste failed: ' + (res.message || ''), true); return; }
+  const extra = res.failed ? ` (${res.failed} failed${res.message ? ': ' + res.message : ''})` : '';
+  if (clipboard.cut) {
+    await deleteNodes(src);             // move = copy + delete originals (to trash, undoable); this refreshes
+    clipboard = { nodes: [], cut: false };
+  } else {
+    await refreshCurrent();
+  }
+  markCutRows();
+  setStatus(`Pasted ${res.count} item${res.count === 1 ? '' : 's'} into ${target.name}${extra}`);
 }
 
 function cmpItems(a, b) {
@@ -481,11 +709,15 @@ function renderList(items) {
     }
   }
   applySelectionStyles();
+  markCutRows();
 }
 
 function makeRow(it) {
   const row = document.createElement('div');
   row.className = 'row-item'; row.__node = it;
+  // A locked archive (Light/Full) shows a padlock in EVERY view so its state is unmistakable.
+  const lock = it.locked ? '🔒 ' : '';
+  if (lock) row.title = `Locked (${it.locked}) — right-click to Unlock`;
   if (viewMode === 'details') {
     // RPF archives show their file size (like a file); plain folders show their item count.
     const sizeText = (it.container && it.kind !== 'archive')
@@ -493,12 +725,12 @@ function makeRow(it) {
       : (it.size >= 0 ? fmtSize(it.size) : '');
     const lc = isEpicNode(it) ? 'label epic-glow' : 'label';
     row.innerHTML =
-      `<span class="c-name">${iconImg(iconName(it))}<span class="${lc}">${it.name}</span></span>` +
+      `<span class="c-name">${iconImg(iconName(it))}<span class="${lc}">${lock}${it.name}</span></span>` +
       `<span class="c-type">${it.type || ''}</span>` +
       `<span class="c-size">${sizeText}</span>` +
       `<span class="c-attr">${it.attrs || ''}</span>`;
   } else {
-    row.innerHTML = `${iconImg(iconName(it))}<span class="${isEpicNode(it) ? 'label epic-glow' : 'label'}">${it.name}</span>`;
+    row.innerHTML = `${iconImg(iconName(it))}<span class="${isEpicNode(it) ? 'label epic-glow' : 'label'}">${lock}${it.name}</span>`;
   }
   row.onclick = e => onRowClick(it, row, e);
   row.ondblclick = () => onItemDbl(it);
@@ -628,6 +860,7 @@ function onItemDbl(item) {
 }
 
 async function openFile(n, as) {
+  if (n && n.locked) { setStatus(`“${n.name}” is locked — right-click to Unlock to use it.`, true); return; }
   setStatus(`Opening ${n.name}…`);
   const res = await withProgress(call('open', { node: n.id, as }), 250);   // only if slow (>250ms)
   if (res.type === 'error') { setStatus('Open failed: ' + res.message, true); return; }
@@ -642,7 +875,7 @@ async function openFile(n, as) {
 
 // Resource types whose default viewer is visual, but that can also be opened as
 // CodeWalker XML on demand ("Edit as XML").
-const XML_EDITABLE = new Set(['ydr', 'ydd', 'yft', 'ytd', 'ypt']);
+const XML_EDITABLE = new Set(['ydr', 'ydd', 'yft', 'ytd', 'ypt', 'ybn']);
 function extOf(name) { return (name.split('.').pop() || '').toLowerCase(); }
 
 // ---------------------------------------------------------------- tabs / panes
@@ -679,8 +912,7 @@ function renderTabs() {
       attachTabDrag(el, t);   // drag a tab out of the window to pop it out
       el.oncontextmenu = e => {
         e.preventDefault(); e.stopPropagation();
-        showMenu([{ label: 'Open in new window', action: () => popoutTab(t) },
-                  { sep: true }, { label: 'Close', action: () => closeTab(t) }], e.clientX, e.clientY);
+        showMenu(tabMenu(t), e.clientX, e.clientY);
       };
     }
     el.onclick = () => { if (el.__dragged) { el.__dragged = false; return; } activate(t); };
@@ -730,6 +962,45 @@ function closeTab(t) {
   if (activeTab === t) activeTab = tabs[Math.min(i, tabs.length - 1)] || null;
   renderTabs();
   if (activeTab) activate(activeTab); else showPane('welcome');
+}
+
+// A tab's "type" for grouping: its file extension (model/edit/hex/etc. all key off the filename).
+function tabExt(t) { return (t.title && t.title.includes('.')) ? t.title.split('.').pop().toLowerCase() : (t.kind || ''); }
+
+// Close every closable tab matching pred, then re-render + re-activate once.
+function closeTabsWhere(pred) {
+  const victims = tabs.filter(t => !t.noClose && pred(t));
+  if (!victims.length) return;
+  for (const t of victims) {
+    if (t.kind === 'edit') editor.disposeTab(t);
+    const i = tabs.indexOf(t); if (i >= 0) tabs.splice(i, 1);
+  }
+  if (!tabs.includes(activeTab)) activeTab = tabs[tabs.length - 1] || null;
+  renderTabs();
+  if (activeTab) activate(activeTab); else showPane('welcome');
+}
+
+// Right-click menu for an open tab: close / close others / to the right / all / by type.
+function tabMenu(t) {
+  const idx = tabs.indexOf(t);
+  const closable = tabs.filter(x => !x.noClose);
+  const others = closable.filter(x => x !== t).length;
+  const toRight = tabs.slice(idx + 1).filter(x => !x.noClose);
+  const exts = [...new Set(closable.map(tabExt))].filter(Boolean).sort();
+  const byType = exts.map(ext => ({
+    label: `.${ext} (${closable.filter(x => tabExt(x) === ext).length})`,
+    action: () => closeTabsWhere(x => tabExt(x) === ext),
+  }));
+  const items = [
+    { label: 'Open in new window', action: () => popoutTab(t) },
+    { sep: true },
+    { label: 'Close', accel: 'Ctrl+W', action: () => closeTab(t) },
+    { label: 'Close others', disabled: others === 0, action: () => closeTabsWhere(x => x !== t) },
+    { label: 'Close to the right', disabled: toRight.length === 0, action: () => closeTabsWhere(x => toRight.includes(x)) },
+    { label: 'Close all', disabled: closable.length === 0, action: () => closeTabsWhere(() => true) },
+  ];
+  if (byType.length > 1) items.push({ sep: true }, { label: 'Close all of type', submenu: byType });
+  return items;
 }
 
 function showPane(kind) {
@@ -1489,6 +1760,8 @@ function renderTextures(res) {
     c.onclick = ev => onTexCardClick(ev, res, t, i);                 // click selects (ctrl/shift = multi)
     c.ondblclick = () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); };  // open preview
     c.oncontextmenu = ev => texGridMenu(res.node, t, ev, ph, fmt);
+    c.addEventListener('pointerdown', ev => beginTexDrag(res.node, t, ev));  // drag out -> raw .dds
+    c.addEventListener('dragstart', ev => ev.preventDefault());      // suppress HTML5 drag; we do native OS drag
     g.appendChild(c);
   });
 }
@@ -1508,6 +1781,11 @@ function texGridMenu(node, t, ev, ph, fmt) {
   showMenu([
     { label: n > 1 ? `Delete selected (${n})` : 'Delete texture', action: () => deleteSelectedTextures(node) },
     { label: 'Replace with image / DDS…', action: () => replaceTexturePrompt(node, t.index, t.name, t.hash) },
+    { label: n > 1 ? `Export ${n} as` : 'Export as', submenu: [
+      { label: 'PNG…', action: () => exportTextures(node, 'png') },
+      { label: 'JPEG…', action: () => exportTextures(node, 'jpg') },
+      { label: 'Raw DDS…', action: () => exportTextures(node, 'dds') },
+    ] },
     { sep: true },
     { label: 'Open', action: () => { if (ph.__img) openTexImageUrl(t.name, fmt, ph.__img); } },
   ], ev.clientX, ev.clientY);
@@ -1524,6 +1802,41 @@ async function deleteSelectedTextures(node) {
   if (res.ok) { texSel.clear(); setStatus(`Deleted ${res.removed} (${res.count} left)`); applyReplacedTextures(res.node, res.textures); }
   else { setStatus('Delete failed', true); infoDialog('Delete failed', res.message || 'Unknown error.'); }
 }
+
+// Export the selected textures to disk: 'dds' = raw (the texture's own DDS, lossless),
+// 'png'/'jpg' = decoded + re-encoded. One texture → Save dialog; several → a folder pick.
+async function exportTextures(node, format) {
+  const hashes = [...texSel];
+  if (!hashes.length) return;
+  const n = hashes.length, fl = format === 'dds' ? 'raw DDS' : format.toUpperCase();
+  setStatus(`Exporting ${n} texture${n > 1 ? 's' : ''} as ${fl}…`);
+  const res = await call('exportTextures', { node, hashes, format });
+  if (res.canceled) { setStatus('Export canceled'); return; }
+  if (res.ok) setStatus(`Exported ${res.count} texture${res.count === 1 ? '' : 's'} → ${res.path}`);
+  else { setStatus('Export failed', true); infoDialog('Export failed', res.message || 'Unknown error.'); }
+}
+
+// ---- native drag-out of textures from the grid (raw .dds, single or multi-select) ----
+// Mirrors the explorer row drag-out: detect a sustained press+move, then the C# host runs
+// the OLE drag with real .dds files extracted from the dictionary.
+let texDrag = null;
+function beginTexDrag(node, t, e) {
+  if (e.button !== 0) return;
+  texDrag = { node, hash: t.hash, x: e.clientX, y: e.clientY, t: performance.now() };
+}
+window.addEventListener('pointermove', e => {
+  if (!texDrag) return;
+  if (!(e.buttons & 1)) { texDrag = null; return; }                          // button released
+  if (Math.abs(e.clientX - texDrag.x) + Math.abs(e.clientY - texDrag.y) < 14) return;
+  if (performance.now() - texDrag.t < 120) return;                           // not a brief double-click
+  const d = texDrag; texDrag = null;
+  // drag the whole selection if the grabbed card is part of it, else just this one
+  const hashes = (texSel.has(d.hash) && texSel.size > 1) ? [...texSel] : [d.hash];
+  setStatus(hashes.length === 1 ? 'Dragging texture…' : `Dragging ${hashes.length} textures…`);
+  dragOutUntil = Infinity;                  // suppress drops until the bridge says the drag ended
+  post('dragOutTex', { node: d.node, hashes });
+});
+window.addEventListener('pointerup', () => { texDrag = null; });
 
 // ---------------------------------------------------------------- gfx (Scaleform/SWF) structure viewer
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -1952,8 +2265,11 @@ async function saveDds(name) {
   try { data = cv.getContext('2d').getImageData(0, 0, w, h).data; }
   catch (e) { setStatus('Cannot read image pixels: ' + e.message, true); return; }
   const fmt = $('ddsFmt').value;
-  setStatus(`Encoding ${fmt} DDS…`);
-  const res = await call('encodeDds', { rgba: bytesToB64(new Uint8Array(data.buffer)), w, h, format: fmt, name });
+  const mips = parseInt($('ddsMips').value, 10) || 0;
+  const quality = $('ddsQual').value;
+  const mipTxt = mips === 0 ? 'all mips' : mips === 1 ? 'no mips' : `${mips} mips`;
+  setStatus(`Encoding ${fmt} DDS (${quality}, ${mipTxt})…`);
+  const res = await call('encodeDds', { rgba: bytesToB64(new Uint8Array(data.buffer)), w, h, format: fmt, name, mips, quality });
   if (res.canceled) { setStatus('Save canceled'); return; }
   if (res.ok) setStatus(`Saved ${fmt} DDS → ${res.path} (${fmtSize(res.size)})`);
   else setStatus('DDS encode failed: ' + (res.message || ''), true);
@@ -2114,6 +2430,19 @@ function menuFor(node) {
   if (node && node.container) items.push({ label: 'Open', action: () => onItemDbl(node) });
   if (node && !node.container && XML_EDITABLE.has(extOf(node.name)))
     items.push({ label: 'Edit as XML', action: () => openFile(node, 'xml') });
+  // Cut / Copy (on a selected item) and Paste (when the clipboard has something).
+  const clipSel = (selection.length > 1 && node && isSelected(node)) ? selection
+                : (node && node.id !== 0 ? [node] : []);
+  if (clipSel.length || clipboard.nodes.length) {
+    items.push({ sep: true });
+    if (clipSel.length) {
+      const n = clipSel.length;
+      items.push({ label: n > 1 ? `Cut ${n} items` : 'Cut', accel: 'Ctrl+X', action: () => clipboardCopy(true) });
+      items.push({ label: n > 1 ? `Copy ${n} items` : 'Copy', accel: 'Ctrl+C', action: () => clipboardCopy(false) });
+    }
+    if (clipboard.nodes.length)
+      items.push({ label: clipboard.cut ? 'Paste (move)' : 'Paste', accel: 'Ctrl+V', action: () => clipboardPaste() });
+  }
   items.push({ label: 'New folder', accel: 'Ctrl+D', action: () => newFolder(target) });
   items.push({ label: 'New RPF', accel: 'Ctrl+N', action: () => newRpf(target) });
   items.push({ label: 'New YTD', action: () => newYtd(target) });
@@ -2132,6 +2461,19 @@ function menuFor(node) {
     items.push({ label: multi ? `Delete ${selection.length} items` : 'Delete', accel: 'Del', action: () => deleteNodes(multi ? selection : [node]) });
     if (!multi && node.kind === 'archive')
       items.push({ label: 'Convert to OPEN encryption', action: () => convertEncryption(node) });
+    // Archive Fix: rebuild this archive (and every archive nested inside it) so GTA V loads it.
+    const isRpfNode = node && (node.kind === 'archive' || (node.name && /\.rpf$/i.test(node.name)));
+    if (!multi && isRpfNode && !node.locked)
+      items.push({ label: '🛠 Archive Fix (this archive + nested)', action: () => archiveFixNode(node) });
+    // Lock / unlock (Epic RPF archive protection). Works on root .rpf files on disk.
+    const isRpf = node && (node.kind === 'archive' || (node.name && /\.rpf$/i.test(node.name)));
+    if (!multi && isRpf) {
+      if (node.locked) {
+        items.push({ label: 'Unlock…', action: () => unlockRpf(node) });
+      } else {
+        items.push({ label: 'Lock (encrypt) — unlock to use', action: () => lockRpf(node, 'full') });
+      }
+    }
   }
   items.push({ sep: true });
   items.push({ label: 'Sort by', submenu: [
@@ -2245,6 +2587,61 @@ async function convertEncryption(node) {
   const res = await withProgress(call('convertEncryption', { node: node.id, path: node.path }), 0);
   if (res.ok) { setStatus(`${res.name}: ${res.before} → ${res.after} encryption`); await refreshCurrent(); }
   else setStatus('Convert failed: ' + (res.message || ''), true);
+}
+
+// Archive-fix a single archive (and everything nested in it) on demand, from the right-click menu.
+async function archiveFixNode(node) {
+  setStatus(`Archive Fix: rebuilding “${node.name}” and nested archives… (this can take a while)`);
+  const res = await withProgress(call('archiveFixNode', { node: node.id, path: node.path }), 0);
+  if (res && res.ok) {
+    setStatus(`Archive Fix: rebuilt ${res.count} archive${res.count === 1 ? '' : 's'} in “${node.name}”.`);
+  } else {
+    const rb = res && res.rolledBack ? ' (rolled back — file left unchanged)' : '';
+    setStatus('Archive Fix failed: ' + ((res && res.message) || 'unknown') + rb, true);
+  }
+}
+
+// ---- archive lock system (protect custom models from theft) ----
+async function lockRpf(node, mode) {
+  const yes = await confirmDialog({
+    title: 'Lock (encrypt)',
+    body: `Encrypt “${node.name}” so neither CodeWalker/OpenIV nor GTA V can open it directly — ` +
+      `this protects the files inside from being stolen. To use it again (in‑game or in tools), Unlock it first.`,
+    okLabel: 'Encrypt',
+  });
+  if (!yes) return;
+  let password = '';
+  const wantPw = await confirmDialog({
+    title: 'Password?',
+    body: 'Add a password to this locked file? Click “Set a password”, or “Cancel” to lock without one. ' +
+          '(Optional — every Epic RPF can open it with the correct password.)',
+    okLabel: 'Set a password',
+  });
+  if (wantPw) {
+    const p = await promptDialog({ title: 'Set password', label: 'Password', value: '', okLabel: 'OK' });
+    if (p && p.name) password = p.name;
+  }
+  setStatus(`Locking ${node.name}…`);
+  const res = await withProgress(call('lockRpf', { node: node.id, path: node.path, mode, password }), 0);
+  if (res.ok) { setStatus(`Locked ${node.name} (${res.mode})`); await refreshCurrent(); }
+  else if (/already locked/i.test(res.message || '')) {
+    await refreshCurrent();   // it really is locked — refresh so the 🔒 + Unlock option show
+    setStatus(`${node.name} is already locked. Right-click → Unlock to remove it.`, true);
+  }
+  else setStatus('Lock failed: ' + (res.message || ''), true);
+}
+
+async function unlockRpf(node) {
+  setStatus(`Unlocking ${node.name}…`);
+  let res = await withProgress(call('unlockRpf', { node: node.id, path: node.path }), 0);
+  if (res.needPassword) {
+    const p = await promptDialog({ title: 'Password required', label: 'Password', value: '', okLabel: 'Unlock' });
+    if (!p || !p.name) { setStatus('Unlock canceled'); return; }
+    setStatus(`Unlocking ${node.name}…`);
+    res = await withProgress(call('unlockRpf', { node: node.id, path: node.path, password: p.name }), 0);
+  }
+  if (res.ok) { setStatus(`Unlocked ${node.name}`); await refreshCurrent(); }
+  else setStatus('Unlock failed: ' + (res.message || ''), true);
 }
 
 // ---- rename (right-click / F2) ----
@@ -2438,6 +2835,12 @@ window.addEventListener('keydown', e => {
   else if (e.shiftKey) return;
   else if (k === 'n') { e.preventDefault(); newRpf(); }
   else if (k === 'd') { e.preventDefault(); newFolder(); }
+  // Windows-standard clipboard — only when the file list owns the keyboard (don't steal
+  // Ctrl+C/V from a text field or a viewer tab).
+  else if (k === 'c' && !inEditableField() && explorerListActive()) { e.preventDefault(); clipboardCopy(false); }
+  else if (k === 'x' && !inEditableField() && explorerListActive()) { e.preventDefault(); clipboardCopy(true); }
+  else if (k === 'v' && !inEditableField() && explorerListActive()) { e.preventDefault(); clipboardPaste(); }
+  else if (k === 'a' && !inEditableField() && explorerListActive()) { e.preventDefault(); selectAll(); }
 });
 
 // ---------------------------------------------------------------- util
@@ -2462,9 +2865,173 @@ if (cwBtnEl) cwBtnEl.onclick = async () => {
   else setStatus('CodeWalker launch failed: ' + ((res && res.message) || 'unknown'), true);
 };
 
+// Terminal button (opt-in via Settings): opens a PowerShell window with rpfcli + helper
+// functions (lock / unlock / lockinfo / admin-keygen) ready, for admin-key work etc.
+const terminalBtnEl = $('terminalBtn');
+function applyTerminalVisibility() {
+  try { const on = !!(window.Appearance && window.Appearance.get().terminal);
+        if (terminalBtnEl) terminalBtnEl.style.display = on ? '' : 'none'; } catch { }
+}
+if (terminalBtnEl) terminalBtnEl.onclick = async () => {
+  setStatus('Opening terminal…');
+  // Open in the folder currently shown in the explorer, so relative paths "just work".
+  const cur = explorer.crumbs[explorer.crumbs.length - 1] || {};
+  const res = await call('openTerminal', { path: cur.path || '' });
+  if (res && res.ok) setStatus('Terminal opened — rpfcli is ready (try: lockinfo, or unlock --key <admin.epickey>).');
+  else setStatus('Terminal failed: ' + ((res && res.message) || 'unknown'), true);
+};
+applyTerminalVisibility();
+
+// Archive Fix toggle (toolbar): pressing it rebuilds (defragments) every archive edited this
+// session — innermost archive first, parents last — so GTA V loads them, then keeps auto-fixing
+// any further change while ON. Preference persists across remounts.
+const archiveFixBtnEl = $('archiveFixBtn');
+function updateArchiveFixBtn() {
+  try {
+    const on = !!(window.Appearance && window.Appearance.get().archiveFix);
+    if (archiveFixBtnEl) archiveFixBtnEl.classList.toggle('primary', on);
+    if (archiveFixBtnEl) archiveFixBtnEl.textContent = on ? '🛠 Archive Fix: ON' : '🛠 Archive Fix';
+  } catch { }
+}
+// sweep=true → fix everything edited so far (button press); sweep=false → just (re)enable
+// auto-fix-on-change server-side (mount restore), no rebuild.
+async function runArchiveFix(sweep, silent) {
+  const res = await call('archiveFix', { Sweep: sweep });
+  if (res && res.ok) {
+    if (!silent && sweep) {
+      setStatus(res.count
+        ? `Archive Fix: rebuilt ${res.count} archive${res.count === 1 ? '' : 's'}. New changes will be auto-fixed.`
+        : 'Archive Fix ON — nothing edited yet; any change you make will be auto-fixed.');
+    }
+    return true;
+  }
+  if (!silent) setStatus('Archive Fix failed: ' + ((res && res.message) || 'unknown'), true);
+  return false;
+}
+if (archiveFixBtnEl) archiveFixBtnEl.onclick = async () => {
+  const on = !!(window.Appearance && window.Appearance.get().archiveFix);
+  if (on) {
+    await call('archiveFixOff', {});
+    window.Appearance.set({ archiveFix: false }); updateArchiveFixBtn();
+    setStatus('Archive Fix OFF.');
+    return;
+  }
+  window.Appearance.set({ archiveFix: true }); updateArchiveFixBtn();
+  await runArchiveFix(true, false);
+};
+updateArchiveFixBtn();
+// Re-enable auto-fix-on-change after a (re)mount if the preference is on (server state resets on app restart).
+function maybeRestoreArchiveFix() { try { if (window.Appearance && window.Appearance.get().archiveFix) runArchiveFix(false, true); } catch { } }
+
 $('winMin').onclick = () => post('winMin');
 $('winMax').onclick = () => post('winMax');
 $('winClose').onclick = () => post('winClose');
+
+// ---------------------------------------------------------------- settings
+// Theme / accent / language / shape / outline. All live-apply + persist through
+// window.Appearance (appearance.js); chrome strings come from window.I18N (i18n.js).
+function st(k) { return window.I18N ? window.I18N.t(k) : k; }
+
+// Tell the host to round (or square) the real OS window to match the saved corner setting.
+function applyWindowCorners() {
+  try { if (window.Appearance) post('winCorners', { radius: window.Appearance.windowRadius(window.Appearance.get().corners) }); } catch { }
+}
+
+function openSettings() {
+  const A = window.Appearance, I = window.I18N;
+  if (!A) return;
+  let s = A.get();
+  const m = modalShell(st('set.title'));
+  m.ov.querySelector('.modal-card').classList.add('set-card');
+  const body = m.body; body.classList.add('set-body'); body.innerHTML = '';
+
+  const group = (title) => { const g = document.createElement('div'); g.className = 'set-group';
+    const h = document.createElement('h4'); h.textContent = title; g.append(h); return g; };
+  const row = (label, ...ctls) => { const r = document.createElement('div'); r.className = 'set-row';
+    const l = document.createElement('div'); l.className = 'set-lbl'; l.textContent = label;
+    const c = document.createElement('div'); c.className = 'set-ctl'; c.append(...ctls);
+    r.append(l, c); return r; };
+
+  // ---- Appearance ----
+  const ap = group(st('set.appearance'));
+
+  // theme tiles
+  const themeLbl = document.createElement('div'); themeLbl.className = 'set-lbl'; themeLbl.textContent = st('set.theme');
+  const themesWrap = document.createElement('div'); themesWrap.className = 'set-themes';
+  A.THEMES.forEach(th => {
+    const tile = document.createElement('div'); tile.className = 'set-theme' + (s.theme === th.id ? ' sel' : '');
+    tile.innerHTML = `<div class="sw">${th.sw.map(c => `<i style="background:${c}"></i>`).join('')}</div>` +
+                     `<span class="nm">${esc(st('theme.' + th.id))}</span>`;
+    tile.onclick = () => { s = A.set({ theme: th.id });
+      themesWrap.querySelectorAll('.set-theme').forEach(x => x.classList.remove('sel')); tile.classList.add('sel'); };
+    themesWrap.append(tile);
+  });
+  ap.append(themeLbl, themesWrap);
+
+  // accent: preset swatches + custom picker
+  const accWrap = document.createElement('div'); accWrap.className = 'set-swatches';
+  const custom = document.createElement('input'); custom.type = 'color'; custom.className = 'set-color'; custom.value = s.accent;
+  A.ACCENTS.forEach(c => {
+    const sw = document.createElement('div'); sw.className = 'set-sw' + (s.accent.toLowerCase() === c.toLowerCase() ? ' sel' : '');
+    sw.style.background = c; sw.title = c;
+    sw.onclick = () => { s = A.set({ accent: c });
+      accWrap.querySelectorAll('.set-sw').forEach(x => x.classList.remove('sel')); sw.classList.add('sel'); custom.value = c; };
+    accWrap.append(sw);
+  });
+  custom.oninput = () => { s = A.set({ accent: custom.value });
+    accWrap.querySelectorAll('.set-sw').forEach(x => x.classList.remove('sel')); };
+  accWrap.append(custom);
+  ap.append(row(st('set.accent'), accWrap));
+
+  // corners (round edges)
+  const cornSel = document.createElement('select'); cornSel.className = 'set-sel';
+  [['sharp', 'set.corners.sharp'], ['rounded', 'set.corners.rounded'], ['extra', 'set.corners.extra']].forEach(([v, k]) => {
+    const o = document.createElement('option'); o.value = v; o.textContent = st(k); if (s.corners === v) o.selected = true; cornSel.append(o);
+  });
+  cornSel.onchange = () => { s = A.set({ corners: cornSel.value }); applyWindowCorners(); };
+  ap.append(row(st('set.corners'), cornSel));
+
+  // outline (enable + colour + width)
+  const oChk = document.createElement('input'); oChk.type = 'checkbox'; oChk.className = 'set-check'; oChk.checked = !!s.outline;
+  const oColor = document.createElement('input'); oColor.type = 'color'; oColor.className = 'set-color'; oColor.value = s.outlineColor;
+  const oRange = document.createElement('input'); oRange.type = 'range'; oRange.className = 'set-range';
+  oRange.min = 1; oRange.max = 6; oRange.step = 1; oRange.value = s.outlineWidth;
+  const oNum = document.createElement('span'); oNum.className = 'set-num'; oNum.textContent = s.outlineWidth + ' px';
+  const syncO = () => { s = A.set({ outline: oChk.checked, outlineColor: oColor.value, outlineWidth: +oRange.value });
+    oNum.textContent = oRange.value + ' px'; oColor.disabled = !oChk.checked; oRange.disabled = !oChk.checked; };
+  oChk.onchange = syncO; oColor.oninput = syncO; oRange.oninput = syncO;
+  oColor.disabled = !s.outline; oRange.disabled = !s.outline;
+  ap.append(row(st('set.outline'), oChk, oColor, oRange, oNum));
+  body.append(ap);
+
+  // ---- Language ----
+  const lg = group(st('set.language'));
+  const langSel = document.createElement('select'); langSel.className = 'set-sel';
+  (I ? I.LANGS : [{ code: 'en', name: 'English' }]).forEach(L => {
+    const o = document.createElement('option'); o.value = L.code; o.textContent = L.name; if (s.lang === L.code) o.selected = true; langSel.append(o);
+  });
+  langSel.onchange = () => { A.set({ lang: langSel.value }); m.close(); openSettings(); };   // rebuild in the new language
+  lg.append(row(st('set.langPick'), langSel));
+  const note = document.createElement('div'); note.className = 'set-hint'; note.textContent = st('set.langNote');
+  lg.append(note);
+  body.append(lg);
+
+  // ---- Advanced ----
+  const adv = group('Advanced');
+  const tChk = document.createElement('input'); tChk.type = 'checkbox'; tChk.className = 'set-check'; tChk.checked = !!s.terminal;
+  tChk.onchange = () => { s = A.set({ terminal: tChk.checked }); applyTerminalVisibility(); };
+  adv.append(row('PowerShell terminal button', tChk));
+  const tHint = document.createElement('div'); tHint.className = 'set-hint';
+  tHint.textContent = 'Adds a Terminal button to the toolbar that opens PowerShell with rpfcli ready (lock / unlock, admin key).';
+  adv.append(tHint);
+  body.append(adv);
+
+  addBtn(m.actions, st('set.reset'), 'ghost', () => {
+    A.reset(); if (I) I.applyI18n(A.get().lang); applyWindowCorners(); m.close(); openSettings();
+  });
+  addBtn(m.actions, st('common.close'), 'primary', m.close);
+}
+$('settingsBtn').onclick = openSettings;
 
 // ---- frameless window resize -------------------------------------------------
 // The OS title bar is gone, so the user couldn't resize the window (WindowChrome's
@@ -2701,6 +3268,13 @@ function opRow(op, idx, onRemove) {
 }
 
 // ---------------------------------------------------------------- boot
+// Translate the chrome to the saved language (appearance/theme were already applied
+// in <head> before paint by appearance.js).
+try { if (window.I18N && window.Appearance) window.I18N.applyI18n(window.Appearance.get().lang); } catch { }
+// Round the actual OS window to match the saved "Round edges" choice (CSS can't clip the
+// WebView's own HWND, so the host sets a rounded window region — see WindowRounding.cs).
+applyWindowCorners();
+
 viewport.init($('gl'));
 editor.initEditor($('editor'));
 setStatus('Ready');
@@ -2797,6 +3371,7 @@ async function autoload() {
 // Open an arbitrary file on disk in a tab (used by the file-association single-instance
 // forwarder, and by viewer mode). Exposed on window so C# can invoke it via ExecuteScript.
 async function openExternalFile(path) {
+  if (/\.rpf$/i.test(path)) { mountRpfFromFile(path); return; }   // archives mount + browse (never hex-load a multi-GB file)
   try {
     const r = await call('openPath', { path });
     if (!r || !r.ok || !r.node) { setStatus('Could not open ' + path + (r && r.message ? ': ' + r.message : ''), true); return; }
@@ -2806,7 +3381,18 @@ async function openExternalFile(path) {
 }
 window.__openExternalFile = openExternalFile;
 
+// A double-clicked .rpf: mount its containing folder so the archive appears in the tree,
+// ready to browse. (A .rpf is far too large to open as a single hex file.)
+function mountRpfFromFile(path) {
+  const i = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+  const parent = i >= 0 ? path.slice(0, i) : path;
+  folderInput.value = parent;
+  setStatus('Mounting ' + parent + ' to browse ' + (i >= 0 ? path.slice(i + 1) : path) + '…');
+  mount();
+}
+
 if (window.__POPOUT) enterPopout(window.__POPOUT);
+else if (window.__OPENRPF) mountRpfFromFile(window.__OPENRPF);   // launched on a .rpf — full UI, mount + browse
 else if (window.__VIEWFILE) {            // launched to view a single file (no instance was running)
   document.body.classList.add('popout', 'viewfile');
   $('popoutTitle').textContent = window.__VIEWFILE.split(/[\\/]/).pop();

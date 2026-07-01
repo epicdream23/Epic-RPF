@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Xml;
 using App.Core;
@@ -28,7 +29,8 @@ Console.OutputEncoding = Encoding.UTF8;
 string gta = Environment.GetEnvironmentVariable("EPICRPF_GTA") ?? @"C:\Program Files\Epic Games\GTAV";
 var rest = new List<string>();
 string? outFile = null, ddsDir = null;
-bool extSearch = false;
+string? password = null, adminKeyPath = null, modeStr = null;
+bool extSearch = false, reveal = false, assumeYes = false, noBackup = false;
 int limit = 200;
 for (int i = 0; i < args.Length; i++)
 {
@@ -39,6 +41,12 @@ for (int i = 0; i < args.Length; i++)
         case "--dds": ddsDir = args[++i]; break;
         case "--ext": extSearch = true; break;
         case "--limit": limit = int.Parse(args[++i]); break;
+        case "-p": case "--password": password = args[++i]; break;
+        case "--key": adminKeyPath = args[++i]; break;
+        case "--mode": modeStr = args[++i]; break;
+        case "--reveal": reveal = true; break;
+        case "-y": case "--yes": assumeYes = true; break;
+        case "--no-backup": noBackup = true; break;
         default: rest.Add(args[i]); break;
     }
 }
@@ -55,6 +63,18 @@ if (cmd == "epic")
     else return Usage();
 }
 
+// Lock-system commands operate on a single .rpf on disk and must NOT mount the GTA folder
+// (a locked archive is encrypted/tampered and would break the mount). Handle them first.
+switch (cmd)
+{
+    case "admin-keygen": return AdminKeygen(rest.ElementAtOrDefault(1));
+    case "lock": return LockCmd(rest.ElementAtOrDefault(1));
+    case "unlock": return UnlockCmd(rest.ElementAtOrDefault(1));
+    case "lockinfo": return LockInfoCmd(rest.ElementAtOrDefault(1));
+    case "selftest": return SelfTest();
+    case "tolerant": return TolerantCmd(rest.ElementAtOrDefault(1));
+}
+
 if (!Directory.Exists(gta)) { Console.Error.WriteLine($"GTA folder not found: {gta}"); return 2; }
 var ws = RpfWorkspace.Mount(gta);
 
@@ -67,8 +87,77 @@ return cmd switch
     "get" => Get(rest.ElementAtOrDefault(1) ?? "", rest.ElementAtOrDefault(2)),
     "put" => Put(rest.ElementAtOrDefault(1) ?? "", rest.ElementAtOrDefault(2)),
     "epic" => EpicInstall(rest.ElementAtOrDefault(2)),
+    "ybntest" => YbnTest(rest.ElementAtOrDefault(1)),
+    "fixall" => FixAll(),
     _ => Usage(),
 };
+
+// Brute-force "archive fix" the WHOLE install: rebuild (defragment) every mounted .rpf — and EVERY
+// archive nested inside it, innermost first — so GTA V loads them after editing. Each root file is
+// backed up first and auto-rolled-back if the rebuild doesn't re-open cleanly, so a bad rebuild is
+// never left on disk (pass --no-backup to skip that, faster but unsafe). Rewrites files in place;
+// slow. `--yes` skips the prompt. Run elevated if the install is under Program Files, and with GTA
+// closed (an open archive fails with a sharing error).
+int FixAll()
+{
+    var roots = ws.AllRpfs.Where(a => a.Parent == null && a.AllEntries != null).ToList();
+    int totalArchives = ws.AllRpfs.Count(a => a.AllEntries != null);
+    Console.Error.WriteLine($"Archive-fix EVERY archive under:\n  {gta}");
+    Console.Error.WriteLine($"  {roots.Count} root .rpf  ({totalArchives} archive(s) total incl. nested), innermost first.");
+    Console.Error.WriteLine(noBackup
+        ? "  --no-backup: rewrites in place with NO rollback safety. Back up the install yourself first!"
+        : "  Each root is backed up + auto-rolled-back if the rebuild fails. Rewrites in place; slow.");
+    if (!assumeYes)
+    {
+        Console.Error.Write("Type YES to continue: ");
+        if (!string.Equals(Console.ReadLine()?.Trim(), "YES", StringComparison.Ordinal))
+        { Console.Error.WriteLine("aborted."); return 1; }
+    }
+
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    int okRoots = 0, fixedArchives = 0; var failures = new List<string>();
+    for (int i = 0; i < roots.Count; i++)
+    {
+        var root = roots[i];
+        var ordered = ArchiveFixer.Subtree(root);       // root + every nested archive, deepest first
+        Console.Error.WriteLine($"[{i + 1}/{roots.Count}] {root.Path ?? root.Name}  ({ordered.Count} archive(s))");
+        int lastPct = -1;
+        var res = ArchiveFixer.FixRoot(root, ordered, backup: !noBackup, (name, p) =>
+        {
+            int pct = (int)(p * 100);
+            if (pct != lastPct) { lastPct = pct; Console.Error.Write($"\r   {pct,3}%  {name}".PadRight(72)[..72]); }
+        });
+        if (res.Ok) { okRoots++; fixedArchives += res.Fixed; Console.Error.WriteLine($"\r   done ({res.Fixed} archive(s))".PadRight(72)); }
+        else { failures.Add($"{res.Root}: {res.Message}"); Console.Error.WriteLine($"\r   FAILED: {res.Message}".PadRight(72)); }
+    }
+    sw.Stop();
+    Console.WriteLine($"-- fixall: {okRoots}/{roots.Count} root archive(s) ok ({fixedArchives} archive(s) rebuilt), {failures.Count} failed, in {sw.Elapsed:hh\\:mm\\:ss}");
+    foreach (var f in failures.Take(80)) Console.WriteLine("  FAIL " + f);
+    return failures.Count == 0 ? 0 : 3;
+}
+
+// Validate the .ybn collision -> 3D mesh extractor on a real file.
+int YbnTest(string? vpath)
+{
+    RpfFileEntry? fe = string.IsNullOrEmpty(vpath) ? null : ws.Manager.GetEntry(Norm(vpath)) as RpfFileEntry;
+    if (fe == null)
+        foreach (var rpf in ws.AllRpfs)
+        {
+            if (rpf.AllEntries == null) continue;
+            foreach (var e in rpf.AllEntries) if (e is RpfFileEntry f && f.NameLower.EndsWith(".ybn", StringComparison.Ordinal)) { fe = f; break; }
+            if (fe != null) break;
+        }
+    if (fe == null) { Console.Error.WriteLine("no .ybn found"); return 2; }
+    var ybn = ws.Manager.GetFile<YbnFile>(fe);
+    if (ybn?.Bounds == null) { Console.Error.WriteLine("no bounds in " + fe.Path); return 3; }
+    var subs = App.Geometry.BoundsMesh.Build(ybn.Bounds);
+    long tris = 0; foreach (var s in subs) tris += s.VertexCount / 3;
+    Console.WriteLine(fe.Path);
+    Console.WriteLine($"  root bound : {ybn.Bounds.Type}");
+    Console.WriteLine($"  submeshes  : {subs.Count}");
+    Console.WriteLine($"  triangles  : {tris:N0}");
+    return subs.Count > 0 ? 0 : 3;
+}
 
 // --- .epic extension packaging / install ---
 int EpicCreate(string? manifestPath, string? outPath)
@@ -129,9 +218,157 @@ int EpicInstall(string? pkgPath)
     return fail == 0 ? 0 : 3;
 }
 
+// ---- archive lock system (admin tool) ----
+
+int AdminKeygen(string? outPath)
+{
+    outPath ??= "EpicRpf-Admin.epickey";
+    var (text, pub) = AdminKey.Generate();
+    File.WriteAllText(outPath, text, new UTF8Encoding(false));
+    Console.WriteLine($"Wrote admin PRIVATE key -> {Path.GetFullPath(outPath)}");
+    Console.WriteLine("KEEP THIS FILE SECRET — it opens any locked file with no password.");
+    Console.WriteLine();
+    Console.WriteLine("Bake this PUBLIC key into src/App.Core/AppSecret.cs (AdminPublicKeyB64):");
+    Console.WriteLine(pub);
+    return 0;
+}
+
+// Resolve a lock target: a real path, or a GTA-root-relative vpath.
+string? ResolveLockPath(string? arg)
+{
+    if (string.IsNullOrEmpty(arg)) return null;
+    if (File.Exists(arg)) return Path.GetFullPath(arg);
+    string p = Path.Combine(gta, Norm(arg));
+    return File.Exists(p) ? p : null;
+}
+
+int LockCmd(string? arg)
+{
+    string? path = ResolveLockPath(arg);
+    if (path == null)
+    {
+        if (string.IsNullOrEmpty(arg)) Console.Error.WriteLine("usage: rpfcli lock <file.rpf> [--password P]   (Full encryption; decrypted at runtime by the injected hook)");
+        else Console.Error.WriteLine($"file not found: {arg}\n  (looked in current dir: {Directory.GetCurrentDirectory()}\n   and GTA folder: {gta})");
+        return 2;
+    }
+    if (modeStr != null && !modeStr.Equals("full", StringComparison.OrdinalIgnoreCase))
+    { Console.Error.WriteLine("only --mode full is supported (the light mode was removed)."); return 1; }
+    try { RpfLock.Lock(path, LockMode.Full, password, s => Console.Error.WriteLine(s)); Console.WriteLine($"locked (Full) {path}"); return 0; }
+    catch (Exception ex) { Console.Error.WriteLine("lock failed: " + ex.Message); return 3; }
+}
+
+int UnlockCmd(string? arg)
+{
+    string? path = ResolveLockPath(arg);
+    if (path == null)
+    {
+        if (string.IsNullOrEmpty(arg)) Console.Error.WriteLine("usage: rpfcli unlock <file.rpf> [--password P | --key admin.epickey]");
+        else Console.Error.WriteLine($"file not found: {arg}\n  (looked in current dir: {Directory.GetCurrentDirectory()}\n   and GTA folder: {gta})");
+        return 2;
+    }
+    AdminKey? admin = null;
+    try
+    {
+        if (adminKeyPath != null) admin = AdminKey.LoadPrivate(adminKeyPath);
+        RpfLock.Unlock(path, password, admin, s => Console.Error.WriteLine(s));
+        Console.WriteLine($"unlocked {path}");
+        return 0;
+    }
+    catch (Exception ex) { Console.Error.WriteLine("unlock failed: " + ex.Message); return 3; }
+    finally { admin?.Dispose(); }
+}
+
+int LockInfoCmd(string? arg)
+{
+    string? path = ResolveLockPath(arg);
+    if (path == null)
+    {
+        if (string.IsNullOrEmpty(arg)) Console.Error.WriteLine("usage: rpfcli lockinfo <file.rpf> [--reveal]");
+        else Console.Error.WriteLine($"file not found: {arg}\n  (looked in current dir: {Directory.GetCurrentDirectory()}\n   and GTA folder: {gta})");
+        return 2;
+    }
+    var info = RpfLock.ReadInfo(path);
+    if (!info.IsLocked) { Console.WriteLine("not locked"); return 0; }
+    Console.WriteLine($"locked:       {info.Mode}");
+    Console.WriteLine($"password:     {(info.PasswordProtected ? "yes" : "no")}");
+    Console.WriteLine($"admin escrow: {(info.HasAdminEscrow ? "yes" : "no")}");
+    Console.WriteLine($"original:     {info.OriginalName} ({info.OriginalSize:N0} b)");
+    if (reveal && info.PasswordProtected)
+    {
+        try { Console.WriteLine($"embedded password: {RpfLock.RevealPassword(path)}"); }
+        catch (Exception ex) { Console.Error.WriteLine("reveal failed: " + ex.Message); }
+    }
+    return 0;
+}
+
+int SelfTest()
+{
+    string dir = Path.Combine(Path.GetTempPath(), "epicrpf_selftest_" + Guid.NewGuid().ToString("N")[..8]);
+    Directory.CreateDirectory(dir);
+    int failures = 0;
+    void Check(string name, bool ok) { Console.WriteLine($"  [{(ok ? "PASS" : "FAIL")}] {name}"); if (!ok) failures++; }
+    bool TryUnlock(string p, string pw) { try { RpfLock.Unlock(p, pw); return true; } catch { return false; } }
+    try
+    {
+        // A pseudo-RPF: valid 16-byte RPF7 header + random body.
+        var data = RandomNumberGenerator.GetBytes(300_000);
+        BitConverter.GetBytes(0x52504637u).CopyTo(data, 0);   // RPF7
+        BitConverter.GetBytes(10u).CopyTo(data, 4);            // entrycount
+        BitConverter.GetBytes(64u).CopyTo(data, 8);            // nameslength
+        BitConverter.GetBytes(0x4E45504Fu).CopyTo(data, 12);   // OPEN
+        byte[] original = (byte[])data.Clone();
+
+        string f1 = Path.Combine(dir, "full.rpf"); File.WriteAllBytes(f1, original);
+        RpfLock.Lock(f1, LockMode.Full, null);
+        Check("full: header encrypted", !File.ReadAllBytes(f1).AsSpan(0, 16).SequenceEqual(original.AsSpan(0, 16)));
+        Check("full: detected as locked", RpfLock.IsLocked(f1));
+        RpfLock.Unlock(f1, null);
+        Check("full: round-trip identical", File.ReadAllBytes(f1).AsSpan().SequenceEqual(original));
+
+        string f2 = Path.Combine(dir, "full_pw.rpf"); File.WriteAllBytes(f2, original);
+        RpfLock.Lock(f2, LockMode.Full, "hunter2");
+        Check("full+pw: wrong password refused", !TryUnlock(f2, "nope"));
+        Check("full+pw: reveal embedded password", RpfLock.RevealPassword(f2) == "hunter2");
+        Check("full+pw: correct password opens", TryUnlock(f2, "hunter2"));
+        Check("full+pw: round-trip identical", File.ReadAllBytes(f2).AsSpan().SequenceEqual(original));
+
+        if (adminKeyPath != null && File.Exists(adminKeyPath))
+        {
+            string f4 = Path.Combine(dir, "admin.rpf"); File.WriteAllBytes(f4, original);
+            RpfLock.Lock(f4, LockMode.Full, "secret");
+            using var ak = AdminKey.LoadPrivate(adminKeyPath);
+            RpfLock.Unlock(f4, null, ak);
+            Check("admin: opens without password via key file", File.ReadAllBytes(f4).AsSpan().SequenceEqual(original));
+        }
+        else Console.WriteLine("  [skip] admin test — pass --key admin.epickey after baking the public key");
+    }
+    catch (Exception ex) { Console.Error.WriteLine("selftest exception: " + ex); failures++; }
+    finally { try { Directory.Delete(dir, true); } catch { } }
+    Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");
+    return failures == 0 ? 0 : 3;
+}
+
+// Recover a "protected"/modified .rpf that GTA reads but tools refuse (e.g. a bogus encryption
+// flag) and list what's inside — proves the tolerant loader works on a real file.
+int TolerantCmd(string? arg)
+{
+    if (string.IsNullOrEmpty(arg) || !File.Exists(arg)) { Console.Error.WriteLine("usage: rpfcli tolerant <file.rpf>"); return 2; }
+    try { KeyLoader.EnsureLoaded(gta, false); } catch { }   // enables AES/NG recovery too (OPEN needs no keys)
+    var rpf = TolerantRpf.TryOpen(Path.GetFullPath(arg), Path.GetFileName(arg));
+    if (rpf == null) { Console.WriteLine("could not recover (not RPF7, genuinely corrupt, or an encrypted TOC needing keys)"); return 3; }
+    Console.WriteLine($"RECOVERED as {rpf.Encryption} — {rpf.AllEntries.Count} entries, {rpf.GrandTotalFileCount} files, {rpf.GrandTotalRpfCount} archive(s)");
+    int n = 0;
+    foreach (var e in rpf.AllEntries)
+        if (e is RpfFileEntry fe) { Console.WriteLine("  " + fe.Path + (fe is RpfResourceFileEntry ? "  [resource]" : "")); if (++n >= 40) { Console.WriteLine("  …"); break; } }
+    return 0;
+}
+
 int Usage()
 {
     Console.Error.WriteLine("usage: rpfcli <ls|find|info|cat|get|put> [args]  (see source header)");
+    Console.Error.WriteLine("  fixall [-y] [--no-backup]   archive-fix EVERY .rpf under --gta + nested, innermost first (slow; backs up + auto-rolls-back each root)");
+    Console.Error.WriteLine("  lock system (Full encryption only): admin-keygen [out.epickey] | lock <f.rpf> [--password P]");
+    Console.Error.WriteLine("               unlock <f.rpf> [--password P | --key admin.epickey] | lockinfo <f.rpf> [--reveal] | selftest [--key admin.epickey] | tolerant <f.rpf>");
     return 1;
 }
 

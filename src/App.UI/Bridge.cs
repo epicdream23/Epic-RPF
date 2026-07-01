@@ -88,9 +88,9 @@ public sealed class Bridge
         Send(new { type = "dragOutDone" });
     }
 
-    public string[] PrepareDragPaths(int[] ids)
+    // Fresh temp dir for a native OS drag-out (cleared each time so stale files never leak).
+    private static string CleanDragDir()
     {
-        if (ids == null || ids.Length == 0) return Array.Empty<string>();
         string dir = Path.Combine(Path.GetTempPath(), "EpicRpf_drag");
         try
         {
@@ -102,6 +102,13 @@ public sealed class Bridge
             Directory.CreateDirectory(dir);
         }
         catch { }
+        return dir;
+    }
+
+    public string[] PrepareDragPaths(int[] ids)
+    {
+        if (ids == null || ids.Length == 0) return Array.Empty<string>();
+        string dir = CleanDragDir();
 
         var paths = new List<string>();
         foreach (var id in ids)
@@ -134,6 +141,81 @@ public sealed class Bridge
         return paths.ToArray();
     }
 
+    // Native OS drag-out of one or more textures from an open .ytd/.ypt grid. Each texture
+    // is extracted RAW (its existing DDS, no re-encode) to a temp .dds, then handed to the
+    // host's OLE drag loop. Reads the cached dict only (no mutation) — runs off the gate,
+    // like the explorer drag-out.
+    public void HandleDragTex(int node, string[] hashes)
+    {
+        if (_startDrag == null) return;
+        var paths = PrepareTexDragPaths(node, hashes);
+        if (paths.Length > 0) _startDrag(paths);   // modal: returns after the drop/cancel
+        Send(new { type = "dragOutDone" });
+    }
+
+    public string[] PrepareTexDragPaths(int node, string[] hashes)
+    {
+        var dict = (_modelCache.TryGetValue(node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
+        if (dict == null) return Array.Empty<string>();
+        var sel = SelectTextures(dict, hashes, null, -1);
+        if (sel.Count == 0) return Array.Empty<string>();
+
+        string dir = CleanDragDir();
+        var paths = new List<string>();
+        foreach (var t in sel)
+        {
+            try
+            {
+                string p = UniquePath(Path.Combine(dir, TexFileName(t, "dds")));
+                File.WriteAllBytes(p, DDSIO.GetDDSFile(t));   // raw DDS — keeps original format + mips
+                paths.Add(p);
+            }
+            catch { }
+        }
+        return paths.ToArray();
+    }
+
+    // Pick textures out of a dictionary by NameHash list, else a single hash, else an index.
+    private static List<Texture> SelectTextures(Texture[] list, string[]? hashes, string? hash, int index)
+    {
+        var res = new List<Texture>();
+        if (hashes != null && hashes.Length > 0)
+        {
+            var set = new HashSet<uint>();
+            foreach (var hs in hashes)
+                if (uint.TryParse(hs, System.Globalization.NumberStyles.HexNumber, null, out var hv)) set.Add(hv);
+            foreach (var t in list) if (t != null && set.Contains((uint)t.NameHash)) res.Add(t);
+            return res;
+        }
+        if (!string.IsNullOrEmpty(hash)
+            && uint.TryParse(hash, System.Globalization.NumberStyles.HexNumber, null, out var h))
+        {
+            var one = list.FirstOrDefault(t => t != null && (uint)t.NameHash == h);
+            if (one != null) { res.Add(one); return res; }
+        }
+        if (index >= 0 && index < list.Length && list[index] != null) res.Add(list[index]);
+        return res;
+    }
+
+    // A safe export filename for a texture (its name, or its hash if unnamed) + extension.
+    private static string TexFileName(Texture t, string ext)
+    {
+        string baseName = string.IsNullOrWhiteSpace(t.Name) ? ((uint)t.NameHash).ToString("X8") : t.Name;
+        return SafeName(baseName) + "." + ext.TrimStart('.');
+    }
+
+    // Append " (2)", " (3)", … if the path already exists, so same-named textures don't clobber.
+    private static string UniquePath(string path)
+    {
+        if (!File.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path) ?? "", name = Path.GetFileNameWithoutExtension(path), ext = Path.GetExtension(path);
+        for (int i = 2; ; i++)
+        {
+            string p = Path.Combine(dir, $"{name} ({i}){ext}");
+            if (!File.Exists(p)) return p;
+        }
+    }
+
     private sealed class Req
     {
         public int Id { get; set; }
@@ -148,9 +230,12 @@ public sealed class Bridge
         public string? Rgba { get; set; }     // base64 RGBA8 for encodeDds
         public int W { get; set; }
         public int H { get; set; }
+        public int Mips { get; set; }          // encodeDds: mip levels (0/neg = full chain, 1 = none, N = N levels)
+        public string? Quality { get; set; }   // encodeDds: "fast" | "balanced" | "best"
         public string? Name { get; set; }     // filename for encodeDds / create commands
         public bool Override { get; set; }     // create content override when making an rpf
         public bool Convert { get; set; }       // rename: confirmed to convert an NG/AES .rpf to OPEN first
+        public bool Move { get; set; }          // pasteNodes: this paste is a cut (move), not a plain copy
         public string? Query { get; set; }     // search text
         public bool Ext { get; set; }          // search by extension instead of name
         public string? Scope { get; set; }     // "none" | "archive" | "folder"
@@ -165,6 +250,7 @@ public sealed class Bridge
         public string? Hash { get; set; }        // custom-name LUT key (drawable hash hex)
         public string[]? Hashes { get; set; }     // multi-select texture delete (NameHash hex list)
         public string? Edge { get; set; }        // frameless window resize edge (l/r/t/b/tl/tr/bl/br)
+        public int Radius { get; set; }          // winCorners: OS-window corner radius (logical px; 0 = square)
         public string? Path { get; set; }        // stable file path, to re-resolve a save after a remount
         public int[]? Nodes { get; set; }         // multi-select (extract many)
         public string[]? Paths { get; set; }       // stable paths paired with Nodes (stale/loose fallback)
@@ -178,6 +264,9 @@ public sealed class Bridge
         public string? Clip { get; set; }         // animBake: clip hash (hex) inside the dictionary
         public bool Save { get; set; }            // setShaderParams: also write the file back
         public ParamEdit[]? Params { get; set; }  // setShaderParams: edited shader values
+        public string? Password { get; set; }      // lock/unlock/play: optional archive password
+        public string? Mode { get; set; }          // lockRpf: "light" | "full"
+        public bool Sweep { get; set; }            // archiveFix: true = rebuild everything edited this session; false = just (re)enable auto-fix
     }
 
     public sealed class ParamEdit
@@ -210,6 +299,8 @@ public sealed class Bridge
 
     // base (on-disk) archives keyed by full path, to link a disk .rpf -> its mount.
     private static readonly Dictionary<string, RpfFile> _baseRpfByPath = new(StringComparer.OrdinalIgnoreCase);
+    // disk .rpf paths a tolerant recovery already failed on, so listings don't retry every time.
+    private static readonly HashSet<string> _recoverFailed = new(StringComparer.OrdinalIgnoreCase);
 
     // live file watching
     private static FileSystemWatcher? _watcher;
@@ -241,6 +332,7 @@ public sealed class Bridge
         MarkSelfWrite(physical);
         try { RpfSafeWrite.CreateFile(parent, name, data, true); }
         finally { MarkSelfWrite(physical); Interlocked.Decrement(ref _writeInProgress); }
+        MarkArchiveEdited(parent.File);   // remember this archive for Archive Fix (+ auto-fix if on)
         // Live, TARGETED UI update: tell the front-end exactly which file changed + its new
         // size, so it recalculates just that one row instantly (no folder re-list, no
         // remount). New files (create/import) are still picked up by their own refresh.
@@ -353,6 +445,7 @@ public sealed class Bridge
             case "createYtd": CmdCreateYtd(r); break;
             case "importFile": CmdImportFile(r); break;
             case "importPath": CmdImportPath(r); break;
+            case "pasteNodes": CmdPasteNodes(r); break;
             case "pathsOf": Send(new { type = "paths", reqId = r.Id, paths = r.DroppedPaths ?? Array.Empty<string>() }); break;
             case "inspectEpic": CmdInspectEpic(r); break;
             case "installEpic": CmdInstallEpic(r); break;
@@ -362,6 +455,12 @@ public sealed class Bridge
             case "delete": CmdDelete(r); break;
             case "rename": CmdRename(r); break;
             case "convertEncryption": CmdConvertEncryption(r); break;
+            case "lockRpf": CmdLockRpf(r); break;
+            case "unlockRpf": CmdUnlockRpf(r); break;
+            case "lockInfo": CmdLockInfo(r); break;
+            case "archiveFix": CmdArchiveFix(r); break;
+            case "archiveFixOff": CmdArchiveFixOff(r); break;
+            case "archiveFixNode": CmdArchiveFixNode(r); break;
             case "undo": CmdUndo(r); break;
             case "modelPart": CmdModelPart(r); break;
             case "useTxd": CmdUseTxd(r); break;
@@ -376,7 +475,9 @@ public sealed class Bridge
             case "replaceTexture": CmdReplaceTexture(r); break;
             case "deleteTexture": CmdDeleteTexture(r); break;
             case "deleteTextures": CmdDeleteTexture(r); break;   // multi-select (r.Hashes)
+            case "exportTextures": CmdExportTextures(r); break;  // save textures as png/jpg/raw-dds
             case "launchCodeWalker": CmdLaunchCodeWalker(r); break;
+            case "openTerminal": CmdOpenTerminal(r); break;
             case "reload": CmdReload(r); break;
             case "openPath": CmdOpenPath(r); break;
             case "renameModel": CmdRenameModel(r); break;
@@ -384,6 +485,7 @@ public sealed class Bridge
             case "winMax": _windowAction?.Invoke("max"); break;
             case "winClose": _windowAction?.Invoke("close"); break;
             case "winResize": _windowAction?.Invoke("resize:" + (r.Edge ?? "")); break;
+            case "winCorners": _windowAction?.Invoke("corners:" + r.Radius.ToString(System.Globalization.CultureInfo.InvariantCulture)); break;
             case "popout": CmdPopout(r); break;
             case "popoutData": CmdPopoutData(r); break;
             default: Send(new { type = "error", reqId = r.Id, message = $"unknown cmd '{r.Cmd}'" }); break;
@@ -409,10 +511,10 @@ public sealed class Bridge
     private void CmdMount(Req r)
     {
         string folder = r.Folder ?? "";
-        int errs = 0;
+        var errList = new List<string>();
         try
         {
-            _ws = RpfWorkspace.Mount(folder, r.Gen9, error: _ => Interlocked.Increment(ref errs));
+            _ws = RpfWorkspace.Mount(folder, r.Gen9, error: s => { lock (errList) errList.Add(s); });
         }
         catch (Exception ex)
         {
@@ -439,6 +541,13 @@ public sealed class Bridge
         // computes + caches them, later runs load the cache in well under a second.
         _ = Task.Run(() => { try { NgEncrypt.Ensure(); } catch { } });
 
+        // Surface each failed archive individually (name + path + message) so the UI can list and
+        // link to them — the error string is "<rpf path>: <exception>".
+        var errorList = errList.Select(ParseMountError)
+            .Where(e => e.path.Length > 0)
+            .Select(e => new { name = Path.GetFileName(e.path), path = e.path, message = e.msg })
+            .ToArray();
+
         Send(new
         {
             type = "mounted",
@@ -449,9 +558,24 @@ public sealed class Bridge
             rootName = _rootName,
             archives = _ws.AllRpfs.Count,
             files,
-            mountErrors = errs,
+            mountErrors = errList.Count,
+            mountErrorList = errorList,
             roots,
         });
+    }
+
+    // Split CodeWalker's "<rpf path>: <exception>" mount-error line into the archive path and a
+    // short one-line message. The path ends at ".rpf" (immediately followed by ": ").
+    private static (string path, string msg) ParseMountError(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return ("", "");
+        int i = s.IndexOf(".rpf:", StringComparison.OrdinalIgnoreCase);
+        if (i < 0) return ("", s);
+        string path = s.Substring(0, i + 4);
+        string msg = s.Substring(i + 5).TrimStart();
+        int nl = msg.IndexOfAny(new[] { '\r', '\n' });
+        if (nl > 0) msg = msg.Substring(0, nl);
+        return (path, msg);
     }
 
     // Map every base (on-disk) archive by its full path so the filesystem listing
@@ -459,6 +583,7 @@ public sealed class Bridge
     private void IndexBaseArchives()
     {
         _baseRpfByPath.Clear();
+        _recoverFailed.Clear();
         if (_ws == null) return;
         foreach (var rpf in _ws.AllRpfs)
         {
@@ -630,6 +755,8 @@ public sealed class Bridge
             // sent yet — the fallback is safe). Mirrors OpenDiskFile's behaviour.
             try
             {
+                // .ybn is collision geometry — its own 3D path (the model viewer expects a drawable).
+                if (FileTypes.Detect(fe.Name) == RpfFileKind.Bounds) { OpenBounds(r, fe); return; }
                 switch (FileTypes.Route(fe.Name))
                 {
                     case ViewerKind.Model: OpenModel(r, fe); break;
@@ -660,6 +787,12 @@ public sealed class Bridge
         string ext = ExtOf(name.ToLowerInvariant());
         try
         {
+            if (FileTypes.Detect(name) == RpfFileKind.Bounds)
+            {
+                var yb = new YbnFile(); yb.Load(bytes);
+                SendBoundsModel(r, name, di.Path, yb.Bounds);
+                return;
+            }
             switch (FileTypes.Route(name))
             {
                 case ViewerKind.Model:
@@ -1077,6 +1210,55 @@ public sealed class Bridge
             parts,
             textures = TextureMeta(localDict),
             stats,
+        });
+    }
+
+    // ---- collision bounds (.ybn) 3D viewer ----
+    private void OpenBounds(Req r, RpfFileEntry fe)
+    {
+        var ybn = _ws?.Manager.GetFile<YbnFile>(fe);
+        SendBoundsModel(r, fe.Name, fe.Path, ybn?.Bounds);
+    }
+
+    // Emit a collision bound as a "model" response (same shape as a drawable) so the 3D viewer
+    // renders it: flat-shaded triangles, palette-coloured per piece (vertex colours), no textures.
+    private void SendBoundsModel(Req r, string name, string path, Bounds? root)
+    {
+        var subs = root != null ? BoundsMesh.Build(root) : new List<BoundsSubMesh>();
+        if (subs.Count == 0) { Send(new { type = "error", reqId = r.Id, message = "no collision geometry in " + name }); return; }
+
+        float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+        foreach (var s in subs)
+        {
+            minX = Math.Min(minX, s.Min.X); minY = Math.Min(minY, s.Min.Y); minZ = Math.Min(minZ, s.Min.Z);
+            maxX = Math.Max(maxX, s.Max.X); maxY = Math.Max(maxY, s.Max.Y); maxZ = Math.Max(maxZ, s.Max.Z);
+        }
+
+        var meshes = subs.Select(s => (object)new
+        {
+            vcount = s.VertexCount, icount = s.Indices.Length, mat = 0,
+            pos = B64(s.Positions), nrm = B64(s.Normals), col = B64(s.Colors), idx = B64(s.Indices),
+            bone = -1, skin = false, domBone = 0,
+            bmin = new[] { s.Min.X, s.Min.Y, s.Min.Z }, bmax = new[] { s.Max.X, s.Max.Y, s.Max.Z },
+        }).ToArray();
+
+        var part = new
+        {
+            name, hash = "00000000", lazy = false,
+            materials = Array.Empty<object>(),
+            skeleton = (object?)null,
+            additions = (string[]?)null,
+            bmin = new[] { minX, minY, minZ }, bmax = new[] { maxX, maxY, maxZ },
+            lods = new[] { new { level = 0, meshes } },
+        };
+
+        Send(new
+        {
+            type = "model", reqId = r.Id, node = r.Node > 0 ? r.Node : _synthSeq--,
+            file = name.ToLowerInvariant(), name, path,
+            parts = new[] { part },
+            textures = Array.Empty<object>(),
+            stats = new { geometryCount = subs.Count, rendered = subs.Count, skipped = 0, skipSamples = Array.Empty<string>() },
         });
     }
 
@@ -1722,7 +1904,7 @@ public sealed class Bridge
                     var rgba = ImageUtil.RgbaFromImage(raw, out int iw, out int ih)
                                ?? throw new Exception("could not decode the imported image — use PNG/JPG/BMP or a .dds");
                     string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
-                    ddsBytes = TextureCodec.EncodeDds(rgba, iw, ih, fmt, true);
+                    ddsBytes = TextureCodec.EncodeDds(rgba, iw, ih, fmt);   // full mip chain, balanced (game texture)
                 }
             }
             else
@@ -1730,7 +1912,7 @@ public sealed class Bridge
                 byte[] rgba = Convert.FromBase64String(r.Rgba ?? "");
                 if (r.W <= 0 || r.H <= 0 || rgba.Length < (long)r.W * r.H * 4) throw new Exception("bad image data");
                 string fmt = !string.IsNullOrEmpty(r.Format) ? r.Format! : EncodeFormatFor(oldTex?.Format);
-                ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt, true);
+                ddsBytes = TextureCodec.EncodeDds(rgba, r.W, r.H, fmt);     // full mip chain, balanced (game texture)
             }
             // TextureFromDds normalizes sRGB DX10 formats and rejects anything that maps to
             // format 0. Then guard the ONE thing that genuinely produces a broken texture:
@@ -2483,7 +2665,7 @@ public sealed class Bridge
             else
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
-                MarkSelfWrite(SafePhysical(dir!.File));
+                MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
                 RpfFile.CreateDirectory(dir!, name);
             }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "folder", name });
@@ -2504,6 +2686,7 @@ public sealed class Bridge
             if (disk != null)
             {
                 var full = Path.Combine(disk, name);
+                RpfLock.ClearSidecar(full);   // drop any stale lock sidecar so the new file isn't seen as locked
                 MarkSelfWrite(full);
                 var rpf = RpfFile.CreateNew(disk, name, RpfEncryption.OPEN);
                 AddRpfToManager(rpf);
@@ -2512,7 +2695,7 @@ public sealed class Bridge
             else
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
-                MarkSelfWrite(SafePhysical(dir!.File));
+                MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
                 RpfFile.CreateNew(dir!, name, RpfEncryption.OPEN);
                 note = r.Override ? TryAddContentOverride(dir, name) : null;
             }
@@ -2537,7 +2720,7 @@ public sealed class Bridge
             else
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
-                MarkSelfWrite(SafePhysical(dir!.File));
+                MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
                 RpfSafeWrite.CreateFile(dir!, name, data, true);
             }
             Send(new { type = "created", reqId = r.Id, ok = true, kind = "ytd", name });
@@ -2581,7 +2764,7 @@ public sealed class Bridge
             else
             {
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
-                MarkSelfWrite(SafePhysical(dir!.File));
+                MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
                 RpfSafeWrite.CreateFile(dir!, outName, data, true);
             }
             if (diskDest != null && TryMountDroppedArchive(diskDest)) { }
@@ -2621,7 +2804,7 @@ public sealed class Bridge
                 byte[] xdata = MetaXmlConvert.Convert(xml, name, ddsDir, out string? cerr)
                                ?? throw new Exception(cerr ?? "XML conversion produced no data");
                 if (disk != null) { string p = Path.Combine(disk, outName); MarkSelfWrite(p); File.WriteAllBytes(p, xdata); }
-                else { if (PrepareArchiveWrite(dir!) is string we) throw new Exception(we); MarkSelfWrite(SafePhysical(dir!.File)); RpfSafeWrite.CreateFile(dir!, outName, xdata, true); }
+                else { if (PrepareArchiveWrite(dir!) is string we) throw new Exception(we); MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File); RpfSafeWrite.CreateFile(dir!, outName, xdata, true); }
                 RescanIfArchive(outName);
                 Send(new { type = "imported", reqId = r.Id, ok = true, name = outName, size = xdata.Length });
                 return;
@@ -2642,7 +2825,7 @@ public sealed class Bridge
                 if (len > 1_900_000_000)
                     throw new Exception($"{name} is {len / 1048576:N0} MB — too large for an archive entry. Import it into a normal folder instead.");
                 if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
-                MarkSelfWrite(SafePhysical(dir!.File));
+                MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
                 RpfSafeWrite.CreateFile(dir!, name, File.ReadAllBytes(src), true);
             }
             // A .rpf dropped onto a disk folder is mounted on its own (fast) so it opens
@@ -2652,6 +2835,152 @@ public sealed class Bridge
             Send(new { type = "imported", reqId = r.Id, ok = true, name, size = len });
         }
         catch (Exception ex) { Send(new { type = "imported", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // ---- copy / paste (Windows-style Ctrl+C / Ctrl+X / Ctrl+V) -------------
+    // Copy a set of nodes (files, folders, or .rpf archives — recursively) into the
+    // target folder. This is a pure COPY: a "cut" (move) is the UI calling this and then
+    // deleting the originals through the normal (undoable, trash-backed) delete path, so
+    // nothing is ever lost if the copy half fails. Name clashes auto-rename ("x - Copy")
+    // so a paste can never clobber an existing file.
+    private void CmdPasteNodes(Req r)
+    {
+        if (!ResolveTarget(r, out var disk, out var dir, out var err))
+        { Send(new { type = "pasted", reqId = r.Id, ok = false, message = err }); return; }
+
+        var ids = r.Nodes ?? Array.Empty<int>();
+        var paths = r.Paths ?? Array.Empty<string>();
+        if (ids.Length == 0) { Send(new { type = "pasted", reqId = r.Id, ok = false, message = "nothing to paste" }); return; }
+
+        // One pre-flight lock/NG check for an archive target (per-write checks still run).
+        if (dir != null && PrepareArchiveWrite(dir) is string twerr)
+        { Send(new { type = "pasted", reqId = r.Id, ok = false, message = twerr }); return; }
+
+        int count = 0, failed = 0; bool anyRpf = false; string? firstName = null, lastErr = null;
+        for (int i = 0; i < ids.Length; i++)
+        {
+            var obj = ResolveNode(ids[i], i < paths.Length ? paths[i] : null);
+            if (obj == null) { failed++; lastErr = "an item is no longer available"; continue; }
+            try { PasteEntry(obj, disk, dir, ref count, ref anyRpf, ref firstName); }
+            catch (Exception ex) { failed++; lastErr = ex.Message; }
+        }
+        if (anyRpf) RescanIfArchive(".rpf");   // mount any pasted nested archive
+        Send(new { type = "pasted", reqId = r.Id, ok = count > 0, count, failed, name = firstName, message = lastErr });
+    }
+
+    // Recursively copy one node into the destination (disk folder or archive directory).
+    private void PasteEntry(object obj, string? disk, RpfDirectoryEntry? dir, ref int count, ref bool anyRpf, ref string? firstName)
+    {
+        // File-like node (loose file, archive entry, or a base .rpf on disk) → copy bytes.
+        if (TryReadNodeBytes(obj, out string name, out byte[] data))
+        {
+            string written = WriteCopy(disk, dir, name, data);
+            firstName ??= written;
+            if (written.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)) anyRpf = true;
+            count++;
+            return;
+        }
+        // Folder-like node → create the destination subfolder and recurse into it.
+        if (obj is DiskItem ddir && ddir.IsDir && Directory.Exists(ddir.Path))
+        {
+            var (subDisk, subDir) = MakeChildDir(disk, dir, new DirectoryInfo(ddir.Path).Name);
+            firstName ??= new DirectoryInfo(ddir.Path).Name;
+            foreach (var f in Directory.GetFiles(ddir.Path))
+                PasteEntry(new DiskItem { Path = f, IsDir = false }, subDisk, subDir, ref count, ref anyRpf, ref firstName);
+            foreach (var d in Directory.GetDirectories(ddir.Path))
+                PasteEntry(new DiskItem { Path = d, IsDir = true }, subDisk, subDir, ref count, ref anyRpf, ref firstName);
+            return;
+        }
+        if (obj is RpfDirectoryEntry rde)
+        {
+            var (subDisk, subDir) = MakeChildDir(disk, dir, rde.Name);
+            firstName ??= rde.Name;
+            if (rde.Files != null) foreach (var f in rde.Files) PasteEntry(f, subDisk, subDir, ref count, ref anyRpf, ref firstName);
+            if (rde.Directories != null) foreach (var d in rde.Directories) PasteEntry(d, subDisk, subDir, ref count, ref anyRpf, ref firstName);
+            return;
+        }
+        throw new Exception("can't paste this item");
+    }
+
+    // Read a file-like node as a valid standalone file (resources keep their RSC7 header,
+    // so the bytes re-import / re-open cleanly). Returns false for directory nodes.
+    private static bool TryReadNodeBytes(object obj, out string name, out byte[] data)
+    {
+        name = ""; data = Array.Empty<byte>();
+        switch (obj)
+        {
+            case RpfFileEntry fe:
+                name = fe.Name; data = RpfWorkspace.ExtractForSave(fe); return true;
+            case DiskItem di when !di.IsDir && File.Exists(di.Path):
+                name = Path.GetFileName(di.Path); data = File.ReadAllBytes(di.Path); return true;
+            case RpfFile rf when SafePhysical(rf) is string p && File.Exists(p):
+                name = rf.Name; data = File.ReadAllBytes(p); return true;
+            default: return false;
+        }
+    }
+
+    // Write one file copy into the destination, picking a non-clashing name. Returns the
+    // name actually written.
+    private string WriteCopy(string? disk, RpfDirectoryEntry? dir, string name, byte[] data)
+    {
+        if (disk != null)
+        {
+            string outName = UniqueDiskName(disk, name);
+            string p = Path.Combine(disk, outName);
+            MarkSelfWrite(p);
+            File.WriteAllBytes(p, data);
+            return outName;
+        }
+        if (data.LongLength > 1_900_000_000)
+            throw new Exception($"{name} is too large for an archive entry — paste it into a normal folder instead.");
+        string an = UniqueArchiveName(dir!, name);
+        if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+        MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
+        RpfSafeWrite.CreateFile(dir!, an, data, true);
+        return an;
+    }
+
+    // Create (or reuse) a destination subfolder, on disk or inside an archive.
+    private (string? disk, RpfDirectoryEntry? dir) MakeChildDir(string? disk, RpfDirectoryEntry? dir, string name)
+    {
+        name = SafeName(name);
+        if (disk != null)
+        {
+            string p = Path.Combine(disk, name);
+            MarkSelfWrite(p);
+            Directory.CreateDirectory(p);
+            return (p, null);
+        }
+        var existing = dir!.Directories?.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (existing != null) return (null, existing);
+        if (PrepareArchiveWrite(dir!) is string werr) throw new Exception(werr);
+        MarkSelfWrite(SafePhysical(dir!.File)); MarkArchiveEdited(dir!.File);
+        return (null, RpfFile.CreateDirectory(dir!, name));
+    }
+
+    private static string UniqueDiskName(string disk, string name)
+    {
+        if (!File.Exists(Path.Combine(disk, name)) && !Directory.Exists(Path.Combine(disk, name))) return name;
+        string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
+        for (int i = 1; ; i++)
+        {
+            string cand = i == 1 ? $"{stem} - Copy{ext}" : $"{stem} - Copy ({i}){ext}";
+            if (!File.Exists(Path.Combine(disk, cand)) && !Directory.Exists(Path.Combine(disk, cand))) return cand;
+        }
+    }
+
+    private static string UniqueArchiveName(RpfDirectoryEntry dir, string name)
+    {
+        bool Exists(string n) =>
+            (dir.Files?.Any(f => string.Equals(f.Name, n, StringComparison.OrdinalIgnoreCase)) ?? false) ||
+            (dir.Directories?.Any(d => string.Equals(d.Name, n, StringComparison.OrdinalIgnoreCase)) ?? false);
+        if (!Exists(name)) return name;
+        string stem = Path.GetFileNameWithoutExtension(name), ext = Path.GetExtension(name);
+        for (int i = 1; ; i++)
+        {
+            string cand = i == 1 ? $"{stem} - Copy{ext}" : $"{stem} - Copy ({i}){ext}";
+            if (!Exists(cand)) return cand;
+        }
     }
 
     // ---- .epic extensions -------------------------------------------------
@@ -2760,6 +3089,18 @@ public sealed class Bridge
         try { _baseRpfByPath[rpf.GetPhysicalFilePath()] = rpf; } catch { }
     }
 
+    // Try to open a disk .rpf that didn't mount normally (a "protected"/modified archive GTA
+    // still reads). Caches failures so folder listings don't keep retrying the same file.
+    private RpfFile? TryRecoverDiskRpf(string fullPath)
+    {
+        if (_recoverFailed.Contains(fullPath)) return null;
+        if (RpfLock.IsLocked(fullPath)) return null;           // Epic-locked -> shown as locked, not recovered
+        if (!TolerantRpf.LooksLikeRpf(fullPath)) { _recoverFailed.Add(fullPath); return null; }
+        var rec = MountSingleDiskArchive(fullPath);            // normal scan, then tolerant fallback
+        if (rec == null) _recoverFailed.Add(fullPath);
+        return rec;
+    }
+
     // Mount a single .rpf that was just placed on disk WITHOUT re-scanning every archive
     // (a full remount of a real install takes seconds — that delay is what made a freshly
     // dropped archive feel slow to open). Scans just this file + its nested children and
@@ -2778,7 +3119,13 @@ public sealed class Bridge
 
             var rpf = new RpfFile(fullPath, rel);
             rpf.ScanStructure(_ => { }, _ => { });
-            if (rpf.AllEntries == null || rpf.LastException != null) return null;   // unreadable → caller falls back
+            if (rpf.AllEntries == null || rpf.LastException != null)
+            {
+                // GTA-readable but tool-broken (e.g. a bogus "CFXP" encryption flag): recover it.
+                var rec = TolerantRpf.TryOpen(fullPath, rel);
+                if (rec == null) return null;                                       // truly unreadable → caller falls back
+                rpf = rec;
+            }
 
             // Replace any previous mount of the same physical file (re-drop / overwrite).
             try
@@ -2942,11 +3289,13 @@ public sealed class Bridge
                     if (PrepareArchiveWrite(fe.File) is string we1) throw new Exception(we1);
                     MarkSelfWrite(SafePhysical(fe.File));
                     RpfFile.RenameEntry(fe, name);
+                    MarkArchiveEdited(fe.File);
                     break;
                 case RpfDirectoryEntry rd:
                     if (PrepareArchiveWrite(rd.File) is string we2) throw new Exception(we2);
                     MarkSelfWrite(SafePhysical(rd.File));
                     RpfFile.RenameEntry(rd, name);
+                    MarkArchiveEdited(rd.File);
                     break;
                 default:
                     throw new Exception("can't rename this");
@@ -3019,6 +3368,7 @@ public sealed class Bridge
         }
         MarkSelfWrite(SafePhysical(fe.File));
         RpfFile.RenameEntry(fe, newName);
+        MarkArchiveEdited(fe.File);
         Send(new { type = "renamed", reqId = r.Id, ok = true, name = newName, converted });
     }
 
@@ -3057,6 +3407,325 @@ public sealed class Bridge
         catch (Exception ex) { Send(new { type = "encryptionConverted", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
+    // ---- archive lock system (Option 1 light tamper / Option 2 full encryption) ----
+
+    // Resolve a node to a ROOT .rpf file path on disk (lock/unlock operate in place on the
+    // whole file; nested child archives can't be locked in place -> null). `mounted` is the
+    // live RpfFile when the target is currently mounted, so we can unmount before encrypting.
+    private string? ResolveDiskRpfPath(Req r, out RpfFile? mounted)
+    {
+        mounted = null;
+        var obj = ResolveNode(r.Node, r.Path);
+        switch (obj)
+        {
+            case DiskItem di when !di.IsDir && di.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase):
+                return di.Path;
+            case RpfFile rf when rf.Parent == null:
+                mounted = rf; return SafePhysical(rf);
+        }
+        if (!string.IsNullOrEmpty(r.Path) && r.Path.Length > 1 && r.Path[1] == ':'
+            && r.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase) && File.Exists(r.Path))
+            return r.Path;
+        return null;
+    }
+
+    private static string? FileWriteLock(string path)
+    {
+        try { using var fs = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite); return null; }
+        catch (IOException) { return Path.GetFileName(path) + " is locked by another program — if GTA V or a launcher is running, close it and try again."; }
+        catch (UnauthorizedAccessException) { return "No write permission for " + Path.GetFileName(path) + "."; }
+    }
+
+    private void CmdLockRpf(Req r)
+    {
+        string? path = ResolveDiskRpfPath(r, out var mounted);
+        if (path == null) { Send(new { type = "locked", reqId = r.Id, ok = false, message = "Select a root .rpf archive on disk — nested archives can't be locked in place." }); return; }
+        if (RpfLock.IsLocked(path)) { Send(new { type = "locked", reqId = r.Id, ok = false, message = "That file is already locked." }); return; }
+        if (FileWriteLock(path) is string le) { Send(new { type = "locked", reqId = r.Id, ok = false, message = le }); return; }
+
+        Interlocked.Increment(ref _writeInProgress);
+        try
+        {
+            MarkSelfWrite(path);
+            if (mounted != null) RemoveRpfTreeFromManager(mounted);
+            _baseRpfByPath.Remove(path);
+            RpfLock.Lock(path, LockMode.Full, string.IsNullOrEmpty(r.Password) ? null : r.Password);
+            MarkSelfWrite(path);
+            Send(new { type = "locked", reqId = r.Id, ok = true, mode = "Full", path });
+        }
+        catch (Exception ex) { Send(new { type = "locked", reqId = r.Id, ok = false, message = ex.Message }); }
+        finally { MarkSelfWrite(path); Interlocked.Decrement(ref _writeInProgress); }
+    }
+
+    private void CmdUnlockRpf(Req r)
+    {
+        string? path = ResolveDiskRpfPath(r, out _);
+        if (path == null || !RpfLock.IsLocked(path)) { Send(new { type = "unlocked", reqId = r.Id, ok = false, message = "That file isn't locked." }); return; }
+        if (FileWriteLock(path) is string le) { Send(new { type = "unlocked", reqId = r.Id, ok = false, message = le }); return; }
+
+        Interlocked.Increment(ref _writeInProgress);
+        try
+        {
+            MarkSelfWrite(path);
+            RpfLock.Unlock(path, string.IsNullOrEmpty(r.Password) ? null : r.Password);
+            MarkSelfWrite(path);
+            try { MountSingleDiskArchive(path); } catch { }   // browse it again now it's decrypted
+            Send(new { type = "unlocked", reqId = r.Id, ok = true, path });
+        }
+        catch (UnauthorizedAccessException ex) { Send(new { type = "unlocked", reqId = r.Id, ok = false, needPassword = true, message = ex.Message }); }
+        catch (Exception ex) { Send(new { type = "unlocked", reqId = r.Id, ok = false, message = ex.Message }); }
+        finally { MarkSelfWrite(path); Interlocked.Decrement(ref _writeInProgress); }
+    }
+
+    private void CmdLockInfo(Req r)
+    {
+        string? path = ResolveDiskRpfPath(r, out _);
+        if (path == null) { Send(new { type = "lockInfo", reqId = r.Id, ok = false }); return; }
+        var info = RpfLock.ReadInfo(path);
+        Send(new { type = "lockInfo", reqId = r.Id, ok = true, locked = info.IsLocked, mode = info.Mode.ToString(),
+            password = info.PasswordProtected, original = info.OriginalName, size = info.OriginalSize, path });
+    }
+
+    // ---- Archive Fix ------------------------------------------------------
+    // Rebuild (defragment) archives so GTA V loads them after editing — the same job as the
+    // ArchiveFix-for-GTA tool. A parent archive embeds its children's bytes, so children must be
+    // rebuilt BEFORE their parents: we fix every edited archive plus its parent chain up to the
+    // root, deepest first (innermost archive → … → root), which is the order the user specified.
+
+    private static volatile bool _autoFix;                       // ON => auto-fix on every change
+    private static readonly HashSet<string> _editedArchives = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object _fixLock = new();
+    private static Timer? _autoFixDebounce;
+
+    // Record that an archive's contents changed this session (called from the archive-write paths).
+    // When auto-fix is ON, schedule a debounced rebuild so a burst of edits collapses into one pass.
+    private static void MarkArchiveEdited(RpfFile? archive)
+    {
+        if (string.IsNullOrEmpty(archive?.Path)) return;
+        lock (_editedArchives) _editedArchives.Add(archive.Path);
+        if (_autoFix)
+        {
+            _autoFixDebounce ??= new Timer(_ => { try { RunArchiveFix(null); } catch { } }, null, Timeout.Infinite, Timeout.Infinite);
+            try { _autoFixDebounce.Change(1200, Timeout.Infinite); } catch { }
+        }
+    }
+
+    // Rebuild every archive recorded in _editedArchives, plus each one's parent chain up to the
+    // root. Grouped by root disk file and run through ArchiveFixer (backup + verify + auto-rollback),
+    // deepest first. Returns the number of archives rebuilt. Clears the batch as it runs.
+    private static int RunArchiveFix(Action<string, float>? progress)
+    {
+        lock (_fixLock)
+        {
+            string[] vpaths;
+            lock (_editedArchives) { vpaths = _editedArchives.ToArray(); _editedArchives.Clear(); }
+            if (vpaths.Length == 0) return 0;
+
+            var man = _ws?.Manager;
+            if (man == null) return 0;
+
+            // Resolve tracked paths to the CURRENT live RpfFile objects (fresh each run avoids acting
+            // on a stale, pre-remount object), then add each one's parent chain up to its root.
+            var byPath = new Dictionary<string, RpfFile>(StringComparer.OrdinalIgnoreCase);
+            foreach (var a in man.AllRpfs) if (a?.Path != null) byPath[a.Path] = a;
+
+            var set = new HashSet<RpfFile>();
+            foreach (var vp in vpaths)
+                if (byPath.TryGetValue(vp, out var a) && a != null)
+                    for (var f = a; f != null; f = f.Parent) set.Add(f);
+            if (set.Count == 0) return 0;
+
+            return FixArchiveSet(set, progress);
+        }
+    }
+
+    // Fix a set of archives: group by their root disk file and run each root through ArchiveFixer
+    // (deepest first, backup + verify + auto-rollback). Suppresses the watcher for the whole pass.
+    private static int FixArchiveSet(IEnumerable<RpfFile> archives, Action<string, float>? progress)
+    {
+        var byRoot = archives.Where(a => a?.AllEntries != null)
+            .GroupBy(a => ArchiveFixer.Root(a));
+
+        Interlocked.Increment(ref _writeInProgress);
+        int done = 0;
+        try
+        {
+            foreach (var grp in byRoot)
+            {
+                var root = grp.Key;
+                // Auto-fix fires on a debounce timer, unattended — unlike the manual "fix this
+                // archive" command it has no user standing by to close the game first. Skip a
+                // root that's currently locked (GTA V/a launcher has it open) rather than let
+                // Defragment fail mid-rebuild; the edit stays queued and the next successful
+                // fix pass (sweep or auto) picks it back up (see MarkArchiveEdited).
+                if (WriteLockError(root) is string lockErr)
+                {
+                    _broadcast?.Invoke(new { type = "archiveFix", error = true, message = $"Archive Fix: {root.Path ?? root.Name} — {lockErr}" });
+                    lock (_editedArchives) foreach (var a in grp) if (a?.Path != null) _editedArchives.Add(a.Path);
+                    continue;
+                }
+                var ordered = ArchiveFixer.OrderDeepestFirst(grp);
+                MarkSelfWrite(SafePhysical(root));
+                var res = ArchiveFixer.FixRoot(root, ordered, backup: true, (name, p) =>
+                {
+                    progress?.Invoke($"Fixing {name}…", p);
+                    _broadcast?.Invoke(new { type = "archiveFix", message = $"Archive Fix: rebuilding {name}…" });
+                });
+                MarkSelfWrite(SafePhysical(root));
+                if (res.Ok) done += res.Fixed;
+                else _broadcast?.Invoke(new { type = "archiveFix", error = true, message = $"Archive Fix: {res.Root} — {res.Message}" });
+            }
+        }
+        finally { Interlocked.Decrement(ref _writeInProgress); }
+        ScheduleRemount();   // resync the manager with the rewritten files on disk
+        return done;
+    }
+
+    // After a defragment the in-memory archive objects no longer match disk (offsets moved, or a
+    // rollback reverted disk but not the objects) — force a fresh mount via the watcher debounce.
+    private static void ScheduleRemount()
+    {
+        _watchRpfChanged = true;
+        try { _watchDebounce?.Change(500, Timeout.Infinite); } catch { }
+    }
+
+    // Right-click "Archive Fix": rebuild the selected archive AND every archive nested inside it
+    // (innermost first), with backup + verify + auto-rollback. "fix update.rpf" => everything in it.
+    private void CmdArchiveFixNode(Req r)
+    {
+        var obj = ResolveNode(r.Node, r.Path);
+        RpfFile? target = obj switch
+        {
+            RpfFile f => f,
+            RpfFileEntry fe when fe.NameLower.EndsWith(".rpf", StringComparison.Ordinal) => fe.File?.FindChildArchive(fe),
+            _ => null,
+        };
+        if (target == null && obj is DiskItem di && !di.IsDir && di.Path.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
+            target = (_baseRpfByPath.TryGetValue(di.Path, out var br) ? br : null) ?? MountSingleDiskArchive(di.Path);
+
+        if (target == null)
+        { Send(new { type = "archiveFixed", reqId = r.Id, ok = false, message = "Select an .rpf archive to fix." }); return; }
+        if (WriteLockError(target) is string lockErr)
+        { Send(new { type = "archiveFixed", reqId = r.Id, ok = false, message = lockErr }); return; }
+
+        var root = ArchiveFixer.Root(target);
+        var ordered = ArchiveFixer.Subtree(target);
+        string? rootPath = SafePhysical(root);
+
+        ArchiveFixer.FixResult res;
+        Interlocked.Increment(ref _writeInProgress);
+        try
+        {
+            MarkSelfWrite(rootPath);
+            res = ArchiveFixer.FixRoot(root, ordered, backup: true, (name, _) =>
+                _broadcast?.Invoke(new { type = "archiveFix", message = $"Archive Fix: rebuilding {name}…" }));
+            MarkSelfWrite(rootPath);
+        }
+        finally { Interlocked.Decrement(ref _writeInProgress); }
+
+        ScheduleRemount();
+        if (res.Ok) Send(new { type = "archiveFixed", reqId = r.Id, ok = true, count = res.Fixed, name = res.Root });
+        else Send(new { type = "archiveFixed", reqId = r.Id, ok = false, rolledBack = res.RolledBack, message = res.Message });
+    }
+
+    // Toggle ON: turning it on keeps auto-fix live; r.Sweep=true also rebuilds everything edited so
+    // far. r.Sweep=false (mount-restore) just re-enables auto-fix-on-change without a rebuild.
+    private void CmdArchiveFix(Req r)
+    {
+        _autoFix = true;
+        if (!r.Sweep) { Send(new { type = "archiveFixed", reqId = r.Id, ok = true, count = 0 }); return; }
+        try
+        {
+            int n = RunArchiveFix((msg, _) => _broadcast?.Invoke(new { type = "archiveFix", message = msg }));
+            Send(new { type = "archiveFixed", reqId = r.Id, ok = true, count = n });
+        }
+        catch (Exception ex) { Send(new { type = "archiveFixed", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    private void CmdArchiveFixOff(Req r)
+    {
+        _autoFix = false;
+        try { _autoFixDebounce?.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+        Send(new { type = "archiveFixed", reqId = r.Id, ok = true, count = 0 });
+    }
+
+    // ---- built-in PowerShell terminal (opt-in) ----
+    // Opens a PowerShell window with rpfcli + convenience functions pre-loaded, so the admin
+    // can run lock/unlock (incl. the admin .epickey override) without juggling paths.
+    private void CmdOpenTerminal(Req r)
+    {
+        try
+        {
+            string exe = FindRpfCli();
+            string gta = _gtaFolder ?? "";
+            // Open in the folder the user is browsing (so relative paths resolve), falling back
+            // to the GTA root, then the app dir. r.Path is the current explorer crumb's path.
+            string cwd = !string.IsNullOrEmpty(r.Path) && Directory.Exists(r.Path) ? r.Path
+                       : gta.Length > 0 && Directory.Exists(gta) ? gta
+                       : AppContext.BaseDirectory;
+            string init = BuildTerminalInit(exe, gta);
+            string tmp = Path.Combine(Path.GetTempPath(), "EpicRpf_terminal.ps1");
+            File.WriteAllText(tmp, init, new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe")
+            {
+                UseShellExecute = true,
+                WorkingDirectory = cwd,
+                Arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -Command \"Set-Location -LiteralPath '"
+                          + cwd.Replace("'", "''") + "'; . '" + tmp.Replace("'", "''") + "'\"",
+            };
+            System.Diagnostics.Process.Start(psi);
+            Send(new { type = "terminalOpened", reqId = r.Id, ok = true });
+        }
+        catch (Exception ex) { Send(new { type = "terminalOpened", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    private static string PsQuote(string s) => "'" + (s ?? "").Replace("'", "''") + "'";
+
+    private static string BuildTerminalInit(string exe, string gta)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("$ErrorActionPreference='Continue'");
+        sb.AppendLine("$Host.UI.RawUI.WindowTitle='Epic RPF terminal'");
+        sb.AppendLine("$exe=" + PsQuote(exe));
+        if (gta.Length > 0) sb.AppendLine("$env:EPICRPF_GTA=" + PsQuote(gta));
+        // rpfcli + friendly wrappers (CLI subcommands available as plain commands). Sync the
+        // process working dir to $PWD on every call so relative paths follow `cd` (PowerShell's
+        // Set-Location doesn't move the process CWD that the child exe inherits).
+        sb.AppendLine("function rpfcli { [Environment]::CurrentDirectory = (Get-Location).Path; & $exe @args }");
+        sb.AppendLine("function lock { rpfcli lock @args }");
+        sb.AppendLine("function unlock { rpfcli unlock @args }");
+        sb.AppendLine("function lockinfo { rpfcli lockinfo @args }");
+        sb.AppendLine("function admin-keygen { rpfcli admin-keygen @args }");
+        sb.AppendLine("function lockhelp {");
+        sb.AppendLine("  Write-Host 'Epic RPF terminal - rpfcli is ready.' -ForegroundColor Cyan");
+        sb.AppendLine("  Write-Host 'Examples:'");
+        sb.AppendLine("  Write-Host '  lockinfo  \"<file.rpf>\"                         status (+ --reveal for embedded password)'");
+        sb.AppendLine("  Write-Host '  unlock    \"<file.rpf>\" --key \"<Admin.epickey>\"   admin override (no password)' -ForegroundColor Green");
+        sb.AppendLine("  Write-Host '  unlock    \"<file.rpf>\" --password \"<pw>\"'");
+        sb.AppendLine("  Write-Host '  lock      \"<file.rpf>\" --mode full|light [--password <pw>]'");
+        sb.AppendLine("  Write-Host '  rpfcli    selftest | cwcheck | hooktest'");
+        if (gta.Length > 0) sb.AppendLine("  Write-Host ('  $env:EPICRPF_GTA = ' + $env:EPICRPF_GTA) -ForegroundColor DarkGray");
+        sb.AppendLine("  Write-Host 'Type lockhelp to show this again.' -ForegroundColor DarkGray");
+        sb.AppendLine("}");
+        sb.AppendLine("lockhelp");
+        return sb.ToString();
+    }
+
+    private static string FindRpfCli()
+    {
+        foreach (var p in new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "cli", "rpfcli.exe"),   // installed layout
+            Path.Combine(AppContext.BaseDirectory, "rpfcli.exe"),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "App.Cli", "bin", "Debug", "net8.0", "rpfcli.exe")),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "App.Cli", "bin", "Release", "net8.0", "rpfcli.exe")),
+        })
+            if (File.Exists(p)) return p;
+        throw new FileNotFoundException("rpfcli.exe not found — build it with: dotnet build src/App.Cli/App.Cli.csproj");
+    }
+
+
     private static void PushUndo(UndoEntry e) { lock (_undoStack) _undoStack.Add(e); }
 
     private void MoveDiskToTrash(DiskItem di, long batch)
@@ -3092,7 +3761,9 @@ public sealed class Bridge
         try { File.WriteAllBytes(dest, RpfWorkspace.ExtractForSave(fe)); } catch { }
         MarkSelfWrite(SafePhysical(fe.File));
         string parentPath = fe.Parent?.Path ?? "";
+        var feArchive = fe.File;
         RpfFile.DeleteEntry(fe);
+        MarkArchiveEdited(feArchive);
         PushUndo(new UndoEntry { Batch = batch, Kind = "rpfFile", TrashPath = dest, ParentPath = parentPath, Name = fe.Name });
     }
 
@@ -3102,7 +3773,9 @@ public sealed class Bridge
         try { int c = 0; long b = 0; ExtractDir(rd, dest, ref c, ref b); } catch { }
         MarkSelfWrite(SafePhysical(rd.File));
         string parentPath = rd.Parent?.Path ?? "";
+        var rdArchive = rd.File;
         RpfFile.DeleteEntry(rd);
+        MarkArchiveEdited(rdArchive);
         PushUndo(new UndoEntry { Batch = batch, Kind = "rpfDir", TrashPath = dest, ParentPath = parentPath, Name = rd.Name });
     }
 
@@ -3387,10 +4060,16 @@ public sealed class Bridge
         foreach (var d in dirs.OrderBy(x => x, OIC)) list.Add(DiskDirNode(d));
         foreach (var f in files.OrderBy(x => x, OIC))
         {
-            if (f.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase) && _baseRpfByPath.TryGetValue(f, out var rpf))
-                list.Add(ArchiveNode(rpf));
-            else
-                list.Add(DiskFileNode(f));
+            if (f.EndsWith(".epclk", StringComparison.OrdinalIgnoreCase)) continue;   // internal lock sidecar — hidden
+            if (f.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_baseRpfByPath.TryGetValue(f, out var rpf)) { list.Add(ArchiveNode(rpf)); continue; }
+                // A .rpf that didn't mount the normal way — try to recover it (GTA-readable but
+                // tool-broken archives) so it browses as an archive instead of showing as hex.
+                var rec = TryRecoverDiskRpf(f);
+                if (rec != null) { list.Add(ArchiveNode(rec)); continue; }
+            }
+            list.Add(DiskFileNode(f));
         }
     }
 
@@ -3406,8 +4085,13 @@ public sealed class Bridge
     {
         long size = -1; try { size = new FileInfo(path).Length; } catch { }
         string name = Path.GetFileName(path);
+        string locked = "";
+        if (name.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase))
+            try { var li = RpfLock.ReadInfo(path); if (li.IsLocked) locked = li.Mode.ToString(); } catch { }
         return new { id = Register(new DiskItem { Path = path, IsDir = false }), name,
-            kind = "file", container = false, expandable = false, type = FriendlyType(name), size, attrs = "Loose",
+            kind = "file", container = false, expandable = false,
+            type = locked.Length > 0 ? "Locked archive" : FriendlyType(name),
+            size, attrs = locked.Length > 0 ? "Locked (" + locked + ")" : "Loose", locked,
             viewer = FileTypes.Route(name).ToString().ToLowerInvariant(), path };
     }
 
@@ -3818,7 +4502,7 @@ public sealed class Bridge
             if (r.W <= 0 || r.H <= 0 || rgba.Length < (long)r.W * r.H * 4)
             { Send(new { type = "encoded", reqId = r.Id, ok = false, message = "bad image data" }); return; }
 
-            byte[] dds = TextureCodec.EncodeDds(rgba, r.W, r.H, r.Format ?? "DXT5", true);
+            byte[] dds = TextureCodec.EncodeDds(rgba, r.W, r.H, r.Format ?? "DXT5", r.Mips, r.Quality ?? "balanced");
             string suggested = r.Name ?? "texture.dds";
             if (!suggested.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) suggested += ".dds";
             string? path = _pickSavePath(suggested);
@@ -3828,6 +4512,54 @@ public sealed class Bridge
             Send(new { type = "encoded", reqId = r.Id, ok = true, path, size = dds.Length, format = r.Format ?? "DXT5" });
         }
         catch (Exception ex) { Send(new { type = "encoded", reqId = r.Id, ok = false, message = ex.Message }); }
+    }
+
+    // Export one or more textures from an open .ytd/.ypt grid to disk. Format "dds" exports
+    // the RAW texture (its existing DDS, no re-encode — lossless); "png"/"jpg"/… decode the
+    // texture to RGBA and re-encode. A single texture → Save dialog; several → a folder pick.
+    private void CmdExportTextures(Req r)
+    {
+        try
+        {
+            var dict = (_modelCache.TryGetValue(r.Node, out var mc) ? mc.LocalDict : null)?.Textures?.data_items;
+            if (dict == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = "texture source not open" }); return; }
+
+            var sel = SelectTextures(dict, r.Hashes, r.Hash, r.Index);
+            if (sel.Count == 0) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = "no texture selected" }); return; }
+
+            string fmt = (r.Format ?? "png").TrimStart('.').ToLowerInvariant();
+            bool rawDds = fmt is "dds" or "dds-raw";
+            string ext = rawDds ? "dds" : fmt;
+
+            byte[] Encode(Texture t)
+            {
+                if (rawDds) return DDSIO.GetDDSFile(t);
+                var rgba = TextureCodec.DecodeTexture(t, out int w, out int h)
+                           ?? throw new Exception($"could not decode '{t.Name}'");
+                return ImageUtil.EncodeRgba(rgba, w, h, ext);
+            }
+
+            if (sel.Count == 1)
+            {
+                string? path = _pickSavePath(TexFileName(sel[0], ext));
+                if (path == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, canceled = true }); return; }
+                if (!path.EndsWith("." + ext, StringComparison.OrdinalIgnoreCase)) path += "." + ext;
+                File.WriteAllBytes(path, Encode(sel[0]));
+                Send(new { type = "texExported", reqId = r.Id, ok = true, count = 1, path });
+            }
+            else
+            {
+                string? outDir = _pickFolder();
+                if (outDir == null) { Send(new { type = "texExported", reqId = r.Id, ok = false, canceled = true }); return; }
+                int n = 0;
+                foreach (var t in sel)
+                {
+                    try { File.WriteAllBytes(UniquePath(Path.Combine(outDir, TexFileName(t, ext))), Encode(t)); n++; } catch { }
+                }
+                Send(new { type = "texExported", reqId = r.Id, ok = true, count = n, path = outDir });
+            }
+        }
+        catch (Exception ex) { Send(new { type = "texExported", reqId = r.Id, ok = false, message = ex.Message }); }
     }
 
     private void CmdDecodeDds(Req r)
