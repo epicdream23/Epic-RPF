@@ -91,10 +91,6 @@ Stop people lifting your custom models/files out of a `.rpf` with CodeWalker or 
 Right-click any root `.rpf` → **Lock (protect)** and pick a strength (optionally with a
 password). Everything is fully reversible with **Unlock**.
 
-- **Light** — tampers a few header bytes so CodeWalker/OpenIV refuse the file, while GTA V
-  still loads it directly. Verified to block CodeWalker; reversible; the `.rpf` keeps its exact
-  size (the small revert data lives in a hidden `*.rpf.epclk` sidecar). In-game tolerance is
-  best-effort — test it, and Unlock if a build won't load it.
 - **Full** — encrypts the whole archive (AES-256) at rest, so **neither tools nor the game**
   can read it directly. To use it, the game is launched with on-the-fly decryption (below):
   the file on disk stays encrypted the entire time, even while playing.
@@ -107,32 +103,6 @@ Epic RPF can run any locked file; only *extracting* needs the password or your a
 
 > Protection is *obfuscation-grade* by design: a determined reverse-engineer could defeat it.
 > It's meant to stop casual theft, not a funded attacker.
-
-### Playing a Full-locked archive (auto-inject)
-
-A Full-locked `.rpf` can't be read directly, so Epic RPF feeds decrypted bytes at runtime via a
-small helper DLL (`EpicRpfHook.dll`) injected into the processes that read it. The **💉 Auto-inject**
-toolbar button (next to CodeWalker / Settings) toggles this: while it's ON, Epic RPF watches for
-`GTA5.exe` **and your RP server launcher**, and the moment they appear injects on-the-fly
-decryption for **every Full-locked archive under your GTA folder that they load** — even when a
-launcher you don't control starts the game. The files stay encrypted on disk the whole time. The
-setting persists and re-arms after each mount.
-
-Many RP launchers run a **sanity check** over the `.rpf` files before starting the game and would
-trip over an encrypted one — so the launcher is injected too, and sees the files decrypted (valid),
-then the game is injected when it starts. The launcher often runs as several processes; every
-matching one is injected. Set the launcher's process name(s) in **Settings → Advanced → "Auto-inject
-also into launchers"** (defaults to `Majestic Launcher`; `GTA5` is always included). Note: a 32-bit
-launcher can't be injected by the 64-bit hook (you'll see a clear message).
-
-> ⚠ **Only enable auto-inject on servers that allow non-cheat DLL injection.** The hook is a
-> decryption helper, not a cheat — but a server that forbids any injection could ban you for it.
-> Confirm with the server's rules/admins first. (It only decrypts your own files; it adds nothing
-> to gameplay.) Archives the game never opens are ignored, and password-protected locks are skipped
-> (lock without a password, or use the admin key, to include them).
-
-Note: if you lock the core `update.rpf` itself, a *normal* launch won't load it until you unlock
-it — that's the point. Keep an unlocked backup while you work.
 
 ## Opening cracked / modified / "protected" archives
 

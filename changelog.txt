@@ -11,15 +11,6 @@ New:
     GTA V can read it directly. An optional password additionally gates opening/
     extracting the contents in Epic RPF itself — it never blocks the game from running
     the file. Fully reversible with "Unlock".
-  * Auto-inject — a new 💉 toolbar toggle watches for GTA5.exe and your RP server
-    launcher and, the moment either appears, injects on-the-fly decryption for every
-    Full-locked archive they load, so the game plays a locked archive normally while it
-    stays encrypted on disk the entire time. Re-arms automatically after every mount.
-  * Creator admin key — a locked file's key is also escrowed to a baked admin public
-    key. The matching private half lives only in a .epickey file you keep outside the
-    app, so you can open or Unlock any locked file — even ones someone else made and
-    forgot the password to — with no password, while reverse-engineering Epic RPF can
-    never reveal that private half.
   * Opening cracked / tampered archives — when an .rpf has been deliberately tampered
     (e.g. a bogus encryption flag) so GTA V still loads it but CodeWalker/OpenIV refuse
     to open it, Epic RPF now brute-forces the real table-of-contents encryption and
